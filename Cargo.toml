@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "apps/wallpaper-daemon",
+    "apps/video-player",
     "crates/wallpaper-core",
     "crates/wallpaper-windows",
     "crates/wallpaper-protocol",
@@ -15,7 +16,9 @@ rust-version = "1.78"
 
 [workspace.dependencies]
 anyhow = "1.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -23,6 +26,14 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Power",
+    "Win32_System_ProcessStatus",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_StationsAndDesktops",
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }

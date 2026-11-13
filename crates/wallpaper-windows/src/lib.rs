@@ -1,8 +1,23 @@
 //! Windows-specific integration boundary.
 //!
-//! Desktop attachment is intentionally not implemented yet. Windows desktop
-//! hosting varies across Windows builds and must be validated with a real HWND
-//! prototype before it becomes a production API.
+//! Provides monitor enumeration, desktop host (`WorkerW`/`Progman`) discovery,
+//! native Win32 wallpaper window orchestration, and embedded MPV video playback.
+
+pub mod desktop_host;
+pub mod events;
+pub mod fullscreen;
+pub mod manager;
+pub mod mpv;
+pub mod policy;
+pub mod window;
+
+pub use desktop_host::{ensure_desktop_host, DesktopHost, DesktopHostDiagnostics, DesktopHostKind};
+pub use events::{SystemEventListener, SystemPlatformEvent};
+pub use fullscreen::{check_foreground_fullscreen, FullscreenStatus};
+pub use manager::{WallpaperManager, WallpaperManagerError};
+pub use mpv::{find_mpv_executable, MpvError, MpvLaunchConfig, MpvPlayer};
+pub use policy::{PlaybackSupervisor, ProcessBackoff, StateDebouncer};
+pub use window::WallpaperWindow;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorInfo {
@@ -23,9 +38,6 @@ mod platform {
     };
 
     /// Enumerates active Windows display monitors.
-    ///
-    /// This provides monitor geometry only. It does not attach a wallpaper
-    /// window to the desktop.
     pub fn enumerate_monitors() -> windows::core::Result<Vec<MonitorInfo>> {
         struct Context {
             monitors: Vec<MonitorInfo>,
@@ -42,13 +54,17 @@ mod platform {
             let mut info = MONITORINFOEXW::default();
             info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
 
-            if let Err(error) = GetMonitorInfoW(monitor, &mut info.monitorInfo) {
+            if let Err(error) = GetMonitorInfoW(monitor, &mut info.monitorInfo).ok() {
                 context.error = Some(error);
                 return BOOL(0);
             }
 
             let rect = info.monitorInfo.rcMonitor;
-            let name_len = info.szDevice.iter().position(|c| *c == 0).unwrap_or(info.szDevice.len());
+            let name_len = info
+                .szDevice
+                .iter()
+                .position(|c| *c == 0)
+                .unwrap_or(info.szDevice.len());
             let device_name = String::from_utf16_lossy(&info.szDevice[..name_len]);
 
             context.monitors.push(MonitorInfo {
@@ -74,7 +90,8 @@ mod platform {
                 None,
                 Some(callback),
                 LPARAM(&mut context as *mut Context as isize),
-            )?;
+            )
+            .ok()?;
         }
 
         if let Some(error) = context.error {

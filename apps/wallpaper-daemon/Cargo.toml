@@ -8,4 +8,8 @@ license.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+wallpaper-core = { path = "../../crates/wallpaper-core" }
 wallpaper-windows = { path = "../../crates/wallpaper-windows" }
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

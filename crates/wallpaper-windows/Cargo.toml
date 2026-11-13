@@ -5,7 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+wallpaper-core = { path = "../wallpaper-core" }
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

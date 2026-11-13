@@ -1,12 +1,17 @@
 //! Platform-independent domain types for the wallpaper engine.
 
+pub mod library;
+
+pub use library::{LibraryError, WallpaperLibrary};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 
 /// Stable identifier for an imported wallpaper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct WallpaperId(Uuid);
+pub struct WallpaperId(pub Uuid);
 
 impl WallpaperId {
     pub fn new() -> Self {
@@ -20,8 +25,22 @@ impl Default for WallpaperId {
     }
 }
 
+impl fmt::Display for WallpaperId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for WallpaperId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(Uuid::parse_str(s)?))
+    }
+}
+
 /// Supported wallpaper content kinds.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WallpaperKind {
     Video,
@@ -29,23 +48,100 @@ pub enum WallpaperKind {
     Scene,
 }
 
-/// A wallpaper known to the local library.
+/// Hardware decoding acceleration options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HardwareAcceleration {
+    Auto,
+    D3d11va,
+    Dxva2,
+    Disabled,
+}
+
+impl HardwareAcceleration {
+    pub fn as_mpv_arg(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto-safe",
+            Self::D3d11va => "d3d11va",
+            Self::Dxva2 => "dxva2",
+            Self::Disabled => "no",
+        }
+    }
+}
+
+impl Default for HardwareAcceleration {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+/// Playback configuration settings for a wallpaper instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Wallpaper {
-    pub id: WallpaperId,
+pub struct PlaybackConfig {
+    pub loop_playback: bool,
+    pub mute: bool,
+    pub volume: u32,
+    pub hardware_acceleration: HardwareAcceleration,
+}
+
+impl Default for PlaybackConfig {
+    fn default() -> Self {
+        Self {
+            loop_playback: true,
+            mute: true,
+            volume: 100,
+            hardware_acceleration: HardwareAcceleration::Auto,
+        }
+    }
+}
+
+/// Metadata describing a wallpaper asset.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WallpaperMetadata {
     pub title: String,
     pub source: String,
+    pub duration_secs: Option<f64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub thumbnail_path: Option<String>,
+}
+
+/// A wallpaper known to the local library.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Wallpaper {
+    pub id: WallpaperId,
     pub kind: WallpaperKind,
+    pub metadata: WallpaperMetadata,
+    pub config: PlaybackConfig,
 }
 
 impl Wallpaper {
     pub fn new(title: impl Into<String>, source: impl Into<String>, kind: WallpaperKind) -> Self {
+        let t = title.into();
+        let s = source.into();
         Self {
             id: WallpaperId::new(),
-            title: title.into(),
-            source: source.into(),
             kind,
+            metadata: WallpaperMetadata {
+                title: t,
+                source: s,
+                duration_secs: None,
+                width: None,
+                height: None,
+                thumbnail_path: None,
+            },
+            config: PlaybackConfig::default(),
         }
+    }
+
+    #[inline]
+    pub fn title(&self) -> &str {
+        &self.metadata.title
+    }
+
+    #[inline]
+    pub fn source(&self) -> &str {
+        &self.metadata.source
     }
 }
 
@@ -60,6 +156,126 @@ pub enum PlaybackState {
     Failed,
 }
 
+/// Performance profiles governing resource usage and playback pause triggers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceProfile {
+    /// Aggressive pause behavior: pauses on any maximized or fullscreen window,
+    /// display sleep, lock screen, and reduces background polling frequency.
+    Eco,
+    /// Default profile: pauses during true fullscreen applications / games,
+    /// lock screen, display power off, and battery saver.
+    Balanced,
+    /// Maximizes uptime: continues playback even with maximized or borderless apps,
+    /// only pauses when explicitly locked or displaying fullscreen exclusive games.
+    Performance,
+}
+
+impl Default for PerformanceProfile {
+    fn default() -> Self {
+        Self::Balanced
+    }
+}
+
+/// Policy configuration controlling when wallpaper playback automatically pauses or resumes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlaybackPolicy {
+    /// Active performance profile.
+    pub profile: PerformanceProfile,
+    /// Whether to pause when a fullscreen application is detected.
+    pub pause_on_fullscreen: bool,
+    /// Whether to pause specifically for fullscreen games (distinguished from normal maximized apps).
+    pub pause_on_fullscreen_game_only: bool,
+    /// Whether to pause when workstation is locked (`WM_WTSSESSION_CHANGE` / lock screen).
+    pub pause_on_lock: bool,
+    /// Whether to pause when display is powered off or system enters suspend/sleep.
+    pub pause_on_display_power_off: bool,
+    /// Debounce duration before triggering pause/resume to prevent rapid state cycling.
+    pub debounce_millis: u64,
+}
+
+impl Default for PlaybackPolicy {
+    fn default() -> Self {
+        Self::for_profile(PerformanceProfile::Balanced)
+    }
+}
+
+impl PlaybackPolicy {
+    pub fn for_profile(profile: PerformanceProfile) -> Self {
+        match profile {
+            PerformanceProfile::Eco => Self {
+                profile,
+                pause_on_fullscreen: true,
+                pause_on_fullscreen_game_only: false, // pause on any fullscreen / maximized app
+                pause_on_lock: true,
+                pause_on_display_power_off: true,
+                debounce_millis: 1000,
+            },
+            PerformanceProfile::Balanced => Self {
+                profile,
+                pause_on_fullscreen: true,
+                pause_on_fullscreen_game_only: true, // only true fullscreen apps/games
+                pause_on_lock: true,
+                pause_on_display_power_off: true,
+                debounce_millis: 500,
+            },
+            PerformanceProfile::Performance => Self {
+                profile,
+                pause_on_fullscreen: false,
+                pause_on_fullscreen_game_only: true,
+                pause_on_lock: true,
+                pause_on_display_power_off: true,
+                debounce_millis: 300,
+            },
+        }
+    }
+
+    /// Evaluates environmental conditions to determine whether playback should pause.
+    ///
+    /// Returns `(should_pause, reason)`.
+    pub fn evaluate(
+        &self,
+        is_fullscreen_detected: bool,
+        is_game_detected: bool,
+        is_session_locked: bool,
+        is_display_off_or_suspended: bool,
+    ) -> (bool, Option<&'static str>) {
+        if self.pause_on_lock && is_session_locked {
+            return (true, Some("session_locked"));
+        }
+
+        if self.pause_on_display_power_off && is_display_off_or_suspended {
+            return (true, Some("display_off_or_suspended"));
+        }
+
+        if self.pause_on_fullscreen {
+            if self.pause_on_fullscreen_game_only {
+                if is_fullscreen_detected && is_game_detected {
+                    return (true, Some("fullscreen_game"));
+                }
+            } else if is_fullscreen_detected {
+                return (true, Some("fullscreen_app"));
+            }
+        }
+
+        (false, None)
+    }
+}
+
+/// Runtime telemetry captured for an active player.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlayerTelemetry {
+    pub device_name: String,
+    pub active_decoder: String,
+    pub state: PlaybackState,
+    pub memory_working_set_bytes: u64,
+    pub uptime_secs: u64,
+    pub video_width: Option<u32>,
+    pub video_height: Option<u32>,
+    pub video_fps: Option<f64>,
+    pub gpu_context: Option<String>,
+}
+
 /// Errors returned by platform/runtime operations.
 #[derive(Debug, Error)]
 pub enum WallpaperError {
@@ -71,6 +287,8 @@ pub enum WallpaperError {
     InvalidSource(String),
     #[error("player failed: {0}")]
     Player(String),
+    #[error("library error: {0}")]
+    Library(#[from] LibraryError),
 }
 
 #[cfg(test)]
@@ -83,8 +301,10 @@ mod tests {
         let second = Wallpaper::new("Second", "wallpapers/second.mp4", WallpaperKind::Video);
 
         assert_ne!(first.id, second.id);
-        assert_eq!(first.title, "First");
+        assert_eq!(first.title(), "First");
+        assert_eq!(first.source(), "wallpapers/first.mp4");
         assert_eq!(first.kind, WallpaperKind::Video);
+        assert!(first.config.loop_playback);
     }
 
     #[test]
@@ -92,8 +312,55 @@ mod tests {
         assert_eq!(serde_json_name(PlaybackState::Playing), "\"playing\"");
     }
 
+    #[test]
+    fn policy_evaluation_respects_profiles_and_environmental_conditions() {
+        let eco = PlaybackPolicy::for_profile(PerformanceProfile::Eco);
+        let balanced = PlaybackPolicy::for_profile(PerformanceProfile::Balanced);
+        let perf = PlaybackPolicy::for_profile(PerformanceProfile::Performance);
+
+        // Session lock always triggers pause across all profiles
+        assert_eq!(
+            eco.evaluate(false, false, true, false),
+            (true, Some("session_locked"))
+        );
+        assert_eq!(
+            balanced.evaluate(false, false, true, false),
+            (true, Some("session_locked"))
+        );
+        assert_eq!(
+            perf.evaluate(false, false, true, false),
+            (true, Some("session_locked"))
+        );
+
+        // Display power off
+        assert_eq!(
+            balanced.evaluate(false, false, false, true),
+            (true, Some("display_off_or_suspended"))
+        );
+
+        // Fullscreen app (non-game)
+        assert_eq!(
+            eco.evaluate(true, false, false, false),
+            (true, Some("fullscreen_app"))
+        );
+        assert_eq!(
+            balanced.evaluate(true, false, false, false),
+            (false, None) // Balanced only pauses on games
+        );
+        assert_eq!(perf.evaluate(true, false, false, false), (false, None));
+
+        // Fullscreen game
+        assert_eq!(
+            balanced.evaluate(true, true, false, false),
+            (true, Some("fullscreen_game"))
+        );
+        assert_eq!(
+            perf.evaluate(true, true, false, false),
+            (false, None) // Performance profile does not pause on fullscreen by default
+        );
+    }
+
     fn serde_json_name(state: PlaybackState) -> String {
-        // Keep the test independent of serde_json as a runtime dependency.
         match state {
             PlaybackState::Starting => "\"starting\"".into(),
             PlaybackState::Playing => "\"playing\"".into(),
