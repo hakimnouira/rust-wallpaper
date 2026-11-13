@@ -1,6 +1,7 @@
 //! Platform-independent domain types for the wallpaper engine.
 
 pub mod library;
+pub mod runtime;
 
 pub use library::{LibraryError, WallpaperLibrary};
 use serde::{Deserialize, Serialize};
@@ -165,6 +166,30 @@ pub enum SuspensionReason {
     RuntimeError,
 }
 
+impl SuspensionReason {
+    /// Every reason, in the fixed order used for deterministic reporting.
+    pub const ALL: [SuspensionReason; 6] = [
+        SuspensionReason::UserPaused,
+        SuspensionReason::FullscreenApplication,
+        SuspensionReason::SessionLocked,
+        SuspensionReason::DisplayPoweredOff,
+        SuspensionReason::SystemSuspended,
+        SuspensionReason::RuntimeError,
+    ];
+
+    /// Stable snake_case name, identical to the serde representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SuspensionReason::UserPaused => "user_paused",
+            SuspensionReason::FullscreenApplication => "fullscreen_application",
+            SuspensionReason::SessionLocked => "session_locked",
+            SuspensionReason::DisplayPoweredOff => "display_powered_off",
+            SuspensionReason::SystemSuspended => "system_suspended",
+            SuspensionReason::RuntimeError => "runtime_error",
+        }
+    }
+}
+
 /// A container tracking active suspension reasons for a wallpaper player.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SuspensionFlags {
@@ -203,9 +228,12 @@ impl SuspensionFlags {
         self.reasons.clear();
     }
 
-    /// Returns a list of active reasons.
+    /// Returns the active reasons in the fixed [`SuspensionReason::ALL`] order.
     pub fn active_reasons(&self) -> Vec<SuspensionReason> {
-        self.reasons.iter().copied().collect()
+        SuspensionReason::ALL
+            .into_iter()
+            .filter(|reason| self.reasons.contains(reason))
+            .collect()
     }
 }
 
@@ -220,18 +248,48 @@ pub enum PlaybackState {
     Failed,
 }
 
+/// What the most relevant window on a monitor looks like, ordered by how strongly
+/// it suggests the wallpaper is hidden or the user is busy with something demanding.
+///
+/// The derived `Ord` is load-bearing: a policy pauses when the observed kind is
+/// `>=` its threshold, so the declaration order below is the severity order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForegroundKind {
+    /// Nothing relevant: empty desktop, shell/taskbar/Start, or our own windows.
+    None,
+    /// An ordinary window that does not fill the monitor.
+    Normal,
+    /// A maximized window that keeps its normal chrome (title bar / frame).
+    /// Typical productivity app: browser, editor, file manager.
+    Maximized,
+    /// A window covering the whole monitor with its chrome stripped, or a
+    /// recognised game-engine window: borderless-fullscreen games, F11 video.
+    BorderlessFullscreen,
+    /// Exclusive / Direct3D fullscreen, as reported by the shell itself.
+    ExclusiveFullscreen,
+}
+
 /// Performance profiles governing resource usage and playback pause triggers.
+///
+/// | Profile     | Pauses for foreground...                | pause / resume debounce | poll   |
+/// |-------------|------------------------------------------|-------------------------|--------|
+/// | Eco         | maximized, borderless, exclusive         | 1000 ms / 2000 ms       | 500 ms |
+/// | Balanced    | borderless, exclusive                    |  500 ms / 1500 ms       | 250 ms |
+/// | Performance | exclusive fullscreen only                |  300 ms /  750 ms       | 200 ms |
+///
+/// All profiles pause for session lock, display power-off and system suspend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PerformanceProfile {
-    /// Aggressive pause behavior: pauses on any maximized or fullscreen window,
-    /// display sleep, lock screen, and reduces background polling frequency.
+    /// Aggressive pause behavior: pauses on any maximized or fullscreen window and
+    /// polls the foreground window less often.
     Eco,
-    /// Default profile: pauses during true fullscreen applications / games,
-    /// lock screen, display power off, and battery saver.
+    /// Default profile: pauses during borderless/exclusive fullscreen applications and
+    /// games but keeps playing behind ordinary maximized productivity apps.
     Balanced,
-    /// Maximizes uptime: continues playback even with maximized or borderless apps,
-    /// only pauses when explicitly locked or displaying fullscreen exclusive games.
+    /// Maximizes uptime: keeps playing behind maximized and borderless apps and only
+    /// pauses for exclusive fullscreen (or the session/power events every profile honours).
     Performance,
 }
 
@@ -241,21 +299,41 @@ impl Default for PerformanceProfile {
     }
 }
 
+impl PerformanceProfile {
+    /// Parses a profile name as typed on a CLI or control channel.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "eco" => Some(Self::Eco),
+            "balanced" | "default" => Some(Self::Balanced),
+            "performance" | "perf" => Some(Self::Performance),
+            _ => None,
+        }
+    }
+}
+
 /// Policy configuration controlling when wallpaper playback automatically pauses or resumes.
+///
+/// This type only describes *decisions*; it knows nothing about MPV or Win32.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlaybackPolicy {
     /// Active performance profile.
     pub profile: PerformanceProfile,
-    /// Whether to pause when a fullscreen application is detected.
-    pub pause_on_fullscreen: bool,
-    /// Whether to pause specifically for fullscreen games (distinguished from normal maximized apps).
-    pub pause_on_fullscreen_game_only: bool,
-    /// Whether to pause when workstation is locked (`WM_WTSSESSION_CHANGE` / lock screen).
+    /// Lowest [`ForegroundKind`] that suspends a monitor, or `None` to never suspend
+    /// for foreground windows.
+    pub foreground_pause_threshold: Option<ForegroundKind>,
+    /// Whether to pause when the workstation is locked.
     pub pause_on_lock: bool,
-    /// Whether to pause when display is powered off or system enters suspend/sleep.
+    /// Whether to pause while display(s) are powered off.
     pub pause_on_display_power_off: bool,
-    /// Debounce duration before triggering pause/resume to prevent rapid state cycling.
-    pub debounce_millis: u64,
+    /// Whether to pause while the system is suspended / sleeping.
+    pub pause_on_system_suspend: bool,
+    /// How long a foreground condition must hold before playback is paused.
+    pub pause_debounce_millis: u64,
+    /// How long the condition must stay cleared before playback resumes.
+    /// Longer than the pause delay so alt-tabbing does not oscillate.
+    pub resume_debounce_millis: u64,
+    /// How often the foreground window is sampled.
+    pub poll_interval_millis: u64,
 }
 
 impl Default for PlaybackPolicy {
@@ -266,63 +344,29 @@ impl Default for PlaybackPolicy {
 
 impl PlaybackPolicy {
     pub fn for_profile(profile: PerformanceProfile) -> Self {
-        match profile {
-            PerformanceProfile::Eco => Self {
-                profile,
-                pause_on_fullscreen: true,
-                pause_on_fullscreen_game_only: false, // pause on any fullscreen / maximized app
-                pause_on_lock: true,
-                pause_on_display_power_off: true,
-                debounce_millis: 1000,
-            },
-            PerformanceProfile::Balanced => Self {
-                profile,
-                pause_on_fullscreen: true,
-                pause_on_fullscreen_game_only: true, // only true fullscreen apps/games
-                pause_on_lock: true,
-                pause_on_display_power_off: true,
-                debounce_millis: 500,
-            },
-            PerformanceProfile::Performance => Self {
-                profile,
-                pause_on_fullscreen: false,
-                pause_on_fullscreen_game_only: true,
-                pause_on_lock: true,
-                pause_on_display_power_off: true,
-                debounce_millis: 300,
-            },
+        let (threshold, pause_ms, resume_ms, poll_ms) = match profile {
+            PerformanceProfile::Eco => (ForegroundKind::Maximized, 1000, 2000, 500),
+            PerformanceProfile::Balanced => (ForegroundKind::BorderlessFullscreen, 500, 1500, 250),
+            PerformanceProfile::Performance => (ForegroundKind::ExclusiveFullscreen, 300, 750, 200),
+        };
+        Self {
+            profile,
+            foreground_pause_threshold: Some(threshold),
+            pause_on_lock: true,
+            pause_on_display_power_off: true,
+            pause_on_system_suspend: true,
+            pause_debounce_millis: pause_ms,
+            resume_debounce_millis: resume_ms,
+            poll_interval_millis: poll_ms,
         }
     }
 
-    /// Evaluates environmental conditions to determine whether playback should pause.
-    ///
-    /// Returns `(should_pause, reason)`.
-    pub fn evaluate(
-        &self,
-        is_fullscreen_detected: bool,
-        is_game_detected: bool,
-        is_session_locked: bool,
-        is_display_off_or_suspended: bool,
-    ) -> (bool, Option<&'static str>) {
-        if self.pause_on_lock && is_session_locked {
-            return (true, Some("session_locked"));
+    /// Returns true when a foreground window of this kind should suspend its monitor.
+    pub fn pauses_for(&self, kind: ForegroundKind) -> bool {
+        match self.foreground_pause_threshold {
+            Some(threshold) => kind != ForegroundKind::None && kind >= threshold,
+            None => false,
         }
-
-        if self.pause_on_display_power_off && is_display_off_or_suspended {
-            return (true, Some("display_off_or_suspended"));
-        }
-
-        if self.pause_on_fullscreen {
-            if self.pause_on_fullscreen_game_only {
-                if is_fullscreen_detected && is_game_detected {
-                    return (true, Some("fullscreen_game"));
-                }
-            } else if is_fullscreen_detected {
-                return (true, Some("fullscreen_app"));
-            }
-        }
-
-        (false, None)
     }
 }
 
@@ -417,50 +461,83 @@ mod tests {
     }
 
     #[test]
-    fn policy_evaluation_respects_profiles_and_environmental_conditions() {
+    fn profiles_pause_for_documented_foreground_kinds() {
+        use ForegroundKind::*;
         let eco = PlaybackPolicy::for_profile(PerformanceProfile::Eco);
         let balanced = PlaybackPolicy::for_profile(PerformanceProfile::Balanced);
         let perf = PlaybackPolicy::for_profile(PerformanceProfile::Performance);
 
-        // Session lock always triggers pause across all profiles
-        assert_eq!(
-            eco.evaluate(false, false, true, false),
-            (true, Some("session_locked"))
-        );
-        assert_eq!(
-            balanced.evaluate(false, false, true, false),
-            (true, Some("session_locked"))
-        );
-        assert_eq!(
-            perf.evaluate(false, false, true, false),
-            (true, Some("session_locked"))
-        );
+        // (kind, eco, balanced, performance)
+        let table = [
+            (None, false, false, false),
+            (Normal, false, false, false),
+            (Maximized, true, false, false),
+            (BorderlessFullscreen, true, true, false),
+            (ExclusiveFullscreen, true, true, true),
+        ];
+        for (kind, e, b, p) in table {
+            assert_eq!(eco.pauses_for(kind), e, "eco {kind:?}");
+            assert_eq!(balanced.pauses_for(kind), b, "balanced {kind:?}");
+            assert_eq!(perf.pauses_for(kind), p, "performance {kind:?}");
+        }
+    }
 
-        // Display power off
-        assert_eq!(
-            balanced.evaluate(false, false, false, true),
-            (true, Some("display_off_or_suspended"))
-        );
+    #[test]
+    fn profiles_have_ordered_debounce_and_polling() {
+        let eco = PlaybackPolicy::for_profile(PerformanceProfile::Eco);
+        let balanced = PlaybackPolicy::for_profile(PerformanceProfile::Balanced);
+        let perf = PlaybackPolicy::for_profile(PerformanceProfile::Performance);
 
-        // Fullscreen app (non-game)
-        assert_eq!(
-            eco.evaluate(true, false, false, false),
-            (true, Some("fullscreen_app"))
-        );
-        assert_eq!(
-            balanced.evaluate(true, false, false, false),
-            (false, None) // Balanced only pauses on games
-        );
-        assert_eq!(perf.evaluate(true, false, false, false), (false, None));
+        for p in [&eco, &balanced, &perf] {
+            assert!(p.pause_on_lock && p.pause_on_display_power_off && p.pause_on_system_suspend);
+            assert!(
+                p.resume_debounce_millis > p.pause_debounce_millis,
+                "resume must be slower than pause to damp oscillation"
+            );
+        }
+        assert!(eco.pause_debounce_millis > balanced.pause_debounce_millis);
+        assert!(balanced.pause_debounce_millis > perf.pause_debounce_millis);
+        assert!(eco.poll_interval_millis > balanced.poll_interval_millis);
+        assert!(balanced.poll_interval_millis > perf.poll_interval_millis);
+    }
 
-        // Fullscreen game
+    #[test]
+    fn foreground_kind_order_is_severity_order() {
+        use ForegroundKind::*;
+        assert!(None < Normal && Normal < Maximized);
+        assert!(Maximized < BorderlessFullscreen && BorderlessFullscreen < ExclusiveFullscreen);
+    }
+
+    #[test]
+    fn profile_names_parse() {
         assert_eq!(
-            balanced.evaluate(true, true, false, false),
-            (true, Some("fullscreen_game"))
+            PerformanceProfile::parse("ECO"),
+            Some(PerformanceProfile::Eco)
         );
         assert_eq!(
-            perf.evaluate(true, true, false, false),
-            (false, None) // Performance profile does not pause on fullscreen by default
+            PerformanceProfile::parse(" perf "),
+            Some(PerformanceProfile::Performance)
+        );
+        assert_eq!(
+            PerformanceProfile::parse("balanced"),
+            Some(PerformanceProfile::Balanced)
+        );
+        assert_eq!(PerformanceProfile::parse("turbo"), Option::None);
+    }
+
+    #[test]
+    fn active_reasons_are_reported_in_fixed_order() {
+        let mut flags = SuspensionFlags::new();
+        flags.add(SuspensionReason::RuntimeError);
+        flags.add(SuspensionReason::UserPaused);
+        flags.add(SuspensionReason::DisplayPoweredOff);
+        assert_eq!(
+            flags.active_reasons(),
+            vec![
+                SuspensionReason::UserPaused,
+                SuspensionReason::DisplayPoweredOff,
+                SuspensionReason::RuntimeError
+            ]
         );
     }
 
