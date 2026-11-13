@@ -145,6 +145,70 @@ impl Wallpaper {
     }
 }
 
+/// Explicit reasons why wallpaper playback may be suspended.
+/// Multiple reasons can coexist simultaneously (e.g. UserPaused while SessionLocked).
+/// A player will only resume when its set of active suspension reasons is completely empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SuspensionReason {
+    /// Manually paused by user or IPC command.
+    UserPaused,
+    /// Paused due to a foreground fullscreen window or game.
+    FullscreenApplication,
+    /// Paused because the Windows workstation session is locked.
+    SessionLocked,
+    /// Paused because display monitors are powered off or in low-power standby.
+    DisplayPoweredOff,
+    /// Paused due to system power suspend / sleep.
+    SystemSuspended,
+    /// Paused due to an active runtime or player failure.
+    RuntimeError,
+}
+
+/// A container tracking active suspension reasons for a wallpaper player.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SuspensionFlags {
+    reasons: std::collections::HashSet<SuspensionReason>,
+}
+
+impl SuspensionFlags {
+    pub fn new() -> Self {
+        Self {
+            reasons: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Adds a suspension reason. Returns true if it was newly added.
+    pub fn add(&mut self, reason: SuspensionReason) -> bool {
+        self.reasons.insert(reason)
+    }
+
+    /// Removes a suspension reason. Returns true if it was removed.
+    pub fn remove(&mut self, reason: SuspensionReason) -> bool {
+        self.reasons.remove(&reason)
+    }
+
+    /// Returns true if any suspension reason requires the player to be suspended.
+    pub fn is_suspended(&self) -> bool {
+        !self.reasons.is_empty()
+    }
+
+    /// Returns true if a specific suspension reason is currently active.
+    pub fn contains(&self, reason: SuspensionReason) -> bool {
+        self.reasons.contains(&reason)
+    }
+
+    /// Clears all suspension reasons.
+    pub fn clear(&mut self) {
+        self.reasons.clear();
+    }
+
+    /// Returns a list of active reasons.
+    pub fn active_reasons(&self) -> Vec<SuspensionReason> {
+        self.reasons.iter().copied().collect()
+    }
+}
+
 /// Runtime state reported by a player process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -305,6 +369,46 @@ mod tests {
         assert_eq!(first.source(), "wallpapers/first.mp4");
         assert_eq!(first.kind, WallpaperKind::Video);
         assert!(first.config.loop_playback);
+    }
+
+    #[test]
+    fn test_suspension_flags_coexistence() {
+        let mut flags = SuspensionFlags::new();
+        assert!(!flags.is_suspended());
+
+        // Lock session
+        flags.add(SuspensionReason::SessionLocked);
+        assert!(flags.is_suspended());
+        assert!(flags.contains(SuspensionReason::SessionLocked));
+
+        // User manually pauses while locked
+        flags.add(SuspensionReason::UserPaused);
+        assert!(flags.is_suspended());
+
+        // Session unlocks
+        flags.remove(SuspensionReason::SessionLocked);
+        // Must remain suspended because UserPaused is still active!
+        assert!(flags.is_suspended());
+        assert!(flags.contains(SuspensionReason::UserPaused));
+
+        // Fullscreen app launches
+        flags.add(SuspensionReason::FullscreenApplication);
+        assert!(flags.is_suspended());
+
+        // Display powers off
+        flags.add(SuspensionReason::DisplayPoweredOff);
+
+        // Display powers on
+        flags.remove(SuspensionReason::DisplayPoweredOff);
+        assert!(flags.is_suspended());
+
+        // Fullscreen app closes
+        flags.remove(SuspensionReason::FullscreenApplication);
+        assert!(flags.is_suspended()); // Still UserPaused
+
+        // User resumes
+        flags.remove(SuspensionReason::UserPaused);
+        assert!(!flags.is_suspended()); // Now fully resumed!
     }
 
     #[test]

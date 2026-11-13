@@ -16,7 +16,7 @@ pub use events::{SystemEventListener, SystemPlatformEvent};
 pub use fullscreen::{check_foreground_fullscreen, FullscreenStatus};
 pub use manager::{WallpaperManager, WallpaperManagerError};
 pub use mpv::{find_mpv_executable, MpvError, MpvLaunchConfig, MpvPlayer};
-pub use policy::{PlaybackSupervisor, ProcessBackoff, StateDebouncer};
+pub use policy::{PlaybackSupervisor, PlayerSuspensionManager, ProcessBackoff, StateDebouncer};
 pub use window::WallpaperWindow;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

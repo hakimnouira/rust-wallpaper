@@ -164,6 +164,10 @@ impl WallpaperManager {
         };
 
         let player = MpvPlayer::launch(launch_cfg)?;
+        // After MPV has successfully initialized and embedded its VO into the window,
+        // attach the window to WorkerW behind desktop icons.
+        win.attach_to_host();
+
         self.players.insert(device.to_string(), player);
         self.active_sources
             .insert(device.to_string(), (video_path, config));
@@ -198,6 +202,24 @@ impl WallpaperManager {
         for (dev, player) in &mut self.players {
             if let Err(err) = player.resume() {
                 warn!(device = %dev, %err, "Failed to resume video player");
+            }
+        }
+    }
+
+    /// Pauses a specific video player.
+    pub fn pause_monitor(&mut self, device: &str) {
+        if let Some(player) = self.players.get_mut(device) {
+            if let Err(err) = player.pause() {
+                warn!(device = %device, %err, "Failed to pause video player on monitor");
+            }
+        }
+    }
+
+    /// Resumes a specific video player.
+    pub fn resume_monitor(&mut self, device: &str) {
+        if let Some(player) = self.players.get_mut(device) {
+            if let Err(err) = player.resume() {
+                warn!(device = %device, %err, "Failed to resume video player on monitor");
             }
         }
     }
@@ -305,29 +327,41 @@ impl WallpaperManager {
         #[cfg(windows)]
         {
             if !self.host.is_valid() {
-                warn!("Desktop host window is invalid (Explorer may have restarted). Re-discovering...");
-                // Stop existing players before recreating windows
-                self.stop_all();
-                self.windows.clear();
-
-                // Re-discover fresh host
-                self.host = ensure_desktop_host()?;
-                info!("Re-discovered new desktop host after Explorer restart");
-
-                // Re-attach windows
-                self.attach_all_monitors()?;
-
-                // Re-launch players on active sources
-                let sources = self.active_sources.clone();
-                for (dev, (path, cfg)) in sources {
-                    if self.windows.contains_key(&dev) {
-                        info!(device = %dev, "Restoring video wallpaper after host recovery");
-                        let _ = self.play_video_on_monitor(&dev, path, cfg);
-                    }
-                }
+                self.force_recover_explorer()?;
             } else {
                 let _ = self.host.update_rect();
                 self.attach_all_monitors()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Explicitly handles Explorer restart notification: tears down players and re-attaches to the new WorkerW.
+    pub fn force_recover_explorer(&mut self) -> Result<(), WallpaperManagerError> {
+        #[cfg(windows)]
+        {
+            warn!("Explorer restart detected: tearing down existing MPV players and windows");
+            self.stop_all();
+            self.windows.clear();
+
+            // Re-discover fresh host
+            self.host = ensure_desktop_host()?;
+            info!(
+                selected_host = format_args!("0x{:X}", self.host.hwnd.0 as isize),
+                "Re-discovered new desktop host after Explorer restart"
+            );
+
+            // Re-attach windows
+            self.attach_all_monitors()?;
+
+            // Re-launch players on active sources
+            let sources = self.active_sources.clone();
+            for (dev, (path, cfg)) in sources {
+                if self.windows.contains_key(&dev) {
+                    info!(device = %dev, "Restoring video wallpaper on recreated host window");
+                    let _ = self.play_video_on_monitor(&dev, path, cfg);
+                }
             }
         }
 

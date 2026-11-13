@@ -1,9 +1,76 @@
 //! Playback supervisor managing debounced policy evaluations, system power/session events,
 //! and process crash recovery with exponential backoff.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::info;
-use wallpaper_core::{PerformanceProfile, PlaybackPolicy};
+use wallpaper_core::{PerformanceProfile, PlaybackPolicy, SuspensionFlags, SuspensionReason};
+
+/// Per-player runtime suspension manager tracking multiple independent suspension reasons.
+#[derive(Debug, Clone, Default)]
+pub struct PlayerSuspensionManager {
+    monitors: HashMap<String, SuspensionFlags>,
+    global_flags: SuspensionFlags,
+}
+
+impl PlayerSuspensionManager {
+    pub fn new() -> Self {
+        Self {
+            monitors: HashMap::new(),
+            global_flags: SuspensionFlags::new(),
+        }
+    }
+
+    /// Adds a global suspension reason affecting all monitors.
+    pub fn add_global(&mut self, reason: SuspensionReason) {
+        self.global_flags.add(reason);
+    }
+
+    /// Removes a global suspension reason.
+    pub fn remove_global(&mut self, reason: SuspensionReason) {
+        self.global_flags.remove(reason);
+    }
+
+    /// Adds a per-monitor suspension reason (e.g. UserPaused on DISPLAY1).
+    pub fn add_monitor(&mut self, device: &str, reason: SuspensionReason) {
+        self.monitors
+            .entry(device.to_string())
+            .or_default()
+            .add(reason);
+    }
+
+    /// Removes a per-monitor suspension reason.
+    pub fn remove_monitor(&mut self, device: &str, reason: SuspensionReason) {
+        if let Some(flags) = self.monitors.get_mut(device) {
+            flags.remove(reason);
+        }
+    }
+
+    /// Checks if a monitor should be suspended.
+    /// Returns true if either global suspension flags or monitor-specific flags are active.
+    pub fn should_suspend(&self, device: &str) -> bool {
+        if self.global_flags.is_suspended() {
+            return true;
+        }
+        if let Some(flags) = self.monitors.get(device) {
+            return flags.is_suspended();
+        }
+        false
+    }
+
+    /// Returns all active reasons for a monitor (combines global and per-monitor).
+    pub fn active_reasons_for(&self, device: &str) -> Vec<SuspensionReason> {
+        let mut reasons = self.global_flags.active_reasons();
+        if let Some(flags) = self.monitors.get(device) {
+            for r in flags.active_reasons() {
+                if !reasons.contains(&r) {
+                    reasons.push(r);
+                }
+            }
+        }
+        reasons
+    }
+}
 
 /// State of an active supervisor retry loop.
 #[derive(Debug, Clone)]
@@ -130,6 +197,7 @@ impl StateDebouncer {
 pub struct PlaybackSupervisor {
     pub policy: PlaybackPolicy,
     pub debouncer: StateDebouncer,
+    pub suspension: PlayerSuspensionManager,
     pub session_locked: bool,
     pub display_off: bool,
     pub active_pause_reason: Option<&'static str>,
@@ -141,6 +209,7 @@ impl PlaybackSupervisor {
         Self {
             policy,
             debouncer,
+            suspension: PlayerSuspensionManager::new(),
             session_locked: false,
             display_off: false,
             active_pause_reason: None,
@@ -209,6 +278,33 @@ mod tests {
         backoff.record_success();
         assert_eq!(backoff.consecutive_failures, 0);
         assert!(backoff.can_retry());
+    }
+
+    #[test]
+    fn test_player_suspension_manager_coexistence() {
+        let mut mgr = PlayerSuspensionManager::new();
+        assert!(!mgr.should_suspend(r"\\.\DISPLAY1"));
+        assert!(!mgr.should_suspend(r"\\.\DISPLAY2"));
+
+        // Global lock event
+        mgr.add_global(SuspensionReason::SessionLocked);
+        assert!(mgr.should_suspend(r"\\.\DISPLAY1"));
+        assert!(mgr.should_suspend(r"\\.\DISPLAY2"));
+
+        // User manually pauses DISPLAY1 while locked
+        mgr.add_monitor(r"\\.\DISPLAY1", SuspensionReason::UserPaused);
+        assert!(mgr.should_suspend(r"\\.\DISPLAY1"));
+
+        // Session unlocks
+        mgr.remove_global(SuspensionReason::SessionLocked);
+        // DISPLAY1 must remain suspended because of UserPaused!
+        assert!(mgr.should_suspend(r"\\.\DISPLAY1"));
+        // DISPLAY2 resumes!
+        assert!(!mgr.should_suspend(r"\\.\DISPLAY2"));
+
+        // User resumes DISPLAY1
+        mgr.remove_monitor(r"\\.\DISPLAY1", SuspensionReason::UserPaused);
+        assert!(!mgr.should_suspend(r"\\.\DISPLAY1"));
     }
 
     #[test]

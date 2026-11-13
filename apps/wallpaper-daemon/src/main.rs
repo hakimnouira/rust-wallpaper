@@ -4,10 +4,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use wallpaper_core::{
-    HardwareAcceleration, PerformanceProfile, PlaybackConfig, PlaybackPolicy, WallpaperLibrary,
+    HardwareAcceleration, PerformanceProfile, PlaybackConfig, PlaybackPolicy, SuspensionReason,
+    WallpaperLibrary,
 };
 use wallpaper_windows::{
-    check_foreground_fullscreen, enumerate_monitors, PlaybackSupervisor, WallpaperManager,
+    check_foreground_fullscreen, enumerate_monitors, PlaybackSupervisor, SystemEventListener,
+    SystemPlatformEvent, WallpaperManager,
 };
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
@@ -181,6 +183,15 @@ fn main() -> anyhow::Result<()> {
             "Intelligent playback supervisor active"
         );
 
+        // 5. Initialize Windows System Event Listener
+        let event_listener = SystemEventListener::start().map_err(|e| {
+            anyhow::anyhow!(
+                "failed to start Windows system event notification listener: {}",
+                e
+            )
+        })?;
+        info!("Windows system event listener active (Session, Power, Display, Explorer)");
+
         if let Some(dur) = duration_limit {
             info!(
                 duration_secs = dur.as_secs(),
@@ -201,6 +212,69 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
 
+            // Process asynchronous Windows system platform notifications
+            while let Some(evt) = event_listener.try_recv() {
+                match evt {
+                    SystemPlatformEvent::SessionLocked => {
+                        info!("Handling SessionLocked: pausing active players, recording suspension reason");
+                        supervisor.session_locked = true;
+                        supervisor
+                            .suspension
+                            .add_global(SuspensionReason::SessionLocked);
+                        manager.pause_all();
+                    }
+                    SystemPlatformEvent::SessionUnlocked => {
+                        info!("Handling SessionUnlocked: clearing session lock, reevaluating playback policy");
+                        supervisor.session_locked = false;
+                        supervisor
+                            .suspension
+                            .remove_global(SuspensionReason::SessionLocked);
+
+                        // Only resume if no other suspension flags are active
+                        let monitors = enumerate_monitors().unwrap_or_default();
+                        for m in monitors {
+                            if !supervisor.suspension.should_suspend(&m.device_name) {
+                                manager.resume_monitor(&m.device_name);
+                            }
+                        }
+                    }
+                    SystemPlatformEvent::DisplayPowerOff => {
+                        info!("Handling DisplayPowerOff: suspending players due to display sleep");
+                        supervisor.display_off = true;
+                        supervisor
+                            .suspension
+                            .add_global(SuspensionReason::DisplayPoweredOff);
+                        manager.pause_all();
+                    }
+                    SystemPlatformEvent::DisplayPowerOn => {
+                        info!("Handling DisplayPowerOn: display awakened, reevaluating playback policy");
+                        supervisor.display_off = false;
+                        supervisor
+                            .suspension
+                            .remove_global(SuspensionReason::DisplayPoweredOff);
+
+                        let monitors = enumerate_monitors().unwrap_or_default();
+                        for m in monitors {
+                            if !supervisor.suspension.should_suspend(&m.device_name) {
+                                manager.resume_monitor(&m.device_name);
+                            }
+                        }
+                    }
+                    SystemPlatformEvent::DisplayTopologyChanged => {
+                        info!("Handling DisplayTopologyChanged: re-enumerating monitors and updating window geometry");
+                        if let Err(e) = manager.refresh() {
+                            warn!(%e, "Failed to refresh monitor layout on topology change");
+                        }
+                    }
+                    SystemPlatformEvent::ExplorerRestarted => {
+                        info!("Handling ExplorerRestarted: rebuilding desktop host and recovering players");
+                        if let Err(e) = manager.force_recover_explorer() {
+                            warn!(%e, "Failed to recover desktop host after Explorer restart");
+                        }
+                    }
+                }
+            }
+
             // Periodically check foreground window and evaluate playback policy
             if last_policy_check.elapsed() >= Duration::from_millis(200) {
                 let status = check_foreground_fullscreen();
@@ -214,10 +288,21 @@ fn main() -> anyhow::Result<()> {
                             class = %status.class_name,
                             "Policy triggered: pausing wallpapers"
                         );
+                        supervisor
+                            .suspension
+                            .add_global(SuspensionReason::FullscreenApplication);
                         manager.pause_all();
                     } else {
-                        info!("Policy condition cleared: resuming wallpapers");
-                        manager.resume_all();
+                        info!("Policy condition cleared: removing fullscreen suspension");
+                        supervisor
+                            .suspension
+                            .remove_global(SuspensionReason::FullscreenApplication);
+                        let monitors = enumerate_monitors().unwrap_or_default();
+                        for m in monitors {
+                            if !supervisor.suspension.should_suspend(&m.device_name) {
+                                manager.resume_monitor(&m.device_name);
+                            }
+                        }
                     }
                 }
 

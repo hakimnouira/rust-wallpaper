@@ -34,10 +34,10 @@ mod platform {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW,
-        RegisterClassExW, SetWindowLongPtrW, SetWindowPos, GWLP_USERDATA, GWL_STYLE, HWND_BOTTOM,
+        RegisterClassExW, SetWindowLongPtrW, SetWindowPos, GWLP_USERDATA, HWND_BOTTOM,
         MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW, WM_DESTROY, WM_ERASEBKGND,
-        WM_MOUSEACTIVATE, WM_PAINT, WM_SETFOCUS, WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN,
-        WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+        WM_MOUSEACTIVATE, WM_PAINT, WM_SETFOCUS, WNDCLASSEXW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
     };
 
     const WINDOW_CLASS_NAME: PCWSTR = w!("RustWallpaperWindow");
@@ -224,18 +224,9 @@ mod platform {
             let data_ptr = Box::into_raw(custom_data);
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, data_ptr as isize);
-                let _ = windows::Win32::UI::WindowsAndMessaging::SetParent(hwnd, host_hwnd);
-
-                // Synchronize child styles and clipping after reparenting to host
-                let old_style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
-                let new_style = (old_style & !WS_POPUP.0)
-                    | WS_CHILD.0
-                    | WS_VISIBLE.0
-                    | WS_CLIPSIBLINGS.0
-                    | WS_CLIPCHILDREN.0;
-                SetWindowLongPtrW(hwnd, GWL_STYLE, new_style as isize);
-
-                // Position behind sibling windows in the host
+                // Note: Keep as a clean top-level popup initially so MPV's process can attach its child window
+                // via CreateWindowEx without violating Win32 cross-process child restrictions.
+                // It is then attached to WorkerW via `attach_to_host()` after MPV attaches.
                 let _ = SetWindowPos(
                     hwnd,
                     HWND_BOTTOM,
@@ -243,10 +234,8 @@ mod platform {
                     client_y,
                     width as i32,
                     height as i32,
-                    SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 );
-
-                let _ = InvalidateRect(hwnd, None, true);
             }
 
             info!(
@@ -271,6 +260,24 @@ mod platform {
                 is_primary,
                 brush,
             })
+        }
+
+        /// Attaches this window to the desktop host (behind icons in WorkerW).
+        pub fn attach_to_host(&self) {
+            unsafe {
+                let _ =
+                    windows::Win32::UI::WindowsAndMessaging::SetParent(self.hwnd, self.host_hwnd);
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    HWND_BOTTOM,
+                    self.client_x,
+                    self.client_y,
+                    self.width as i32,
+                    self.height as i32,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+                );
+                let _ = InvalidateRect(self.hwnd, None, true);
+            }
         }
 
         /// Updates the window geometry (e.g. following display resolution changes).

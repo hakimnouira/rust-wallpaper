@@ -138,7 +138,6 @@ impl MpvPlayer {
             .arg(format!("--volume={}", launch_cfg.config.volume))
             .arg("--idle=yes")
             .arg("--force-window=yes")
-            .arg("--vo=gpu")
             .arg("--no-border")
             .arg("--no-osc")
             .arg("--no-osd-bar")
