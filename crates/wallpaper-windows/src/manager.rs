@@ -433,6 +433,18 @@ impl wallpaper_core::monitors::WallpaperHost for WallpaperManager {
         .map_err(|e| wallpaper_core::monitors::StartError::Failed(e.to_string()))
     }
 
+    fn stop_wallpaper(&mut self, device: &str) -> Result<(), String> {
+        if let Some(mut player) = self.players.remove(device) {
+            if let Err(error) = player.stop() {
+                self.players.insert(device.to_string(), player);
+                return Err(error.to_string());
+            }
+        }
+        self.active_sources.remove(device);
+        self.backoffs.remove(device);
+        Ok(())
+    }
+
     fn player_reports(&self) -> Vec<wallpaper_core::health::PlayerReport> {
         use wallpaper_core::health::{PlayerReport, RecoveryState, Signal};
         let mut reports = Vec::with_capacity(self.players.len());
