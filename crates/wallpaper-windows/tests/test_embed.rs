@@ -478,4 +478,102 @@ mod tests {
             "pending request must resolve to an Err upon player stop"
         );
     }
+
+    #[test]
+    fn test_ipc_writer_failure_and_pending_cleanup() {
+        let mut video_path = PathBuf::from("assets/wallpapers/sample-nature.mp4");
+        if !video_path.exists() {
+            video_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets/wallpapers/sample-nature.mp4");
+        }
+        let host = ensure_desktop_host().expect("failed to discover desktop host");
+        let win = WallpaperWindow::create(
+            host.hwnd,
+            "TEST_FAIL_CLEANUP".to_string(),
+            0,
+            0,
+            400,
+            300,
+            false,
+            COLORREF(0),
+        )
+        .expect("create window");
+
+        let launch_cfg = MpvLaunchConfig {
+            video_path,
+            wid: win.hwnd.0 as isize,
+            config: PlaybackConfig::default(),
+        };
+
+        let mut player = MpvPlayer::launch(launch_cfg).expect("launch player");
+        assert_eq!(player.pending_request_count(), 0);
+
+        // 1. Verify normal command execution leaves 0 pending entries
+        player.set_volume(50).expect("normal command succeeds");
+        assert_eq!(player.pending_request_count(), 0);
+
+        // 2. Simulate writer failure / disconnect
+        player.disconnect_pipe_writer_for_test();
+        let fail_res = player.set_volume(75);
+        assert!(
+            fail_res.is_err(),
+            "command must fail when writer is disconnected"
+        );
+
+        // 3. Ensure pending_responses entry was cleaned up and not leaked
+        assert_eq!(
+            player.pending_request_count(),
+            0,
+            "failed command must not leave lingering entries in pending_responses"
+        );
+
+        // 4. Repeated stop calls must be safe and idempotent
+        player.stop().expect("first stop must succeed");
+        assert!(!player.is_alive());
+        player
+            .stop()
+            .expect("second stop must succeed idempotently");
+        player.stop().expect("third stop must succeed idempotently");
+    }
+
+    #[test]
+    fn test_wallpaper_manager_failure_recovery() {
+        use wallpaper_windows::manager::WallpaperManager;
+
+        let mut manager = WallpaperManager::init().expect("initialize wallpaper manager");
+        let devices = manager.active_devices();
+        assert!(
+            !devices.is_empty(),
+            "must have at least one active monitor device"
+        );
+
+        let primary_device = devices[0].clone();
+
+        // 1. Play with non-existent video path to trigger MpvPlayer::launch failure
+        let invalid_video = PathBuf::from("assets/non_existent_video_path_xyz123.mp4");
+        let res = manager.play_video_on_monitor(
+            &primary_device,
+            invalid_video,
+            PlaybackConfig::default(),
+        );
+
+        // Must report error
+        assert!(res.is_err(), "launching non-existent video must fail");
+
+        // 2. Verify monitor's wallpaper window was restored and attached to WorkerW host
+        let win = manager
+            .window(&primary_device)
+            .expect("wallpaper window must still exist");
+        let style = win.get_style();
+        assert_ne!(
+            style & windows::Win32::UI::WindowsAndMessaging::WS_CHILD.0,
+            0,
+            "window must remain WS_CHILD attached to host after failure recovery"
+        );
+        assert_eq!(
+            style & windows::Win32::UI::WindowsAndMessaging::WS_POPUP.0,
+            0,
+            "window must clear WS_POPUP after failure recovery"
+        );
+    }
 }

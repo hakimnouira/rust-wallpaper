@@ -148,8 +148,17 @@ impl WallpaperManager {
             .get(device)
             .ok_or_else(|| WallpaperManagerError::MonitorNotFound(device.to_string()))?;
 
+        // Stop any existing player on this monitor before reconfiguring
+        if let Some(mut existing_player) = self.players.remove(device) {
+            let _ = existing_player.stop();
+        }
+
         // Temporarily detach window to top-level popup so MPV can embed without cross-process child restrictions
-        win.detach_from_host()?;
+        if let Err(detach_err) = win.detach_from_host() {
+            // Recover original attached state if detach failed partway through
+            let _ = win.attach_to_host();
+            return Err(WallpaperManagerError::Window(detach_err));
+        }
 
         let wid = win.hwnd.0 as isize;
         self.pump_messages();
@@ -166,7 +175,7 @@ impl WallpaperManager {
             config: config.clone(),
         };
 
-        let player = match MpvPlayer::launch(launch_cfg) {
+        let mut player = match MpvPlayer::launch(launch_cfg) {
             Ok(p) => p,
             Err(e) => {
                 let _ = win.attach_to_host();
@@ -175,7 +184,12 @@ impl WallpaperManager {
         };
 
         // Ensure window is in correct bottom z-order behind desktop icons
-        win.attach_to_host()?;
+        if let Err(attach_err) = win.attach_to_host() {
+            // If reattachment fails, terminate player and restore window as safely as possible
+            let _ = player.stop();
+            let _ = win.attach_to_host();
+            return Err(WallpaperManagerError::Window(attach_err));
+        }
 
         self.players.insert(device.to_string(), player);
         self.active_sources
@@ -403,6 +417,16 @@ impl WallpaperManager {
     /// Returns a reference to the active desktop host.
     pub fn host(&self) -> &DesktopHost {
         &self.host
+    }
+
+    /// Returns a reference to the wallpaper window for a specific monitor device.
+    pub fn window(&self, device: &str) -> Option<&WallpaperWindow> {
+        self.windows.get(device)
+    }
+
+    /// Returns list of active monitor device names.
+    pub fn active_devices(&self) -> Vec<String> {
+        self.windows.keys().cloned().collect()
     }
 
     /// Returns the number of active wallpaper windows.

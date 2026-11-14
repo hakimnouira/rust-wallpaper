@@ -313,6 +313,35 @@ impl MpvProcess {
         }
     }
 
+    pub fn wait_timeout(&mut self, timeout: Duration) -> Result<Option<u32>, std::io::Error> {
+        use windows::Win32::Foundation::{GetLastError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+        let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
+        unsafe {
+            let wait = WaitForSingleObject(self.process_handle, millis);
+            match wait {
+                WAIT_OBJECT_0 => {
+                    let mut code = 0u32;
+                    GetExitCodeProcess(self.process_handle, &mut code).map_err(|e| {
+                        std::io::Error::other(format!("GetExitCodeProcess failed: {e}"))
+                    })?;
+                    Ok(Some(code))
+                }
+                WAIT_TIMEOUT => Ok(None),
+                WAIT_FAILED => {
+                    let err = GetLastError();
+                    Err(std::io::Error::other(format!(
+                        "WaitForSingleObject WAIT_FAILED: {err:?}"
+                    )))
+                }
+                other => Err(std::io::Error::other(format!(
+                    "WaitForSingleObject unexpected result: {other:?}"
+                ))),
+            }
+        }
+    }
+
     pub fn raw_handle(&self) -> windows::Win32::Foundation::HANDLE {
         self.process_handle
     }
@@ -346,14 +375,26 @@ impl MpvProcess {
     pub fn id(&self) -> u32 {
         self.0.id()
     }
-    pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, std::io::Error> {
-        self.0.try_wait()
+    pub fn try_wait(&mut self) -> Result<Option<u32>, std::io::Error> {
+        self.0
+            .try_wait()
+            .map(|opt| opt.map(|s| s.code().unwrap_or(0) as u32))
     }
     pub fn kill(&mut self) -> Result<(), std::io::Error> {
         self.0.kill()
     }
-    pub fn wait(&mut self) -> Result<std::process::ExitStatus, std::io::Error> {
-        self.0.wait()
+    pub fn wait(&mut self) -> Result<u32, std::io::Error> {
+        self.0.wait().map(|s| s.code().unwrap_or(0) as u32)
+    }
+    pub fn wait_timeout(&mut self, timeout: Duration) -> Result<Option<u32>, std::io::Error> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(Some(status.code().unwrap_or(0) as u32));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(None)
     }
 }
 
@@ -376,6 +417,13 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 impl MpvPlayer {
     /// Launches an MPV instance embedded in `wid` and establishes IPC control.
     pub fn launch(launch_cfg: MpvLaunchConfig) -> Result<Self, MpvError> {
+        if !launch_cfg.video_path.exists() {
+            return Err(MpvError::Player(format!(
+                "Video file not found at path: {}",
+                launch_cfg.video_path.display()
+            )));
+        }
+
         let mpv_bin = find_mpv_executable()?;
         let pipe_id = Uuid::new_v4();
         let pipe_name = format!("rust-wallpaper-mpv-{}", pipe_id);
@@ -683,26 +731,54 @@ impl MpvPlayer {
     /// Sends a JSON command to the MPV IPC pipe.
     pub fn send_command(&mut self, command: &[Value]) -> Result<Option<Value>, MpvError> {
         let req_id = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let payload = json!({
+            "command": command,
+            "request_id": req_id
+        });
+
+        // 1. Serialize message before inserting into pending map
+        let mut msg = serde_json::to_string(&payload)?;
+        msg.push('\n');
+
         let (tx, rx) = channel();
+
+        // 2. RAII guard ensures pending_responses entry is always removed on early error
+        struct PendingGuard<'a> {
+            pending: &'a Arc<Mutex<HashMap<u64, Sender<Result<Value, MpvError>>>>>,
+            req_id: u64,
+            completed: bool,
+        }
+        impl<'a> Drop for PendingGuard<'a> {
+            fn drop(&mut self) {
+                if !self.completed {
+                    if let Ok(mut map) = self.pending.lock() {
+                        map.remove(&self.req_id);
+                    }
+                }
+            }
+        }
 
         {
             let mut pending = self.pending_responses.lock().unwrap();
             pending.insert(req_id, tx);
         }
 
-        let payload = json!({
-            "command": command,
-            "request_id": req_id
-        });
+        let mut guard = PendingGuard {
+            pending: &self.pending_responses,
+            req_id,
+            completed: false,
+        };
 
-        let mut msg = serde_json::to_string(&payload)?;
-        msg.push('\n');
-
+        // 3. Write and flush message to pipe
         {
             let mut writer_guard = self.pipe_writer.lock().unwrap();
             if let Some(writer) = writer_guard.as_mut() {
-                writer.write_all(msg.as_bytes())?;
-                writer.flush()?;
+                if let Err(e) = writer.write_all(msg.as_bytes()) {
+                    return Err(MpvError::IpcIoError(e));
+                }
+                if let Err(e) = writer.flush() {
+                    return Err(MpvError::IpcIoError(e));
+                }
             } else {
                 return Err(MpvError::IpcConnectionFailed(
                     "IPC pipe writer not connected".into(),
@@ -744,6 +820,8 @@ impl MpvPlayer {
                 }
             }
         }
+
+        guard.completed = true;
 
         match parsed_result {
             Some(parsed) => {
@@ -836,10 +914,20 @@ impl MpvPlayer {
     /// Stops playback and terminates MPV.
     pub fn stop(&mut self) -> Result<(), MpvError> {
         if self.state == PlaybackState::Stopped {
-            return Ok(());
+            // Repeated stop calls are safe: verify process is actually dead
+            match self.child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {
+                    // Process still alive despite stopped flag, fall through to force-kill
+                }
+                Err(e) => {
+                    return Err(MpvError::Player(format!(
+                        "Failed to query child status: {e}"
+                    )));
+                }
+            }
         }
         info!("Stopping video player process");
-        self.state = PlaybackState::Stopped;
 
         // Send fire-and-forget quit command to MPV without waiting for reply
         if let Ok(mut writer_guard) = self.pipe_writer.lock() {
@@ -862,17 +950,43 @@ impl MpvPlayer {
             }
         }
 
+        // 1. Bounded wait for graceful exit
         let wait_deadline = Instant::now() + Duration::from_millis(300);
         while Instant::now() < wait_deadline {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                return Ok(());
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.state = PlaybackState::Stopped;
+                    return Ok(());
+                }
+                Ok(None) => {
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+                Err(e) => {
+                    return Err(MpvError::Player(format!(
+                        "Error querying child exit state: {e}"
+                    )));
+                }
             }
-            std::thread::sleep(Duration::from_millis(15));
         }
 
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        Ok(())
+        // 2. Graceful quit timed out, terminate child process
+        self.child
+            .kill()
+            .map_err(|e| MpvError::Player(format!("Failed to kill MPV process: {e}")))?;
+
+        // 3. Bounded wait after kill (up to 1000ms) to verify termination
+        match self.child.wait_timeout(Duration::from_millis(1000)) {
+            Ok(Some(_)) => {
+                self.state = PlaybackState::Stopped;
+                Ok(())
+            }
+            Ok(None) => Err(MpvError::Player(
+                "MPV process did not terminate within bounded kill timeout".into(),
+            )),
+            Err(e) => Err(MpvError::Player(format!(
+                "Error waiting for MPV process exit: {e}"
+            ))),
+        }
     }
 
     /// Queries working set memory bytes of the MPV child process.
@@ -909,6 +1023,16 @@ impl MpvPlayer {
     ) {
         let mut map = self.pending_responses.lock().unwrap();
         map.insert(id, tx);
+    }
+
+    #[doc(hidden)]
+    pub fn pending_request_count(&self) -> usize {
+        self.pending_responses.lock().unwrap().len()
+    }
+
+    #[doc(hidden)]
+    pub fn disconnect_pipe_writer_for_test(&mut self) {
+        *self.pipe_writer.lock().unwrap() = None;
     }
 
     /// Checks if the MPV player child process is still running.
