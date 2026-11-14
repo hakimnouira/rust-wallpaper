@@ -9,7 +9,6 @@ mod tests {
         window::WallpaperWindow,
     };
     use windows::Win32::Foundation::COLORREF;
-    use windows::Win32::UI::WindowsAndMessaging::{GetWindowLongPtrW, GWL_STYLE, WS_POPUP};
 
     #[test]
     fn test_desktop_host_and_window_lifecycle() {
@@ -57,8 +56,23 @@ mod tests {
             let _ = DestroyWindow(child);
         }
 
-        // Initially attached to WorkerW host
-        win.attach_to_host();
+        use windows::Win32::UI::WindowsAndMessaging::{WS_CHILD, WS_POPUP};
+
+        // Initially created as a top-level popup
+        let style_init = win.get_style();
+        assert_ne!(
+            style_init & WS_POPUP.0,
+            0,
+            "window must start with WS_POPUP style"
+        );
+        assert_eq!(
+            style_init & WS_CHILD.0,
+            0,
+            "window must not have WS_CHILD initially"
+        );
+
+        // Attach to WorkerW host: clear WS_POPUP, set WS_CHILD
+        win.attach_to_host().expect("attach_to_host must succeed");
         let parent_attached = unsafe {
             windows::Win32::UI::WindowsAndMessaging::GetAncestor(
                 win.hwnd,
@@ -69,29 +83,45 @@ mod tests {
             parent_attached, host.hwnd,
             "window parent must be host HWND when attached"
         );
-        let style_attached = unsafe { GetWindowLongPtrW(win.hwnd, GWL_STYLE) as u32 };
+        let style_attached = win.get_style();
         assert_ne!(
+            style_attached & WS_CHILD.0,
+            0,
+            "window must have WS_CHILD style when attached to WorkerW"
+        );
+        assert_eq!(
             style_attached & WS_POPUP.0,
             0,
-            "window must preserve WS_POPUP for cross-process embedding"
+            "window must clear WS_POPUP style when attached to WorkerW"
         );
 
-        // Detach to unowned popup
-        win.detach_from_host();
+        // Detach to unowned popup: clear WS_CHILD, set WS_POPUP
+        win.detach_from_host()
+            .expect("detach_from_host must succeed");
         let parent_detached = unsafe {
             windows::Win32::UI::WindowsAndMessaging::GetAncestor(
                 win.hwnd,
                 windows::Win32::UI::WindowsAndMessaging::GA_PARENT,
             )
         };
-        // Desktop / unowned parent is either desktop window or default
         assert_ne!(
             parent_detached, host.hwnd,
             "window parent must not be host HWND when detached"
         );
+        let style_detached = win.get_style();
+        assert_ne!(
+            style_detached & WS_POPUP.0,
+            0,
+            "window must restore WS_POPUP style when detached"
+        );
+        assert_eq!(
+            style_detached & WS_CHILD.0,
+            0,
+            "window must clear WS_CHILD style when detached"
+        );
 
-        // Re-attach
-        win.attach_to_host();
+        // Re-attach to WorkerW host
+        win.attach_to_host().expect("re-attach must succeed");
         let parent_reattach = unsafe {
             windows::Win32::UI::WindowsAndMessaging::GetAncestor(
                 win.hwnd,
@@ -101,6 +131,17 @@ mod tests {
         assert_eq!(
             parent_reattach, host.hwnd,
             "window parent must be host HWND after re-attaching"
+        );
+        let style_reattached = win.get_style();
+        assert_ne!(
+            style_reattached & WS_CHILD.0,
+            0,
+            "window must have WS_CHILD style after re-attaching"
+        );
+        assert_eq!(
+            style_reattached & WS_POPUP.0,
+            0,
+            "window must clear WS_POPUP style after re-attaching"
         );
     }
 
@@ -237,9 +278,52 @@ mod tests {
             "child parent must match wallpaper HWND"
         );
 
-        // 3. Attach to desktop host and verify WorkerW hierarchy
+        // 3. Attach to desktop host and verify WorkerW hierarchy & style transitions
         println!("STEP 3: attaching wallpaper window to WorkerW host");
-        win.attach_to_host();
+        let style_before_attach = win.get_style();
+        assert_ne!(
+            style_before_attach & windows::Win32::UI::WindowsAndMessaging::WS_POPUP.0,
+            0,
+            "wallpaper window must have WS_POPUP before attaching"
+        );
+        assert_eq!(
+            style_before_attach & windows::Win32::UI::WindowsAndMessaging::WS_CHILD.0,
+            0,
+            "wallpaper window must not have WS_CHILD before attaching"
+        );
+
+        win.attach_to_host().expect("attach_to_host must succeed");
+
+        let style_after_attach = win.get_style();
+        assert_ne!(
+            style_after_attach & windows::Win32::UI::WindowsAndMessaging::WS_CHILD.0,
+            0,
+            "wallpaper window must have WS_CHILD after attaching to WorkerW"
+        );
+        assert_eq!(
+            style_after_attach & windows::Win32::UI::WindowsAndMessaging::WS_POPUP.0,
+            0,
+            "wallpaper window must clear WS_POPUP after attaching to WorkerW"
+        );
+
+        // Verify MPV child window remains valid and parented under win.hwnd after attachment
+        let child_after_attach = win
+            .find_child_hwnd()
+            .expect("MPV child HWND must remain valid after attach");
+        assert_eq!(
+            child_after_attach, child_hwnd,
+            "child HWND handle must match"
+        );
+        let child_parent_after = unsafe {
+            windows::Win32::UI::WindowsAndMessaging::GetAncestor(
+                child_after_attach,
+                windows::Win32::UI::WindowsAndMessaging::GA_PARENT,
+            )
+        };
+        assert_eq!(
+            child_parent_after, win.hwnd,
+            "child parent must still be wallpaper HWND"
+        );
 
         let win_parent = unsafe {
             windows::Win32::UI::WindowsAndMessaging::GetAncestor(
@@ -378,8 +462,20 @@ mod tests {
             let _ = player.query_active_decoder();
         }
 
-        // Test shutdown with pending requests
+        // Test shutdown while requests are pending
+        let (tx_pending, rx_pending) = std::sync::mpsc::channel();
+        player.insert_mock_pending_request(999_999, tx_pending);
+
+        // player.stop() must complete pending requests with errors and clean up child
         player.stop().expect("stop player");
-        assert!(!player.is_alive());
+        assert!(!player.is_alive(), "player must stop cleanly");
+
+        let pending_res = rx_pending
+            .recv_timeout(Duration::from_millis(500))
+            .expect("pending request must receive response upon stop");
+        assert!(
+            pending_res.is_err(),
+            "pending request must resolve to an Err upon player stop"
+        );
     }
 }

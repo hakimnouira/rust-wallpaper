@@ -34,10 +34,10 @@ mod platform {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW,
-        RegisterClassExW, SetWindowLongPtrW, SetWindowPos, GWLP_USERDATA, HWND_BOTTOM,
-        MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW, WM_DESTROY, WM_ERASEBKGND,
-        WM_MOUSEACTIVATE, WM_PAINT, WM_SETFOCUS, WNDCLASSEXW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+        RegisterClassExW, SetWindowLongPtrW, SetWindowPos, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE,
+        HWND_BOTTOM, MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW, WM_DESTROY,
+        WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_PAINT, WM_SETFOCUS, WNDCLASSEXW, WS_CHILD,
+        WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
     };
 
     const WINDOW_CLASS_NAME: PCWSTR = w!("RustWallpaperWindow");
@@ -297,13 +297,48 @@ mod platform {
             }
         }
 
-        /// Attaches this window to the desktop host (behind icons in WorkerW).
-        pub fn attach_to_host(&self) {
-            unsafe {
-                let _ =
-                    windows::Win32::UI::WindowsAndMessaging::SetParent(self.hwnd, self.host_hwnd);
+        /// Retrieves the current window style (GWL_STYLE).
+        pub fn get_style(&self) -> u32 {
+            unsafe { GetWindowLongPtrW(self.hwnd, GWL_STYLE) as u32 }
+        }
 
-                let _ = SetWindowPos(
+        /// Retrieves the current extended window style (GWL_EXSTYLE).
+        pub fn get_ex_style(&self) -> u32 {
+            unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32 }
+        }
+
+        /// Attaches this window to the desktop host (behind icons in WorkerW).
+        /// Transitions style from WS_POPUP to WS_CHILD and reparents to host_hwnd.
+        pub fn attach_to_host(&self) -> Result<(), WindowError> {
+            unsafe {
+                // 1. Clear WS_POPUP and set WS_CHILD before SetParent (per Win32 docs)
+                let mut style = GetWindowLongPtrW(self.hwnd, GWL_STYLE) as u32;
+                style &= !WS_POPUP.0;
+                style |= WS_CHILD.0;
+                windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(
+                    0,
+                ));
+                let prev_style = SetWindowLongPtrW(self.hwnd, GWL_STYLE, style as isize);
+                if prev_style == 0 {
+                    let err = windows::Win32::Foundation::GetLastError();
+                    if err.0 != 0 {
+                        return Err(WindowError::ApiError(format!(
+                            "SetWindowLongPtrW (GWL_STYLE -> WS_CHILD) failed: {err:?}"
+                        )));
+                    }
+                }
+
+                // 2. Reparent to WorkerW host
+                windows::Win32::UI::WindowsAndMessaging::SetParent(self.hwnd, self.host_hwnd)
+                    .map_err(|e| {
+                        WindowError::ApiError(format!(
+                            "SetParent to host 0x{:X} failed: {e}",
+                            self.host_hwnd.0 as usize
+                        ))
+                    })?;
+
+                // 3. Apply frame refresh and ensure bottom z-order
+                SetWindowPos(
                     self.hwnd,
                     HWND_BOTTOM,
                     self.client_x,
@@ -311,18 +346,43 @@ mod platform {
                     self.width as i32,
                     self.height as i32,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
-                );
+                )
+                .map_err(|e| WindowError::ApiError(format!("SetWindowPos failed: {e}")))?;
+
                 let _ = InvalidateRect(self.hwnd, None, true);
+                Ok(())
             }
         }
 
         /// Detaches this window from WorkerW, turning it into an unowned top-level popup.
-        pub fn detach_from_host(&self) {
+        /// Transitions style from WS_CHILD to WS_POPUP and reparents to desktop top-level.
+        pub fn detach_from_host(&self) -> Result<(), WindowError> {
             unsafe {
-                let _ =
-                    windows::Win32::UI::WindowsAndMessaging::SetParent(self.hwnd, HWND::default());
+                // 1. Clear WS_CHILD and restore WS_POPUP before SetParent
+                let mut style = GetWindowLongPtrW(self.hwnd, GWL_STYLE) as u32;
+                style &= !WS_CHILD.0;
+                style |= WS_POPUP.0;
+                windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::WIN32_ERROR(
+                    0,
+                ));
+                let prev_style = SetWindowLongPtrW(self.hwnd, GWL_STYLE, style as isize);
+                if prev_style == 0 {
+                    let err = windows::Win32::Foundation::GetLastError();
+                    if err.0 != 0 {
+                        return Err(WindowError::ApiError(format!(
+                            "SetWindowLongPtrW (GWL_STYLE -> WS_POPUP) failed: {err:?}"
+                        )));
+                    }
+                }
 
-                let _ = SetWindowPos(
+                // 2. Reparent to NULL (top-level)
+                windows::Win32::UI::WindowsAndMessaging::SetParent(self.hwnd, HWND::default())
+                    .map_err(|e| {
+                        WindowError::ApiError(format!("SetParent to desktop top-level failed: {e}"))
+                    })?;
+
+                // 3. Apply frame refresh
+                SetWindowPos(
                     self.hwnd,
                     HWND_BOTTOM,
                     self.client_x,
@@ -330,8 +390,11 @@ mod platform {
                     self.width as i32,
                     self.height as i32,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
-                );
+                )
+                .map_err(|e| WindowError::ApiError(format!("SetWindowPos failed: {e}")))?;
+
                 let _ = InvalidateRect(self.hwnd, None, true);
+                Ok(())
             }
         }
 
@@ -395,5 +458,25 @@ impl WallpaperWindow {
         self.client_y = client_y;
         self.width = width;
         self.height = height;
+    }
+
+    pub fn attach_to_host(&self) -> Result<(), WindowError> {
+        Ok(())
+    }
+
+    pub fn detach_from_host(&self) -> Result<(), WindowError> {
+        Ok(())
+    }
+
+    pub fn get_style(&self) -> u32 {
+        0
+    }
+
+    pub fn get_ex_style(&self) -> u32 {
+        0
+    }
+
+    pub fn has_child_window(&self) -> bool {
+        false
     }
 }
