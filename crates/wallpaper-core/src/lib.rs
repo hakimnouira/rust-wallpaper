@@ -1,6 +1,9 @@
 //! Platform-independent domain types for the wallpaper engine.
 
+pub mod health;
 pub mod library;
+pub mod monitors;
+pub mod registration;
 pub mod runtime;
 
 pub use library::{LibraryError, WallpaperLibrary};
