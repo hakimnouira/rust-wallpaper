@@ -265,6 +265,11 @@ mod platform {
 
         /// Checks if an embedded child window (such as MPV's render surface) has been created inside this window.
         pub fn has_child_window(&self) -> bool {
+            self.find_child_hwnd().is_some()
+        }
+
+        /// Returns the first child window handle inside this window if one exists.
+        pub fn find_child_hwnd(&self) -> Option<HWND> {
             unsafe {
                 let child = windows::Win32::UI::WindowsAndMessaging::FindWindowExW(
                     self.hwnd,
@@ -272,7 +277,23 @@ mod platform {
                     PCWSTR::null(),
                     PCWSTR::null(),
                 );
-                child.map(|h| h.0 != std::ptr::null_mut()).unwrap_or(false)
+                match child {
+                    Ok(h) if !h.0.is_null() => Some(h),
+                    _ => None,
+                }
+            }
+        }
+
+        /// Retrieves the Win32 window class name for a given HWND.
+        pub fn get_window_class(hwnd: HWND) -> Option<String> {
+            let mut buf = [0u16; 256];
+            unsafe {
+                let len = windows::Win32::UI::WindowsAndMessaging::GetClassNameW(hwnd, &mut buf);
+                if len > 0 {
+                    Some(String::from_utf16_lossy(&buf[..len as usize]))
+                } else {
+                    None
+                }
             }
         }
 
