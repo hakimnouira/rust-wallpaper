@@ -445,10 +445,10 @@ impl wallpaper_core::monitors::WallpaperHost for WallpaperManager {
         Ok(())
     }
 
-    fn player_reports(&self) -> Vec<wallpaper_core::health::PlayerReport> {
+    fn player_reports(&mut self) -> Vec<wallpaper_core::health::PlayerReport> {
         use wallpaper_core::health::{PlayerReport, RecoveryState, Signal};
         let mut reports = Vec::with_capacity(self.players.len());
-        for (device, player) in &self.players {
+        for (device, player) in &mut self.players {
             let recovery = self.backoffs.get(device).and_then(|b| {
                 if b.consecutive_failures == 0 {
                     None
@@ -463,9 +463,7 @@ impl wallpaper_core::monitors::WallpaperHost for WallpaperManager {
                 state: player.state(),
                 uptime: Some(std::time::Duration::from_secs(player.uptime_secs())),
                 memory_bytes: player.get_memory_bytes(),
-                // Child::try_wait requires mutable access. Keep this read-only snapshot
-                // non-blocking; scheduled recovery and IPC probes provide fault evidence.
-                process_alive: Signal::Unknown,
+                process_alive: Signal::from_bool(player.is_alive()),
                 recovery,
             });
         }
