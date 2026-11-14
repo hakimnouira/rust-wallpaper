@@ -478,11 +478,14 @@ impl WallpaperManager {
     pub fn probe_players(&mut self) -> Vec<wallpaper_core::health::ProbeResult> {
         let mut results = Vec::with_capacity(self.players.len());
         for (device, player) in &mut self.players {
-            let (width, height, _, _) = player.query_video_details();
+            let (ipc_responded, video_initialized) = match player.probe_video_output() {
+                Ok((responded, initialized)) => (responded, initialized),
+                Err(_) => (false, false),
+            };
             results.push(wallpaper_core::health::ProbeResult {
                 device: device.clone(),
-                ipc_responded: width.is_some() || height.is_some(),
-                video_initialized: width.unwrap_or(0) > 0 && height.unwrap_or(0) > 0,
+                ipc_responded,
+                video_initialized,
             });
         }
         results
