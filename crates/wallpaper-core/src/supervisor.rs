@@ -70,6 +70,18 @@ impl RuntimeSupervisor {
         result
     }
 
+    /// Removes a persisted user assignment and reapplies the registry's default policy.
+    pub fn unassign_user<H: WallpaperHost>(
+        &mut self,
+        device: &str,
+        host: &mut H,
+        now: Instant,
+    ) -> Result<(), String> {
+        let result = self.lifecycle.unassign_user(device, host, now);
+        self.runtime.reset_command_history(device);
+        result
+    }
+
     /// True when a (potentially blocking) IPC probe round should run now.
     pub fn probe_due(&self, now: Instant) -> bool {
         self.probes.is_due(now)
