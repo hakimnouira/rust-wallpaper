@@ -420,14 +420,13 @@ fn handle_control(
     };
 
     match cmd {
-        ControlCommand::Pause { device } => {
-            let device = device.as_deref().and_then(|d| resolve(d).ok());
-            if let Some(input) = device.as_deref() {
-                runtime.runtime.set_user_paused(Some(input), true);
-            } else if device.is_none() {
-                runtime.runtime.set_user_paused(None, true);
-            }
-        }
+        ControlCommand::Pause { device } => match device {
+            Some(name) => match resolve(&name) {
+                Ok(device) => { runtime.runtime.set_user_paused(Some(&device), true); }
+                Err(e) => warn!("{e}"),
+            },
+            None => { runtime.runtime.set_user_paused(None, true); }
+        },
         ControlCommand::Resume { device } => match device {
             Some(name) => match resolve(&name) {
                 Ok(device) => { runtime.runtime.set_user_paused(Some(&device), false); }
