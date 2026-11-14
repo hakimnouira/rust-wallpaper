@@ -347,7 +347,7 @@ mod tests {
             );
             Ok(())
         }
-        fn player_reports(&self) -> Vec<PlayerReport> {
+        fn player_reports(&mut self) -> Vec<PlayerReport> {
             self.players
                 .iter()
                 .map(|(d, p)| PlayerReport {
