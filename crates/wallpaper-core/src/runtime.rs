@@ -64,6 +64,7 @@ pub const FULLSCREEN_TOLERANCE_PX: i32 = 2;
 pub const MAXIMIZED_TOLERANCE_PX: i32 = 10;
 
 /// Evaluates geometric coverage between a window rect and a monitor rect.
+#[allow(clippy::too_many_arguments)] // kept for compatibility with the original public signature
 pub fn is_rect_fullscreen(
     win_left: i32,
     win_top: i32,
@@ -757,9 +758,10 @@ impl RuntimeState {
 
         if let Some(at) = self.explorer_event_at {
             let settled = now.saturating_duration_since(at) >= EXPLORER_SETTLE;
-            let spaced = self.last_explorer_recovery.map_or(true, |t| {
-                now.saturating_duration_since(t) >= EXPLORER_MIN_INTERVAL
-            });
+            let spaced = match self.last_explorer_recovery {
+                Some(t) => now.saturating_duration_since(t) >= EXPLORER_MIN_INTERVAL,
+                None => true,
+            };
             if settled && spaced {
                 self.explorer_event_at = None;
                 self.last_explorer_recovery = Some(now);
@@ -1540,10 +1542,11 @@ mod tests {
         assert_eq!(rt.suspension().active_reasons_for(D1).len(), 5);
 
         // Clear them one at a time in a scrambled order; player must stay paused until the last.
-        let steps: Vec<Box<dyn Fn(&mut RuntimeState, Instant)>> = vec![
+        type Step = Box<dyn Fn(&mut RuntimeState, Instant)>;
+        let steps: Vec<Step> = vec![
             Box::new(|r, t| r.apply_event(RuntimeEvent::DisplayPowerOn, t)),
             Box::new(|r, t| r.apply_event(RuntimeEvent::SystemResume, t)),
-            Box::new(|r, t| {
+            Box::new(|r, _t| {
                 r.set_user_paused(Some(D1), false);
             }),
             Box::new(|r, t| r.apply_event(RuntimeEvent::SessionUnlocked, t)),

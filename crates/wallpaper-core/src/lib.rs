@@ -279,7 +279,7 @@ pub enum ForegroundKind {
 /// | Performance | exclusive fullscreen only                |  300 ms /  750 ms       | 200 ms |
 ///
 /// All profiles pause for session lock, display power-off and system suspend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PerformanceProfile {
     /// Aggressive pause behavior: pauses on any maximized or fullscreen window and
@@ -287,16 +287,11 @@ pub enum PerformanceProfile {
     Eco,
     /// Default profile: pauses during borderless/exclusive fullscreen applications and
     /// games but keeps playing behind ordinary maximized productivity apps.
+    #[default]
     Balanced,
     /// Maximizes uptime: keeps playing behind maximized and borderless apps and only
     /// pauses for exclusive fullscreen (or the session/power events every profile honours).
     Performance,
-}
-
-impl Default for PerformanceProfile {
-    fn default() -> Self {
-        Self::Balanced
-    }
 }
 
 impl PerformanceProfile {
