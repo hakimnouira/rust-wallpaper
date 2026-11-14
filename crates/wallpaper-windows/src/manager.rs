@@ -45,6 +45,22 @@ pub enum WallpaperManagerError {
     },
 }
 
+/// Summary of results from a global shutdown operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShutdownSummary {
+    /// Device names of players that were successfully terminated and removed.
+    pub stopped: Vec<String>,
+    /// Device names and corresponding error messages for players that failed to terminate.
+    pub failed: Vec<(String, String)>,
+}
+
+impl ShutdownSummary {
+    /// Returns true if all players terminated successfully without errors.
+    pub fn is_success(&self) -> bool {
+        self.failed.is_empty()
+    }
+}
+
 /// Palette of background colors for different displays.
 const MONITOR_PALETTE: &[(u8, u8, u8)] = &[
     (24, 32, 47), // Deep navy slate
@@ -312,19 +328,53 @@ impl WallpaperManager {
         }
     }
 
-    /// Stops all video players and accurately reports individual outcomes.
-    pub fn stop_all(&mut self) {
+    /// Stops all video players, retaining any failed players in tracking.
+    ///
+    /// Clears active sources to prevent unintended auto-restarts, attempts to stop each
+    /// player, removes only successfully terminated players from tracking, and logs a
+    /// clear shutdown summary with affected monitor IDs.
+    pub fn stop_all(&mut self) -> ShutdownSummary {
+        // Clear active sources to prevent unintended automatic restarts after an explicit stop
+        self.active_sources.clear();
+
+        let mut summary = ShutdownSummary::default();
+
         for (dev, player) in &mut self.players {
             match player.stop() {
                 Ok(()) => {
                     info!(device = %dev, "Stopped video player");
+                    summary.stopped.push(dev.clone());
                 }
                 Err(err) => {
                     warn!(device = %dev, %err, "Failed to stop video player");
+                    summary.failed.push((dev.clone(), err.to_string()));
                 }
             }
         }
-        self.players.clear();
+
+        // Remove only successfully stopped players from tracking.
+        // Failed players remain in self.players so they stay observable and can be retried.
+        for dev in &summary.stopped {
+            self.players.remove(dev);
+        }
+
+        let failed_ids: Vec<&str> = summary.failed.iter().map(|(d, _)| d.as_str()).collect();
+        if summary.failed.is_empty() {
+            info!(
+                stopped_count = summary.stopped.len(),
+                stopped_monitors = ?summary.stopped,
+                "Global shutdown completed successfully for all monitors"
+            );
+        } else {
+            warn!(
+                stopped_count = summary.stopped.len(),
+                failed_count = summary.failed.len(),
+                failed_monitors = ?failed_ids,
+                "Global shutdown completed with failures; retained failed players in tracking"
+            );
+        }
+
+        summary
     }
 
     /// Returns a list of active players with their diagnostic metrics.
@@ -346,9 +396,14 @@ impl WallpaperManager {
         let devices: Vec<String> = self.windows.keys().cloned().collect();
 
         for dev in devices {
+            // Only check/recover if there is an active configured source for this device
+            if !self.active_sources.contains_key(&dev) {
+                continue;
+            }
+
             let needs_restart = match self.players.get_mut(&dev) {
                 Some(player) => player.uptime_secs() >= 1 && !player.is_alive(),
-                None => self.active_sources.contains_key(&dev),
+                None => true,
             };
 
             if needs_restart {
@@ -418,6 +473,7 @@ impl WallpaperManager {
         #[cfg(windows)]
         {
             warn!("Explorer restart detected: tearing down existing MPV players and windows");
+            let saved_sources = self.active_sources.clone();
             self.stop_all();
             self.windows.clear();
 
@@ -432,8 +488,7 @@ impl WallpaperManager {
             self.attach_all_monitors()?;
 
             // Re-launch players on active sources
-            let sources = self.active_sources.clone();
-            for (dev, (path, cfg)) in sources {
+            for (dev, (path, cfg)) in saved_sources {
                 if self.windows.contains_key(&dev) {
                     info!(device = %dev, "Restoring video wallpaper on recreated host window");
                     let _ = self.play_video_on_monitor(&dev, path, cfg);
@@ -490,6 +545,26 @@ impl WallpaperManager {
     /// Returns the number of active video players.
     pub fn player_count(&self) -> usize {
         self.players.len()
+    }
+
+    /// Returns a reference to the active video player for a specific monitor device.
+    pub fn player(&self, device: &str) -> Option<&MpvPlayer> {
+        self.players.get(device)
+    }
+
+    /// Returns a mutable reference to the active video player for a specific monitor device.
+    pub fn player_mut(&mut self, device: &str) -> Option<&mut MpvPlayer> {
+        self.players.get_mut(device)
+    }
+
+    /// Returns whether a monitor device has an active video source configured.
+    pub fn has_active_source(&self, device: &str) -> bool {
+        self.active_sources.contains_key(device)
+    }
+
+    /// Returns the number of configured active video sources.
+    pub fn active_source_count(&self) -> usize {
+        self.active_sources.len()
     }
 }
 

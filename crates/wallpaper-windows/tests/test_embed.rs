@@ -609,4 +609,109 @@ mod tests {
         assert_eq!(manager.player_count(), 0);
         manager.stop_all(); // Idempotent stop_all
     }
+
+    #[test]
+    fn test_manager_stop_all_preserves_failed_player_tracking() {
+        use wallpaper_windows::manager::WallpaperManager;
+
+        let mut manager = WallpaperManager::init().expect("initialize wallpaper manager");
+        let devices = manager.active_devices();
+        assert!(
+            !devices.is_empty(),
+            "must have at least one active monitor device"
+        );
+
+        let primary_device = devices[0].clone();
+
+        let mut valid_video = PathBuf::from("assets/wallpapers/sample-nature.mp4");
+        if !valid_video.exists() {
+            valid_video = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets/wallpapers/sample-nature.mp4");
+        }
+
+        // 1. Start video playback on primary monitor
+        manager
+            .play_video_on_monitor(&primary_device, valid_video, PlaybackConfig::default())
+            .expect("initial playback must succeed");
+        assert_eq!(manager.player_count(), 1, "must have 1 active player");
+        assert!(
+            manager.has_active_source(&primary_device),
+            "must have active source registered"
+        );
+
+        // 2. Inject mock stop failure on the player
+        manager
+            .player_mut(&primary_device)
+            .expect("player must exist")
+            .set_mock_stop_failure(true);
+
+        // 3. Execute stop_all(): must attempt stop, retain failed player, clear active_sources
+        let summary = manager.stop_all();
+        assert!(
+            !summary.is_success(),
+            "stop_all must report failure when child stop fails"
+        );
+        assert_eq!(summary.stopped.len(), 0, "no players succeeded stopping");
+        assert_eq!(summary.failed.len(), 1, "exactly 1 player failed stopping");
+        assert_eq!(summary.failed[0].0, primary_device);
+
+        // 4. Verify player is RETAINED in self.players and remains observable
+        assert_eq!(
+            manager.player_count(),
+            1,
+            "failed player must remain tracked in self.players"
+        );
+        assert!(
+            manager.player(&primary_device).is_some(),
+            "failed player must be observable in manager"
+        );
+        assert_eq!(
+            manager.player_statuses().len(),
+            1,
+            "retained player must be present in player_statuses"
+        );
+
+        // 5. Verify active_sources was cleared, preventing unintended automatic restarts
+        assert_eq!(
+            manager.active_source_count(),
+            0,
+            "active sources must be cleared by global stop request"
+        );
+        assert!(
+            !manager.has_active_source(&primary_device),
+            "device must no longer have active source"
+        );
+
+        // Verify check_and_recover_players() does not restart or duplicate players
+        manager.check_and_recover_players();
+        assert_eq!(
+            manager.player_count(),
+            1,
+            "retained player count must remain 1 after recovery check"
+        );
+        assert_eq!(manager.active_source_count(), 0);
+
+        // 6. Reset mock failure and retry shutdown: must succeed and remove player
+        manager
+            .player_mut(&primary_device)
+            .expect("player exists")
+            .set_mock_stop_failure(false);
+
+        let retry_summary = manager.stop_all();
+        assert!(
+            retry_summary.is_success(),
+            "stop_all must succeed once mock failure is cleared"
+        );
+        assert_eq!(retry_summary.stopped.len(), 1);
+        assert_eq!(retry_summary.stopped[0], primary_device);
+        assert_eq!(retry_summary.failed.len(), 0);
+
+        // Player is now confirmed terminated and removed from tracking
+        assert_eq!(
+            manager.player_count(),
+            0,
+            "player must be removed from self.players after successful termination"
+        );
+        assert!(manager.player(&primary_device).is_none());
+    }
 }

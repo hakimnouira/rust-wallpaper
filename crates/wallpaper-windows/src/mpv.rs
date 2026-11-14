@@ -410,6 +410,8 @@ pub struct MpvPlayer {
     volume: u32,
     muted: bool,
     started_at: Instant,
+    #[doc(hidden)]
+    mock_stop_failure: bool,
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -680,6 +682,7 @@ impl MpvPlayer {
             volume: launch_cfg.config.volume,
             muted: launch_cfg.config.mute,
             started_at: Instant::now(),
+            mock_stop_failure: false,
         };
 
         // Query active decoder through IPC with bounded polling
@@ -913,6 +916,12 @@ impl MpvPlayer {
 
     /// Stops playback and terminates MPV.
     pub fn stop(&mut self) -> Result<(), MpvError> {
+        if self.mock_stop_failure {
+            return Err(MpvError::Player(
+                "Injected mock shutdown failure for testing".to_string(),
+            ));
+        }
+
         if self.state == PlaybackState::Stopped {
             // Repeated stop calls are safe: verify process is actually dead
             match self.child.try_wait() {
@@ -1033,6 +1042,12 @@ impl MpvPlayer {
     #[doc(hidden)]
     pub fn disconnect_pipe_writer_for_test(&mut self) {
         *self.pipe_writer.lock().unwrap() = None;
+    }
+
+    /// For testing: simulate a shutdown/kill failure without relying on OS process errors.
+    #[doc(hidden)]
+    pub fn set_mock_stop_failure(&mut self, fail: bool) {
+        self.mock_stop_failure = fail;
     }
 
     /// Checks if the MPV player child process is still running.
