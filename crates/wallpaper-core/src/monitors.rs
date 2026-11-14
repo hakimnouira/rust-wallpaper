@@ -619,6 +619,9 @@ impl MonitorLifecycle {
             info!(device = %m.device_name, id = %m.id, "Monitor disconnected");
             self.start_retry.remove(&m.device_name);
             self.rearm.remove(&m.device_name);
+            // A device name is only a current Windows routing key. Never keep an applied
+            // marker for a disconnected output: the same hardware may return as DISPLAYn.
+            self.applied.remove(&m.device_name);
         }
         for c in &report.diff.changed {
             info!(
@@ -628,6 +631,11 @@ impl MonitorLifecycle {
                 primary = c.primary_changed(),
                 "Monitor changed"
             );
+            if c.renamed() {
+                self.applied.remove(&c.old.device_name);
+                self.start_retry.remove(&c.old.device_name);
+                self.rearm.remove(&c.old.device_name);
+            }
         }
         self.ensure_all(host, now, &mut report);
         report
