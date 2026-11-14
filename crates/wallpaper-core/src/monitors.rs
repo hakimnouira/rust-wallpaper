@@ -899,6 +899,7 @@ mod tests {
         pause_calls: Vec<String>,
         resume_calls: Vec<String>,
         fail_start: bool,
+        stop_calls: Vec<String>,
     }
 
     impl FakeHost {
@@ -951,6 +952,12 @@ mod tests {
             self.sources.insert(device.to_string(), a.clone());
             self.players
                 .insert(device.to_string(), ActualPlayback::Playing);
+            Ok(())
+        }
+        fn stop_wallpaper(&mut self, device: &str) -> Result<(), String> {
+            self.stop_calls.push(device.to_string());
+            self.players.remove(device);
+            self.sources.remove(device);
             Ok(())
         }
         fn player_reports(&self) -> Vec<PlayerReport> {
@@ -1197,6 +1204,24 @@ mod tests {
         );
         assert_eq!(rep.started.len(), 2);
         assert_eq!(lc.assigned_devices(), vec![D1.to_string(), D2.to_string()]);
+    }
+
+    #[test]
+    fn clearing_last_assignment_stops_the_wallpaper() {
+        let t = Instant::now();
+        let mut host = FakeHost::default();
+        host.connect(D1);
+        let mut lc = lifecycle(None);
+        lc.sync(vec![mon("A", D1, 0, true)], &mut host, t);
+        lc.assign_user(D1, a("chosen.mp4"), &mut host, t).unwrap();
+        assert_eq!(host.players.get(D1), Some(&ActualPlayback::Playing));
+
+        lc.unassign_user(D1, &mut host, t + ms(10)).unwrap();
+
+        assert_eq!(host.stop_calls, vec![D1.to_string()]);
+        assert!(!host.players.contains_key(D1));
+        assert!(!host.sources.contains_key(D1));
+        assert!(lc.wanted_devices().is_empty());
     }
 
     /// Monitor added: it gets a default, and nothing already running is touched.
