@@ -148,6 +148,9 @@ impl WallpaperManager {
             .get(device)
             .ok_or_else(|| WallpaperManagerError::MonitorNotFound(device.to_string()))?;
 
+        // Temporarily detach window to top-level popup so MPV can embed without cross-process child restrictions
+        win.detach_from_host();
+
         let wid = win.hwnd.0 as isize;
         self.pump_messages();
         info!(
@@ -163,9 +166,15 @@ impl WallpaperManager {
             config: config.clone(),
         };
 
-        let player = MpvPlayer::launch(launch_cfg)?;
-        // After MPV has successfully initialized and embedded its VO into the window,
-        // attach the window to WorkerW behind desktop icons.
+        let player = match MpvPlayer::launch(launch_cfg) {
+            Ok(p) => p,
+            Err(e) => {
+                win.attach_to_host();
+                return Err(WallpaperManagerError::Player(e));
+            }
+        };
+
+        // Ensure window is in correct bottom z-order behind desktop icons
         win.attach_to_host();
 
         self.players.insert(device.to_string(), player);

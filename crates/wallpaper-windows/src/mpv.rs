@@ -125,9 +125,11 @@ impl MpvPlayer {
             "no"
         };
 
+        crate::desktop_host::ensure_interactive_desktop();
+
         let mut cmd = Command::new(&mpv_bin);
         let log_path = std::env::temp_dir().join(format!("mpv-{}.log", pipe_id));
-        cmd.arg(format!("--wid={}", launch_cfg.wid))
+        cmd.arg(format!("--wid={}", launch_cfg.wid as usize))
             .arg(format!("--input-ipc-server={}", pipe_path))
             .arg(format!("--log-file={}", log_path.display()))
             .arg("--msg-level=all=trace")
@@ -138,6 +140,8 @@ impl MpvPlayer {
             .arg(format!("--volume={}", launch_cfg.config.volume))
             .arg("--idle=yes")
             .arg("--force-window=yes")
+            .arg("--vo=gpu")
+            .arg("--gpu-context=d3d11")
             .arg("--no-border")
             .arg("--no-osc")
             .arg("--no-osd-bar")
@@ -155,7 +159,7 @@ impl MpvPlayer {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
-        let child = cmd.spawn().map_err(MpvError::SpawnFailed)?;
+        let mut child = cmd.spawn().map_err(MpvError::SpawnFailed)?;
 
         #[cfg(windows)]
         let job_handle = Self::attach_job_object(&child)?;
@@ -165,6 +169,12 @@ impl MpvPlayer {
         let mut pipe_file = None;
 
         while Instant::now() < connect_deadline {
+            if let Ok(Some(status)) = child.try_wait() {
+                return Err(MpvError::Player(format!(
+                    "MPV child process exited unexpectedly with status {status:?}"
+                )));
+            }
+
             #[cfg(windows)]
             {
                 use windows::Win32::UI::WindowsAndMessaging::{
@@ -197,18 +207,63 @@ impl MpvPlayer {
         if let Some(file) = pipe_file {
             if let Ok(writer_clone) = file.try_clone() {
                 *pipe_writer.lock().unwrap() = Some(writer_clone);
+                #[cfg(windows)]
+                use std::os::windows::io::AsRawHandle;
+                #[cfg(windows)]
+                let raw_handle = file.as_raw_handle() as isize;
+
                 let reader = BufReader::new(file);
                 let pending_clone = Arc::clone(&pending_responses);
                 let running_clone = Arc::clone(&reader_running);
                 running_clone.store(true, Ordering::SeqCst);
 
-                // Dedicated background reader thread
+                // Dedicated background reader thread with non-blocking peek to prevent pipe locks
                 std::thread::Builder::new()
                     .name("mpv-ipc-reader".into())
                     .spawn(move || {
                         let mut r = reader;
                         let mut line = String::new();
+                        #[cfg(windows)]
+                        extern "system" {
+                            fn PeekNamedPipe(
+                                hNamedPipe: windows::Win32::Foundation::HANDLE,
+                                lpBuffer: *mut core::ffi::c_void,
+                                nBufferSize: u32,
+                                lpBytesRead: *mut u32,
+                                lpTotalBytesAvail: *mut u32,
+                                lpBytesLeftThisMessage: *mut u32,
+                            ) -> windows::Win32::Foundation::BOOL;
+                        }
+                        #[cfg(windows)]
+                        let pipe_handle = windows::Win32::Foundation::HANDLE(
+                            raw_handle as *mut core::ffi::c_void,
+                        );
+
                         while running_clone.load(Ordering::SeqCst) {
+                            #[cfg(windows)]
+                            {
+                                let mut bytes_avail = 0u32;
+                                let ok = unsafe {
+                                    PeekNamedPipe(
+                                        pipe_handle,
+                                        std::ptr::null_mut(),
+                                        0,
+                                        std::ptr::null_mut(),
+                                        &mut bytes_avail,
+                                        std::ptr::null_mut(),
+                                    )
+                                    .as_bool()
+                                };
+                                if ok {
+                                    if bytes_avail == 0 {
+                                        std::thread::sleep(Duration::from_millis(10));
+                                        continue;
+                                    }
+                                } else {
+                                    break; // Pipe broken or closed
+                                }
+                            }
+
                             line.clear();
                             match r.read_line(&mut line) {
                                 Ok(0) => break, // EOF
@@ -253,22 +308,44 @@ impl MpvPlayer {
             job_handle,
         };
 
-        // Query active decoder through IPC
+        // Query active decoder through IPC with bounded polling
         if player.reader_running.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(250));
-            match player.query_active_decoder() {
-                Ok(decoder) => {
-                    info!(
-                        active_decoder = %decoder,
-                        requested = ?launch_cfg.config.hardware_acceleration,
-                        "Hardware decoding telemetry verified"
-                    );
-                    player.active_decoder = decoder;
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            let mut detected = "software".to_string();
+            while Instant::now() < deadline {
+                #[cfg(windows)]
+                {
+                    use windows::Win32::UI::WindowsAndMessaging::{
+                        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+                    };
+                    let mut msg = MSG::default();
+                    unsafe {
+                        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                            let _ = TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                    }
                 }
-                Err(err) => {
-                    warn!(%err, "Failed initial query for active decoder");
+
+                if let Ok(decoder) = player.query_active_decoder() {
+                    if !decoder.is_empty() && decoder != "no" {
+                        detected = decoder;
+                        if detected != "software"
+                            || launch_cfg.config.hardware_acceleration
+                                == wallpaper_core::HardwareAcceleration::Disabled
+                        {
+                            break;
+                        }
+                    }
                 }
+                std::thread::sleep(Duration::from_millis(25));
             }
+            info!(
+                active_decoder = %detected,
+                requested = ?launch_cfg.config.hardware_acceleration,
+                "Hardware decoding telemetry verified"
+            );
+            player.active_decoder = detected;
             player.state = PlaybackState::Playing;
         } else {
             warn!(
@@ -349,8 +426,38 @@ impl MpvPlayer {
             }
         }
 
-        match rx.recv_timeout(Duration::from_millis(1500)) {
-            Ok(parsed) => {
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let mut parsed_result = None;
+
+        while Instant::now() < deadline {
+            #[cfg(windows)]
+            {
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+                };
+                let mut msg = MSG::default();
+                unsafe {
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+            }
+
+            match rx.try_recv() {
+                Ok(parsed) => {
+                    parsed_result = Some(parsed);
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        match parsed_result {
+            Some(parsed) => {
                 if let Some(err) = parsed.get("error").and_then(|e| e.as_str()) {
                     if err != "success" && err != "property unavailable" {
                         debug!(
@@ -362,7 +469,7 @@ impl MpvPlayer {
                 }
                 Ok(parsed.get("data").cloned())
             }
-            Err(_) => {
+            None => {
                 let mut pending = self.pending_responses.lock().unwrap();
                 pending.remove(&req_id);
                 Err(MpvError::IpcConnectionFailed(format!(
@@ -416,22 +523,33 @@ impl MpvPlayer {
 
     /// Stops playback and terminates MPV.
     pub fn stop(&mut self) -> Result<(), MpvError> {
+        if self.state == PlaybackState::Stopped {
+            return Ok(());
+        }
         info!("Stopping video player process");
+        self.state = PlaybackState::Stopped;
+
+        // Send fire-and-forget quit command to MPV without waiting for reply
+        if let Ok(mut writer_guard) = self.pipe_writer.lock() {
+            if let Some(writer) = writer_guard.as_mut() {
+                let quit_msg = "{\"command\":[\"quit\"]}\n";
+                let _ = writer.write_all(quit_msg.as_bytes());
+                let _ = writer.flush();
+            }
+        }
         self.reader_running.store(false, Ordering::SeqCst);
-        let _ = self.send_command(&[json!("quit")]);
         *self.pipe_writer.lock().unwrap() = None;
 
-        let wait_deadline = Instant::now() + Duration::from_millis(150);
+        let wait_deadline = Instant::now() + Duration::from_millis(300);
         while Instant::now() < wait_deadline {
             if let Ok(Some(_)) = self.child.try_wait() {
-                break;
+                return Ok(());
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(15));
         }
 
         let _ = self.child.kill();
         let _ = self.child.wait();
-        self.state = PlaybackState::Stopped;
         Ok(())
     }
 

@@ -119,7 +119,7 @@ mod platform {
     }
 
     /// Ensures the calling thread is attached to the interactive "default" desktop.
-    fn ensure_interactive_desktop() {
+    pub fn ensure_interactive_desktop() {
         unsafe {
             // Check if we can open the interactive "default" desktop.
             // When launched from background services, IDE runners, or sandbox environments,
@@ -324,7 +324,12 @@ mod platform {
 }
 
 #[cfg(windows)]
+pub(crate) use platform::ensure_interactive_desktop;
+#[cfg(windows)]
 pub use platform::{ensure_desktop_host, DesktopHost};
+
+#[cfg(not(windows))]
+pub(crate) fn ensure_interactive_desktop() {}
 
 #[cfg(not(windows))]
 #[derive(Debug, Clone)]

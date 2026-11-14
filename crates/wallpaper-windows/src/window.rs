@@ -182,6 +182,7 @@ mod platform {
             is_primary: bool,
             bg_color: COLORREF,
         ) -> Result<Self, WindowError> {
+            crate::desktop_host::ensure_interactive_desktop();
             ensure_window_class()?;
 
             let brush = unsafe { CreateSolidBrush(bg_color) };
@@ -224,7 +225,7 @@ mod platform {
             let data_ptr = Box::into_raw(custom_data);
             unsafe {
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, data_ptr as isize);
-                // Note: Keep as a clean top-level popup initially so MPV's process can attach its child window
+                // Keep as a top-level popup initially so MPV's process can attach its child window
                 // via CreateWindowEx without violating Win32 cross-process child restrictions.
                 // It is then attached to WorkerW via `attach_to_host()` after MPV attaches.
                 let _ = SetWindowPos(
@@ -262,11 +263,44 @@ mod platform {
             })
         }
 
+        /// Checks if an embedded child window (such as MPV's render surface) has been created inside this window.
+        pub fn has_child_window(&self) -> bool {
+            unsafe {
+                let child = windows::Win32::UI::WindowsAndMessaging::FindWindowExW(
+                    self.hwnd,
+                    HWND::default(),
+                    PCWSTR::null(),
+                    PCWSTR::null(),
+                );
+                child.map(|h| h.0 != std::ptr::null_mut()).unwrap_or(false)
+            }
+        }
+
         /// Attaches this window to the desktop host (behind icons in WorkerW).
         pub fn attach_to_host(&self) {
             unsafe {
                 let _ =
                     windows::Win32::UI::WindowsAndMessaging::SetParent(self.hwnd, self.host_hwnd);
+
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    HWND_BOTTOM,
+                    self.client_x,
+                    self.client_y,
+                    self.width as i32,
+                    self.height as i32,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+                );
+                let _ = InvalidateRect(self.hwnd, None, true);
+            }
+        }
+
+        /// Detaches this window from WorkerW, turning it into an unowned top-level popup.
+        pub fn detach_from_host(&self) {
+            unsafe {
+                let _ =
+                    windows::Win32::UI::WindowsAndMessaging::SetParent(self.hwnd, HWND::default());
+
                 let _ = SetWindowPos(
                     self.hwnd,
                     HWND_BOTTOM,
