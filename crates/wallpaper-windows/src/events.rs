@@ -27,6 +27,7 @@
 //! exact repeats. Consumers must still treat events idempotently.
 
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use wallpaper_core::registration::{Coverage, RegistrationReport, RetryPolicy};
 use wallpaper_core::runtime::RuntimeEvent;
 
 #[cfg(windows)]
@@ -34,7 +35,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 #[cfg(windows)]
 use std::sync::mpsc::Sender;
 #[cfg(windows)]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 #[cfg(windows)]
 use tracing::{debug, error, info};
 
@@ -78,6 +79,23 @@ pub enum ListenerPoll {
     Disconnected,
 }
 
+/// Test hook: number of upcoming registration attempts to fail artificially, per source.
+/// `u32::MAX` means "always fail". All zero (the default) is production behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct InjectedFailures {
+    pub session_notifications: u32,
+    pub display_power: u32,
+    pub explorer_restart: u32,
+}
+
+/// Listener configuration. `Default` is what the daemon uses.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListenerOptions {
+    /// Bounded retry schedule for registrations that fail.
+    pub retry: RetryPolicy,
+    pub inject_failures: InjectedFailures,
+}
+
 /// Handle to the system event listener. Dropping it stops the thread and removes every Win32
 /// registration (session notification, power-setting notification, window, window class).
 pub struct SystemEventListener {
@@ -86,6 +104,8 @@ pub struct SystemEventListener {
     thread_handle: Option<std::thread::JoinHandle<()>>,
     #[cfg(windows)]
     hwnd_val: Arc<AtomicIsize>,
+    #[cfg(windows)]
+    report: Arc<Mutex<RegistrationReport>>,
     #[cfg(not(windows))]
     _keepalive: std::sync::mpsc::Sender<SystemPlatformEvent>,
 }
@@ -93,19 +113,38 @@ pub struct SystemEventListener {
 impl SystemEventListener {
     /// Creates and starts the background Windows system event listener.
     pub fn start() -> Result<Self, String> {
+        Self::start_with(ListenerOptions::default())
+    }
+
+    /// Like [`start`](Self::start) with explicit options (retry schedule, fault injection).
+    ///
+    /// Only failing to create the hidden window fails the start. A registration that fails is
+    /// retried in the background and reported through
+    /// [`registration_report`](Self::registration_report); it never silently looks like success.
+    pub fn start_with(options: ListenerOptions) -> Result<Self, String> {
         #[allow(unused_variables)]
         let (tx, rx) = channel();
+        #[cfg(not(windows))]
+        let _ = options;
 
         #[cfg(windows)]
         {
             let hwnd_val = Arc::new(AtomicIsize::new(0));
             let hwnd_clone = Arc::clone(&hwnd_val);
+            let report = Arc::new(Mutex::new(RegistrationReport::default()));
+            let report_clone = Arc::clone(&report);
             let (init_tx, init_rx) = channel();
 
             let handle = std::thread::Builder::new()
                 .name("sys-event-listener".to_string())
                 .spawn(move || {
-                    platform::run_notification_thread(tx, hwnd_clone, init_tx);
+                    platform::run_notification_thread(
+                        tx,
+                        hwnd_clone,
+                        init_tx,
+                        options,
+                        report_clone,
+                    );
                 })
                 .map_err(|e| format!("Failed to spawn notification thread: {}", e))?;
 
@@ -114,6 +153,7 @@ impl SystemEventListener {
                     rx,
                     thread_handle: Some(handle),
                     hwnd_val,
+                    report,
                 }),
                 Ok(Err(e)) => {
                     let _ = handle.join();
@@ -133,6 +173,27 @@ impl SystemEventListener {
         {
             Ok(Self { rx, _keepalive: tx })
         }
+    }
+
+    /// Current registration status of every event source. Cheap; safe to call every tick.
+    pub fn registration_report(&self) -> RegistrationReport {
+        #[cfg(windows)]
+        {
+            self.report
+                .lock()
+                .map(|r| r.clone())
+                .unwrap_or_else(|p| p.into_inner().clone())
+        }
+        #[cfg(not(windows))]
+        {
+            RegistrationReport::default()
+        }
+    }
+
+    /// Whether the listener can currently hear about *everything* the runtime depends on.
+    /// `Full` only if every registration is active.
+    pub fn coverage(&self) -> Coverage {
+        self.registration_report().coverage()
     }
 
     /// Polls without blocking, distinguishing "nothing yet" from "listener died".
@@ -194,7 +255,8 @@ impl Drop for SystemEventListener {
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use std::sync::Mutex;
+    use std::time::Instant;
+    use wallpaper_core::registration::{EventSource, RegistrationTracker, RetryDecision};
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -206,10 +268,10 @@ mod platform {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-        GetWindowLongPtrW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
-        SetWindowLongPtrW, UnregisterClassW, GWLP_USERDATA, HMENU, MSG,
+        GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+        SetTimer, SetWindowLongPtrW, UnregisterClassW, GWLP_USERDATA, HMENU, MSG,
         REGISTER_NOTIFICATION_FLAGS, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_POWERBROADCAST,
-        WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+        WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
     // Values verified against the `windows` crate's generated Win32 metadata.
@@ -238,6 +300,9 @@ mod platform {
         pub data: [u8; 1],
     }
 
+    /// Timer id used to drive registration retries on the listener's own window.
+    const RETRY_TIMER_ID: usize = 1;
+
     struct ListenerState {
         tx: Sender<SystemPlatformEvent>,
         taskbar_created_msg: u32,
@@ -246,6 +311,10 @@ mod platform {
         last_locked: Option<bool>,
         last_display_on: Option<bool>,
         last_suspended: Option<bool>,
+        tracker: RegistrationTracker,
+        shared_report: Arc<Mutex<RegistrationReport>>,
+        inject: InjectedFailures,
+        timer_active: bool,
     }
 
     impl ListenerState {
@@ -295,10 +364,134 @@ mod platform {
         }
     }
 
+    /// Consumes one injected failure for a source, if any remain.
+    fn take_injected(counter: &mut u32) -> bool {
+        if *counter > 0 {
+            if *counter != u32::MAX {
+                *counter -= 1;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Makes one registration attempt for `source` and records the outcome.
+    ///
+    /// Works through a raw pointer and never holds a `&mut ListenerState` across a Win32 call:
+    /// Windows may deliver the initial notification (e.g. the current display state)
+    /// synchronously from inside the registration call, re-entering the window procedure.
+    unsafe fn attempt(ptr: *mut ListenerState, hwnd: HWND, source: EventSource, now: Instant) {
+        // Phase 1: decide whether to inject a failure (short borrow).
+        let injected = {
+            let st = &mut *ptr;
+            match source {
+                EventSource::SessionNotifications => {
+                    take_injected(&mut st.inject.session_notifications)
+                }
+                EventSource::DisplayPower => take_injected(&mut st.inject.display_power),
+                EventSource::ExplorerRestart => take_injected(&mut st.inject.explorer_restart),
+                EventSource::SuspendResume | EventSource::DisplayTopology => false,
+            }
+        };
+
+        // Phase 2: the Win32 call, with no live borrow.
+        enum Outcome {
+            Ok,
+            Power(HPOWERNOTIFY),
+            Message(u32),
+            Err(String),
+        }
+        let outcome = if injected {
+            Outcome::Err("injected failure (test hook)".to_string())
+        } else {
+            match source {
+                EventSource::SessionNotifications => {
+                    match WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
+                        Ok(()) => Outcome::Ok,
+                        Err(e) => Outcome::Err(e.to_string()),
+                    }
+                }
+                EventSource::DisplayPower => {
+                    // Windows sends the current display state right after registration.
+                    match RegisterPowerSettingNotification(
+                        HANDLE(hwnd.0),
+                        &GUID_CONSOLE_DISPLAY_STATE,
+                        REGISTER_NOTIFICATION_FLAGS(0), // DEVICE_NOTIFY_WINDOW_HANDLE
+                    ) {
+                        Ok(h) => Outcome::Power(h),
+                        Err(e) => Outcome::Err(e.to_string()),
+                    }
+                }
+                EventSource::ExplorerRestart => {
+                    // Explorer announces a fresh taskbar by broadcasting this registered message.
+                    let id = RegisterWindowMessageW(w!("TaskbarCreated"));
+                    if id == 0 {
+                        Outcome::Err("RegisterWindowMessageW(TaskbarCreated) returned 0".into())
+                    } else {
+                        Outcome::Message(id)
+                    }
+                }
+                // Delivered to any live top-level window; no registration exists to fail.
+                EventSource::SuspendResume | EventSource::DisplayTopology => Outcome::Ok,
+            }
+        };
+
+        // Phase 3: record (short borrow).
+        let st = &mut *ptr;
+        match outcome {
+            Outcome::Ok | Outcome::Power(_) | Outcome::Message(_) => {
+                match outcome {
+                    Outcome::Power(h) => st.power_notify_handle = Some(h),
+                    Outcome::Message(id) => st.taskbar_created_msg = id,
+                    _ => {}
+                }
+                if source == EventSource::SessionNotifications {
+                    st.wts_registered = true;
+                }
+                st.tracker.mark_active(source);
+                debug!(source = source.as_str(), "Event source registered");
+            }
+            Outcome::Err(error) => match st.tracker.record_failure(source, error.clone(), now) {
+                RetryDecision::RetryAfter(delay) => {
+                    error!(source = source.as_str(), %error, ?delay, "Event registration failed; will retry");
+                }
+                RetryDecision::GiveUp => {
+                    error!(source = source.as_str(), %error, "Event registration FAILED permanently; events from this source will not arrive");
+                }
+            },
+        }
+    }
+
+    /// Publishes the tracker's report to the owner and starts/stops the retry timer as needed.
+    unsafe fn publish_and_sync_timer(ptr: *mut ListenerState, hwnd: HWND) {
+        let st = &mut *ptr;
+        if let Ok(mut shared) = st.shared_report.lock() {
+            *shared = st.tracker.report().clone();
+        }
+        let need = st.tracker.has_pending_retries();
+        if need && !st.timer_active {
+            let ms = (st.tracker.policy().initial_delay.as_millis() as u32 / 2).clamp(10, 250);
+            SetTimer(hwnd, RETRY_TIMER_ID, ms, None);
+            st.timer_active = true;
+        } else if !need && st.timer_active {
+            let _ = KillTimer(hwnd, RETRY_TIMER_ID);
+            st.timer_active = false;
+        }
+    }
+
+    unsafe fn run_due_retries(ptr: *mut ListenerState, hwnd: HWND, now: Instant) {
+        let due = (*ptr).tracker.due(now);
+        for source in due {
+            attempt(ptr, hwnd, source, now);
+        }
+        publish_and_sync_timer(ptr, hwnd);
+    }
+
     const NOTIFY_WINDOW_CLASS: PCWSTR = w!("RustWallpaperNotificationWindow");
 
     /// Live listeners sharing the window class: registered by the first, unregistered by the last.
-    static CLASS_REFS: Mutex<usize> = Mutex::new(0);
+    static CLASS_REFS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
     const ERROR_CLASS_ALREADY_EXISTS: i32 = 1410;
 
     unsafe fn acquire_class(hinstance: HINSTANCE) -> Result<(), String> {
@@ -342,6 +535,13 @@ mod platform {
         if ptr.is_null() {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
+
+        // Handled before taking a long-lived `&mut`, because retries re-derive from `ptr`.
+        if msg == WM_TIMER && wparam.0 == RETRY_TIMER_ID {
+            run_due_retries(ptr, hwnd, Instant::now());
+            return LRESULT(0);
+        }
+
         let state = &mut *ptr;
 
         if state.taskbar_created_msg != 0 && msg == state.taskbar_created_msg {
@@ -410,6 +610,10 @@ mod platform {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                if state.timer_active {
+                    let _ = KillTimer(hwnd, RETRY_TIMER_ID);
+                    state.timer_active = false;
+                }
                 if let Some(hpower) = state.power_notify_handle.take() {
                     let _ = UnregisterPowerSettingNotification(hpower);
                 }
@@ -428,6 +632,8 @@ mod platform {
         tx: Sender<SystemPlatformEvent>,
         hwnd_holder: Arc<AtomicIsize>,
         init_tx: Sender<Result<(), String>>,
+        options: ListenerOptions,
+        shared_report: Arc<Mutex<RegistrationReport>>,
     ) {
         unsafe {
             let hinstance: HINSTANCE = match GetModuleHandleW(PCWSTR::null()) {
@@ -442,9 +648,6 @@ mod platform {
                 let _ = init_tx.send(Err(e));
                 return;
             }
-
-            // Explorer announces a fresh taskbar by broadcasting this registered message.
-            let taskbar_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
 
             // Hidden TOP-LEVEL window (see module docs).
             let hwnd = match CreateWindowExW(
@@ -472,38 +675,29 @@ mod platform {
                 }
             };
 
-            let wts_registered = match WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)
-            {
-                Ok(()) => true,
-                Err(e) => {
-                    error!(%e, "WTSRegisterSessionNotification failed: lock/unlock not reported");
-                    false
-                }
-            };
-
-            // Windows sends the current display state right after registration.
-            let power_notify = match RegisterPowerSettingNotification(
-                HANDLE(hwnd.0),
-                &GUID_CONSOLE_DISPLAY_STATE,
-                REGISTER_NOTIFICATION_FLAGS(0), // DEVICE_NOTIFY_WINDOW_HANDLE
-            ) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    error!(%e, "RegisterPowerSettingNotification failed: display power not reported");
-                    None
-                }
-            };
-
             let state = Box::new(ListenerState {
                 tx,
-                taskbar_created_msg: taskbar_msg,
-                power_notify_handle: power_notify,
-                wts_registered,
+                taskbar_created_msg: 0,
+                power_notify_handle: None,
+                wts_registered: false,
                 last_locked: None,
                 last_display_on: None,
                 last_suspended: None,
+                tracker: RegistrationTracker::new(options.retry),
+                shared_report,
+                inject: options.inject_failures,
+                timer_active: false,
             });
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+            let ptr = Box::into_raw(state);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr as isize);
+
+            // First attempt for every source. A failure here does not fail the start: it is
+            // recorded, published and retried on the window's timer.
+            let now = Instant::now();
+            for source in EventSource::ALL {
+                attempt(ptr, hwnd, source, now);
+            }
+            publish_and_sync_timer(ptr, hwnd);
 
             hwnd_holder.store(hwnd.0 as isize, Ordering::SeqCst);
             let _ = init_tx.send(Ok(()));
@@ -762,5 +956,153 @@ mod windows_integration_tests {
             done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "drop must join the listener thread"
         );
+    }
+
+    // ---- registration status and retries ---------------------------------------------------
+
+    use wallpaper_core::registration::{EventSource, RegistrationState};
+
+    fn wait_for(secs: u64, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        condition()
+    }
+
+    #[test]
+    fn registration_report_is_settled_and_consistent_after_start() {
+        let l = SystemEventListener::start().unwrap();
+        let report = l.registration_report();
+        for source in EventSource::ALL {
+            assert_ne!(
+                report.state(source),
+                &RegistrationState::Pending,
+                "{source:?} was attempted during start"
+            );
+        }
+        // These cannot fail on a live top-level window.
+        for source in [
+            EventSource::SuspendResume,
+            EventSource::DisplayTopology,
+            EventSource::ExplorerRestart,
+        ] {
+            assert_eq!(
+                report.state(source),
+                &RegistrationState::Active,
+                "{source:?}"
+            );
+        }
+        // Full coverage means exactly "every source active", never anything weaker.
+        let all_active = EventSource::ALL
+            .iter()
+            .all(|s| report.state(*s) == &RegistrationState::Active);
+        assert_eq!(report.is_full(), all_active);
+        assert_eq!(l.coverage() == Coverage::Full, all_active);
+    }
+
+    #[test]
+    fn transient_registration_failures_are_retried_until_active() {
+        let options = ListenerOptions {
+            retry: RetryPolicy {
+                max_attempts: 6,
+                initial_delay: Duration::from_millis(150),
+                max_delay: Duration::from_millis(300),
+            },
+            inject_failures: InjectedFailures {
+                session_notifications: 2,
+                ..Default::default()
+            },
+        };
+        let l = SystemEventListener::start_with(options).unwrap();
+
+        // Straight after start the first attempt has failed: not full coverage, and the
+        // report says why instead of pretending.
+        let early = l.registration_report();
+        assert!(matches!(
+            early.state(EventSource::SessionNotifications),
+            RegistrationState::Retrying { .. }
+        ));
+        assert!(
+            !early.is_full(),
+            "partial registration must not look like full coverage"
+        );
+        assert!(early
+            .diagnostics()
+            .iter()
+            .any(|d| d.contains("session_notifications") && d.contains("retrying")));
+
+        assert!(
+            wait_for(6, || l
+                .registration_report()
+                .state(EventSource::SessionNotifications)
+                == &RegistrationState::Active),
+            "the third attempt succeeds on its own"
+        );
+    }
+
+    #[test]
+    fn permanently_failing_registration_stays_visibly_partial() {
+        let options = ListenerOptions {
+            retry: RetryPolicy {
+                max_attempts: 3,
+                initial_delay: Duration::from_millis(20),
+                max_delay: Duration::from_millis(40),
+            },
+            inject_failures: InjectedFailures {
+                explorer_restart: u32::MAX,
+                ..Default::default()
+            },
+        };
+        let l = SystemEventListener::start_with(options).unwrap();
+        assert!(wait_for(6, || matches!(
+            l.registration_report().state(EventSource::ExplorerRestart),
+            RegistrationState::Failed { .. }
+        )));
+
+        let report = l.registration_report();
+        assert!(matches!(
+            report.state(EventSource::ExplorerRestart),
+            RegistrationState::Failed { attempts: 3, .. }
+        ));
+        assert!(!report.is_full());
+        assert!(matches!(
+            report.coverage(),
+            Coverage::Partial { ref missing } if missing.contains(&EventSource::ExplorerRestart)
+        ));
+        assert!(report.diagnostics().iter().any(|d| d.contains("FAILED")));
+
+        // The sources that did register keep working: the listener is degraded, not dead.
+        send(&l, WM_DISPLAYCHANGE, 0, 0);
+        assert_eq!(drain(&l), vec![SystemPlatformEvent::DisplayTopologyChanged]);
+    }
+
+    #[test]
+    fn drop_with_a_retry_timer_pending_completes_promptly() {
+        let options = ListenerOptions {
+            retry: RetryPolicy {
+                max_attempts: 6,
+                initial_delay: Duration::from_secs(5),
+                max_delay: Duration::from_secs(8),
+            },
+            inject_failures: InjectedFailures {
+                display_power: u32::MAX,
+                ..Default::default()
+            },
+        };
+        let l = SystemEventListener::start_with(options).unwrap();
+        assert!(matches!(
+            l.registration_report().state(EventSource::DisplayPower),
+            RegistrationState::Retrying { .. }
+        ));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(l);
+            let _ = done_tx.send(());
+        });
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).is_ok());
     }
 }
