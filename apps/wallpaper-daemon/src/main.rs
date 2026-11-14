@@ -460,6 +460,16 @@ fn handle_control(cmd: ControlCommand, runtime: &mut PlaybackSupervisor, known: 
             runtime.set_profile(profile);
             true
         }
+        // TODO(handoff step 4): route through RuntimeSupervisor::assign_user / lifecycle once the
+        // daemon loop is migrated to RuntimeSupervisor. Parsed and validated, but not applied yet.
+        ControlCommand::Assign { device, path } => {
+            warn!(%device, %path, "assign is not wired into the daemon yet (see docs/runtime-handoff-04.3.md)");
+            false
+        }
+        ControlCommand::Unassign { device } => {
+            warn!(%device, "unassign is not wired into the daemon yet (see docs/runtime-handoff-04.3.md)");
+            false
+        }
         ControlCommand::Status => {
             for m in runtime.status(known) {
                 let reasons: Vec<&str> = m.reasons.iter().map(|r| r.as_str()).collect();

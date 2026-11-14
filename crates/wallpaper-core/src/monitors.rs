@@ -44,6 +44,25 @@ impl MonitorId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Identity from the monitor's hardware device-interface path (the `DeviceID` Windows gives
+    /// for `EnumDisplayDevices(..., EDD_GET_DEVICE_INTERFACE_NAME)`), e.g.
+    /// `\\?\DISPLAY#GSM5B09#5&2b1c7a8&0&UID4357#{e6f07b5f-...}`. It names the physical monitor on
+    /// its port and, unlike `\\.\DISPLAYn`, does not change when other monitors come and go.
+    /// Blank input falls back to [`MonitorId::from_device_name`].
+    pub fn from_interface_path(path: &str, device_name: &str) -> Self {
+        let path = path.trim();
+        if path.is_empty() {
+            Self::from_device_name(device_name)
+        } else {
+            Self(format!("hw:{}", path.to_ascii_lowercase()))
+        }
+    }
+
+    /// Weak identity from the Windows device name; used only when no hardware identity exists.
+    pub fn from_device_name(device_name: &str) -> Self {
+        Self(format!("dev:{}", device_name.to_ascii_lowercase()))
+    }
 }
 
 impl std::fmt::Display for MonitorId {
@@ -927,6 +946,34 @@ mod tests {
 
     fn lifecycle(fallback: Option<Assignment>) -> MonitorLifecycle {
         MonitorLifecycle::new(registry(fallback))
+    }
+
+    #[test]
+    fn monitor_ids_are_stable_across_device_renumbering() {
+        let path =
+            r"\\?\DISPLAY#GSM5B09#5&2b1c7a8&0&UID4357#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}";
+        let before = MonitorId::from_interface_path(path, r"\\.\DISPLAY2");
+        let after = MonitorId::from_interface_path(&path.to_ascii_uppercase(), r"\\.\DISPLAY1");
+        assert_eq!(
+            before, after,
+            "same hardware, different device name, case-insensitive"
+        );
+
+        let other = MonitorId::from_interface_path(
+            r"\\?\DISPLAY#GSM5B09#5&2b1c7a8&0&UID4358#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}",
+            r"\\.\DISPLAY2",
+        );
+        assert_ne!(
+            before, other,
+            "identical model on another port is a different monitor"
+        );
+    }
+
+    #[test]
+    fn monitor_id_falls_back_to_device_name_when_no_hardware_identity() {
+        let id = MonitorId::from_interface_path("  ", r"\\.\DISPLAY3");
+        assert_eq!(id, MonitorId::from_device_name(r"\\.\DISPLAY3"));
+        assert!(id.as_str().starts_with("dev:"));
     }
 
     // ---- registry ---------------------------------------------------------------------
