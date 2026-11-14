@@ -1,16 +1,5 @@
-//! Wallpaper daemon: wires the Windows event sources, foreground detector and user commands
-//! into one runtime state machine, and lets a single `reconcile` step drive the players.
-//!
-//! Decision flow (see `docs/runtime-agent-b.md`):
-//!
-//! ```text
-//! SystemEventListener ─┐
-//! FullscreenTracker  ──┼─► PlaybackSupervisor (facts → reasons) ─► reconcile ─► WallpaperManager
-//! stdin control      ──┤                                              ▲
-//! player health      ──┘                              actual state ───┘
-//! ```
-//!
-//! Nothing here calls `pause_all` / `resume_all`: only `reconcile` pauses or resumes players.
+//! Wallpaper daemon. RuntimeSupervisor is the single orchestration path for
+//! monitor assignments, player health, system events and playback reconciliation.
 
 use anyhow::Context;
 use std::path::PathBuf;
@@ -18,12 +7,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
-use wallpaper_core::runtime::{parse_control_command, resolve_device};
+use wallpaper_core::health::HealthPolicy;
+use wallpaper_core::monitors::{
+    Assignment, MonitorLifecycle, MonitorRegistry, SqliteAssignmentStore,
+};
+use wallpaper_core::runtime::{parse_control_command, resolve_device, RuntimeState};
+use wallpaper_core::supervisor::RuntimeSupervisor;
 use wallpaper_core::{
     HardwareAcceleration, PerformanceProfile, PlaybackConfig, PlaybackPolicy, WallpaperLibrary,
 };
 use wallpaper_windows::{
-    enumerate_monitors, ControlCommand, FullscreenTracker, ListenerPoll, PlaybackSupervisor,
+    enumerate_monitor_details, ControlCommand, FullscreenTracker, ListenerPoll,
     SystemEventListener, WallpaperManager,
 };
 
@@ -39,7 +33,6 @@ fn parse_cli_args() -> (Option<Duration>, PerformanceProfile) {
     let args: Vec<String> = std::env::args().collect();
     let mut duration = None;
     let mut profile = PerformanceProfile::Balanced;
-
     for i in 1..args.len() {
         if (args[i] == "--duration" || args[i] == "--timeout") && i + 1 < args.len() {
             if let Ok(secs) = args[i + 1].parse::<u64>() {
@@ -51,10 +44,7 @@ fn parse_cli_args() -> (Option<Duration>, PerformanceProfile) {
         }
         if args[i] == "--profile" && i + 1 < args.len() {
             profile = PerformanceProfile::parse(&args[i + 1]).unwrap_or_else(|| {
-                eprintln!(
-                    "unknown profile '{}', using balanced (eco|balanced|performance)",
-                    args[i + 1]
-                );
+                eprintln!("unknown profile '{}', using balanced (eco|balanced|performance)", args[i + 1]);
                 PerformanceProfile::Balanced
             });
         }
@@ -71,63 +61,64 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let (duration_limit, profile) = parse_cli_args();
-
     info!("Rust Wallpaper daemon starting");
-    info!(?profile, "Intelligent runtime & resource management active");
+    info!(?profile, "RuntimeSupervisor orchestration active");
 
     #[cfg(windows)]
     {
         unsafe {
-            let _ =
-                windows::Win32::System::Console::SetConsoleCtrlHandler(Some(ctrl_handler), true);
+            let _ = windows::Win32::System::Console::SetConsoleCtrlHandler(
+                Some(ctrl_handler),
+                true,
+            );
         }
 
-        // 1. Initialize SQLite Wallpaper Library
         let db_path = PathBuf::from("library.db");
         let library = WallpaperLibrary::open(&db_path)
             .context("failed to open or create SQLite wallpaper library")?;
-        info!(db = %db_path.display(), "SQLite wallpaper library initialized");
 
-        // 2. Discover or import sample wallpapers
+        // Import the bundled demo assets when present. They are not treated as permanent
+        // assignments: the monitor registry below owns the persisted user choices.
         let nature_mp4 = PathBuf::from("assets/wallpapers/sample-nature.mp4");
         let abstract_webm = PathBuf::from("assets/wallpapers/sample-abstract.webm");
-
-        if nature_mp4.exists() {
-            let _ = library.import_video(
-                &nature_mp4,
-                Some("Nature Test Video (MP4)"),
-                Some(PlaybackConfig {
-                    loop_playback: true,
-                    mute: true,
-                    volume: 100,
-                    hardware_acceleration: HardwareAcceleration::Auto,
-                }),
-            );
+        let demo_config = PlaybackConfig {
+            loop_playback: true,
+            mute: true,
+            volume: 80,
+            hardware_acceleration: HardwareAcceleration::Auto,
+        };
+        if nature_mp4.is_file() {
+            let _ = library.import_video(&nature_mp4, Some("Nature Test Video (MP4)"), Some(demo_config.clone()));
         }
-
-        if abstract_webm.exists() {
-            let _ = library.import_video(
-                &abstract_webm,
-                Some("Abstract Test Video (WebM)"),
-                Some(PlaybackConfig {
-                    loop_playback: true,
-                    mute: true,
-                    volume: 100,
-                    hardware_acceleration: HardwareAcceleration::Auto,
-                }),
-            );
+        if abstract_webm.is_file() {
+            let _ = library.import_video(&abstract_webm, Some("Abstract Test Video (WebM)"), Some(demo_config.clone()));
         }
+        info!(count = library.list().unwrap_or_default().len(), "Wallpaper library loaded");
 
-        let wallpapers = library.list().unwrap_or_default();
-        info!(count = wallpapers.len(), "Loaded wallpapers from library");
-        for w in &wallpapers {
-            info!(id = %w.id, title = %w.title(), source = %w.source(), "Wallpaper in library");
-        }
+        let fallback_path = if nature_mp4.is_file() {
+            Some(nature_mp4)
+        } else if abstract_webm.is_file() {
+            Some(abstract_webm)
+        } else {
+            None
+        };
+        let fallback = fallback_path.map(|path| Assignment {
+            video_path: path,
+            config: demo_config,
+        });
 
-        // 3. Initialize Desktop Wallpaper Manager
-        let mut manager =
-            WallpaperManager::init().context("failed to initialize desktop wallpaper manager")?;
+        let assignment_store = SqliteAssignmentStore::open(&db_path)
+            .context("failed to initialize persistent monitor assignments")?;
+        let registry = MonitorRegistry::new(Box::new(assignment_store), fallback);
+        let lifecycle = MonitorLifecycle::new(registry);
+        let mut runtime = RuntimeSupervisor::new(
+            RuntimeState::new(PlaybackPolicy::for_profile(profile)),
+            lifecycle,
+            HealthPolicy::default(),
+        );
 
+        let mut manager = WallpaperManager::init()
+            .context("failed to initialize desktop wallpaper manager")?;
         let diag = &manager.host().diagnostics;
         info!(
             selected_host = format_args!("0x{:X}", diag.selected_host_hwnd),
@@ -138,107 +129,34 @@ fn main() -> anyhow::Result<()> {
             "Desktop host ready"
         );
 
-        // 4. Multi-Monitor Video Wallpaper Assignment
-        let monitors = enumerate_monitors().unwrap_or_default();
-        for (idx, monitor) in monitors.iter().enumerate() {
-            // Assign different videos to different monitors
-            let video_to_play = if idx % 2 == 0 && nature_mp4.exists() {
-                nature_mp4.clone()
-            } else if abstract_webm.exists() {
-                abstract_webm.clone()
-            } else {
-                nature_mp4.clone()
-            };
-
-            let config = PlaybackConfig {
-                loop_playback: true,
-                mute: true,
-                volume: 80,
-                hardware_acceleration: HardwareAcceleration::Auto,
-            };
-
-            info!(
-                device = %monitor.device_name,
-                primary = monitor.is_primary,
-                video = %video_to_play.display(),
-                hwdec = ?config.hardware_acceleration,
-                "Attaching video wallpaper to monitor"
-            );
-
-            if let Err(e) =
-                manager.play_video_on_monitor(&monitor.device_name, video_to_play, config)
-            {
-                warn!(device = %monitor.device_name, %e, "Failed to start video wallpaper on monitor");
-            }
-        }
-
-        info!(
-            active_players = manager.player_count(),
-            "Video wallpaper playback active across monitors"
-        );
-
-        // Log initial hardware decoding & memory status
-        for (dev, decoder, state, mem) in manager.player_statuses() {
-            info!(
-                device = %dev,
-                active_decoder = %decoder,
-                state = ?state,
-                memory_mb = mem / (1024 * 1024),
-                "Active player status & hardware decoding verification"
-            );
-        }
-
-        // Names of monitors that were given a wallpaper: a missing player there is a fault.
-        let assigned: Vec<String> = manager
-            .player_statuses()
+        let initial = enumerate_monitor_details()
+            .context("failed to enumerate monitor identities")?
             .into_iter()
-            .map(|(device, ..)| device)
+            .map(|m| m.into_descriptor())
             .collect();
-
-        // 5. Runtime state machine, event listener, detector and control channel
-        let mut runtime = PlaybackSupervisor::new(PlaybackPolicy::for_profile(profile));
-        {
-            let p = runtime.policy();
-            info!(
-                profile = ?p.profile,
-                threshold = ?p.foreground_pause_threshold,
-                pause_debounce_ms = p.pause_debounce_millis,
-                resume_debounce_ms = p.resume_debounce_millis,
-                poll_ms = p.poll_interval_millis,
-                "Playback supervisor active"
-            );
+        let now = Instant::now();
+        let initial_report = runtime.sync_topology(initial, &mut manager, now);
+        for (device, error) in &initial_report.start_failures {
+            warn!(%device, %error, "Initial wallpaper assignment failed; lifecycle will retry");
         }
 
-        let mut listener = match SystemEventListener::start() {
-            Ok(l) => {
-                info!("System event listener active (session, display power, suspend/resume, topology, Explorer)");
-                Some(l)
-            }
-            Err(e) => {
-                warn!(%e, "System event listener failed to start; will retry");
-                None
-            }
-        };
+        let mut listener = start_listener_with_retry();
         let mut next_listener_attempt = Instant::now() + LISTENER_RETRY;
-
         let mut tracker = FullscreenTracker::new();
         let control_rx = spawn_control_reader();
-        info!("Console commands: pause [DISPLAYn] | resume [DISPLAYn] | profile <eco|balanced|performance> | status | quit");
+        info!("Commands: pause [DISPLAYn] | resume [DISPLAYn] | assign DISPLAYn <video path> | unassign DISPLAYn | profile <eco|balanced|performance> | status | quit");
 
         if let Some(dur) = duration_limit {
-            info!(
-                duration_secs = dur.as_secs(),
-                "Daemon running for scheduled duration"
-            );
+            info!(duration_secs = dur.as_secs(), "Daemon running for scheduled duration");
         } else {
-            info!("Daemon running. Press Ctrl+C to terminate cleanly and restore desktop");
+            info!("Daemon running. Press Ctrl+C to terminate cleanly");
         }
 
         let start_time = Instant::now();
-        let mut known_monitors: Vec<String> = enumerate_monitors()
+        let mut known_monitors: Vec<String> = enumerate_monitor_details()
             .unwrap_or_default()
             .into_iter()
-            .map(|m| m.device_name)
+            .map(|m| m.info.device_name)
             .collect();
         let mut last_poll = Instant::now() - Duration::from_secs(1);
         let mut last_health = Instant::now();
@@ -251,21 +169,17 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
             let now = Instant::now();
-            let mut reconcile_due = false;
 
-            // --- user commands -------------------------------------------------------
             while let Ok(cmd) = control_rx.try_recv() {
-                reconcile_due |= handle_control(cmd, &mut runtime, &known_monitors);
+                handle_control(cmd, &mut runtime, &mut manager, &known_monitors, now);
             }
 
-            // --- system events (all processed in order; state is idempotent) ---------
             let mut listener_died = false;
             if let Some(l) = &listener {
                 loop {
                     match l.poll() {
                         ListenerPoll::Event(evt) => {
-                            runtime.apply_event(evt.into(), now);
-                            reconcile_due = true;
+                            runtime.runtime.apply_event(evt.into(), now);
                         }
                         ListenerPoll::Empty => break,
                         ListenerPoll::Disconnected => {
@@ -276,15 +190,16 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             if listener_died {
-                warn!("System event listener thread died; restarting");
+                warn!("System event listener thread exited; scheduling restart");
                 listener = None;
                 next_listener_attempt = now;
             }
             if listener.is_none() && now >= next_listener_attempt {
                 match SystemEventListener::start() {
                     Ok(l) => {
-                        info!("System event listener (re)started");
+                        info!("System event listener restarted");
                         listener = Some(l);
+                        next_listener_attempt = now + LISTENER_RETRY;
                     }
                     Err(e) => {
                         warn!(%e, "System event listener restart failed");
@@ -293,75 +208,80 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // --- work made due by events (bursts already collapsed) ------------------
-            let work = runtime.take_pending_work(now);
+            let work = runtime.runtime.take_pending_work(now);
             if work.recover_explorer {
                 info!("Recovering desktop host after Explorer restart");
                 if let Err(e) = manager.force_recover_explorer() {
-                    warn!(%e, "Failed to recover desktop host after Explorer restart");
+                    warn!(%e, "Explorer recovery failed");
+                } else if let Ok(monitors) = enumerate_monitor_details() {
+                    let report = runtime.sync_topology(
+                        monitors.into_iter().map(|m| m.into_descriptor()).collect(),
+                        &mut manager,
+                        now,
+                    );
+                    for (device, error) in report.start_failures {
+                        warn!(%device, %error, "Wallpaper restoration failed after Explorer recovery");
+                    }
                 }
-                // Rebuilt players start in the Playing state: reconcile re-asserts the truth.
-                reconcile_due = true;
-            } else if work.refresh_topology {
-                info!("Display topology settled: re-enumerating monitors");
+            }
+            if work.refresh_topology {
+                info!("Display topology settled; refreshing monitor lifecycle");
                 if let Err(e) = manager.refresh() {
-                    warn!(%e, "Failed to refresh monitor layout on topology change");
+                    warn!(%e, "Wallpaper manager refresh failed");
                 }
-                if let Ok(m) = enumerate_monitors() {
-                    if !m.is_empty() {
-                        known_monitors = m.into_iter().map(|m| m.device_name).collect();
-                    }
-                }
-                reconcile_due = true;
+                sync_monitors(&mut runtime, &mut manager, &mut known_monitors, now);
             }
 
-            // --- foreground detection (rate set by the active profile) ---------------
-            if now.saturating_duration_since(last_poll) >= runtime.poll_interval() {
+            if now.saturating_duration_since(last_poll) >= runtime.runtime.poll_interval() {
                 last_poll = now;
-                if let Ok(m) = enumerate_monitors() {
-                    if !m.is_empty() {
-                        known_monitors = m.into_iter().map(|m| m.device_name).collect();
-                    }
-                }
+                sync_known_devices(&mut known_monitors);
                 let probe = tracker.probe();
-                runtime.observe_foreground(&known_monitors, &probe.observations, now);
-                reconcile_due = true;
+                runtime.runtime.observe_foreground(
+                    &known_monitors,
+                    &probe.observations,
+                    now,
+                );
             }
 
-            // --- player health and crash recovery ------------------------------------
-            if now.saturating_duration_since(last_health) >= Duration::from_millis(200) {
+            // Refresh the topology independently of notifications. This also recovers from
+            // missed WM_DISPLAYCHANGE events and updates stable hardware identities.
+            if now.saturating_duration_since(last_refresh) >= TOPOLOGY_POLL {
+                last_refresh = now;
+                if let Err(e) = manager.refresh() {
+                    warn!(%e, "Error refreshing wallpaper manager");
+                }
+                sync_monitors(&mut runtime, &mut manager, &mut known_monitors, now);
+            }
+
+            if now.saturating_duration_since(last_health) >= HEALTH_TICK {
                 last_health = now;
                 manager.check_and_recover_players();
-                let present: Vec<String> = manager
-                    .player_statuses()
-                    .into_iter()
-                    .map(|(device, ..)| device)
-                    .collect();
-                runtime.sync_player_presence(&assigned, &present);
-                reconcile_due = true; // recovered players start Playing
-            }
-
-            if now.saturating_duration_since(last_refresh) >= Duration::from_millis(500) {
-                last_refresh = now;
-                if let Err(err) = manager.refresh() {
-                    warn!(%err, "Error refreshing wallpaper manager");
+                if runtime.probe_due(now) {
+                    let probes = manager.probe_players();
+                    runtime.record_probes(&probes, now);
                 }
-                reconcile_due = true;
+                let health = runtime.update_health(&mut manager, now);
+                for h in health {
+                    if !h.status.is_healthy() {
+                        warn!(
+                            device = %h.device,
+                            status = ?h.status,
+                            unverified = ?h.unverified(),
+                            "Wallpaper player health"
+                        );
+                    }
+                }
             }
 
-            // --- the single decision point -------------------------------------------
-            // Also runs on a heartbeat so a command that failed is retried.
-            if reconcile_due || now.saturating_duration_since(last_reconcile) >= RECONCILE_HEARTBEAT
-            {
+            if now.saturating_duration_since(last_reconcile) >= RECONCILE_HEARTBEAT {
                 runtime.reconcile(&mut manager, now);
                 last_reconcile = now;
             }
 
-            // --- telemetry -----------------------------------------------------------
             if now.saturating_duration_since(last_telemetry) >= Duration::from_secs(2) {
                 last_telemetry = now;
                 for telem in manager.collect_telemetry() {
-                    let reasons: Vec<&str> = runtime
+                    let reasons: Vec<&str> = runtime.runtime
                         .suspension()
                         .active_reasons_for(&telem.device_name)
                         .into_iter()
@@ -375,45 +295,90 @@ fn main() -> anyhow::Result<()> {
                         memory_mb = telem.memory_working_set_bytes / (1024 * 1024),
                         uptime_s = telem.uptime_secs,
                         gpu_context = ?telem.gpu_context,
-                        res = format_args!("{}x{}", telem.video_width.unwrap_or(0), telem.video_height.unwrap_or(0)),
+                        resolution = format_args!("{}x{}", telem.video_width.unwrap_or(0), telem.video_height.unwrap_or(0)),
                         fps = telem.video_fps.unwrap_or(0.0),
                         "Player telemetry"
                     );
                 }
             }
 
-            if let Some(dur) = duration_limit {
-                if start_time.elapsed() >= dur {
-                    info!("Scheduled run duration reached. Commencing clean shutdown");
-                    break;
-                }
+            if duration_limit.is_some_and(|d| start_time.elapsed() >= d) {
+                info!("Scheduled run duration reached; shutting down");
+                break;
             }
-
-            std::thread::sleep(Duration::from_millis(16)); // ~60 Hz tick
+            std::thread::sleep(Duration::from_millis(16));
         }
 
-        info!("Shutting down daemon: stopping event listener, players and windows");
+        info!("Shutting down daemon");
         drop(listener);
         drop(manager);
-        info!("Clean shutdown complete. Zero orphaned processes guaranteed");
+        info!("Clean shutdown complete");
     }
 
     #[cfg(not(windows))]
     {
         warn!("Native Windows wallpaper desktop integration is only supported on Windows.");
     }
-
     Ok(())
 }
 
-/// Delay before retrying a failed or dead event listener.
 #[cfg(windows)]
 const LISTENER_RETRY: Duration = Duration::from_secs(2);
-/// Maximum time between reconcile passes when nothing else triggered one.
 #[cfg(windows)]
-const RECONCILE_HEARTBEAT: Duration = Duration::from_millis(250);
+const TOPOLOGY_POLL: Duration = Duration::from_millis(750);
+#[cfg(windows)]
+const HEALTH_TICK: Duration = Duration::from_millis(250);
+#[cfg(windows)]
+const RECONCILE_HEARTBEAT: Duration = Duration::from_millis(100);
 
-/// Reads console commands on a background thread so stdin can never stall the loop.
+#[cfg(windows)]
+fn start_listener_with_retry() -> Option<SystemEventListener> {
+    match SystemEventListener::start() {
+        Ok(listener) => {
+            info!("System event listener started");
+            Some(listener)
+        }
+        Err(e) => {
+            warn!(%e, "System event listener unavailable; retrying");
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+fn sync_known_devices(known: &mut Vec<String>) {
+    if let Ok(monitors) = enumerate_monitor_details() {
+        let devices: Vec<String> = monitors.into_iter().map(|m| m.info.device_name).collect();
+        if !devices.is_empty() {
+            *known = devices;
+        }
+    }
+}
+
+#[cfg(windows)]
+fn sync_monitors(
+    runtime: &mut RuntimeSupervisor,
+    manager: &mut WallpaperManager,
+    known: &mut Vec<String>,
+    now: Instant,
+) {
+    match enumerate_monitor_details() {
+        Ok(monitors) if !monitors.is_empty() => {
+            *known = monitors.iter().map(|m| m.info.device_name.clone()).collect();
+            let report = runtime.sync_topology(
+                monitors.into_iter().map(|m| m.into_descriptor()).collect(),
+                manager,
+                now,
+            );
+            for (device, error) in report.start_failures {
+                warn!(%device, %error, "Wallpaper assignment could not be started; retry budget exhausted");
+            }
+        }
+        Ok(_) => warn!("Monitor enumeration returned no displays; retaining previous topology"),
+        Err(e) => warn!(%e, "Monitor enumeration failed; retaining previous topology"),
+    }
+}
+
 #[cfg(windows)]
 fn spawn_control_reader() -> Receiver<ControlCommand> {
     let (tx, rx) = channel();
@@ -425,7 +390,7 @@ fn spawn_control_reader() -> Receiver<ControlCommand> {
             loop {
                 line.clear();
                 match stdin.read_line(&mut line) {
-                    Ok(0) | Err(_) => break, // stdin closed or not available
+                    Ok(0) | Err(_) => break,
                     Ok(_) if line.trim().is_empty() => {}
                     Ok(_) => match parse_control_command(&line) {
                         Ok(cmd) => {
@@ -441,69 +406,81 @@ fn spawn_control_reader() -> Receiver<ControlCommand> {
     rx
 }
 
-/// Applies a user command to the runtime state. Returns true if a reconcile is needed.
 #[cfg(windows)]
-fn handle_control(cmd: ControlCommand, runtime: &mut PlaybackSupervisor, known: &[String]) -> bool {
-    let resolve = |input: &Option<String>| -> Result<Option<String>, String> {
-        match input {
-            None => Ok(None),
-            Some(name) => resolve_device(name, known)
-                .map(Some)
-                .ok_or_else(|| format!("unknown monitor '{name}' (known: {known:?})")),
-        }
+fn handle_control(
+    cmd: ControlCommand,
+    runtime: &mut RuntimeSupervisor,
+    manager: &mut WallpaperManager,
+    known: &[String],
+    now: Instant,
+) {
+    let resolve = |name: &str| {
+        resolve_device(name, known)
+            .ok_or_else(|| format!("unknown monitor '{name}' (known: {known:?})"))
     };
 
     match cmd {
-        ControlCommand::Pause { device } => apply_user_pause(runtime, &resolve(&device), true),
-        ControlCommand::Resume { device } => apply_user_pause(runtime, &resolve(&device), false),
-        ControlCommand::SetProfile(profile) => {
-            runtime.set_profile(profile);
-            true
+        ControlCommand::Pause { device } => {
+            let device = device.as_deref().and_then(|d| resolve(d).ok());
+            if let Some(input) = device.as_deref() {
+                runtime.runtime.set_user_paused(Some(input), true);
+            } else if device.is_none() {
+                runtime.runtime.set_user_paused(None, true);
+            }
         }
-        // TODO(handoff step 4): route through RuntimeSupervisor::assign_user / lifecycle once the
-        // daemon loop is migrated to RuntimeSupervisor. Parsed and validated, but not applied yet.
-        ControlCommand::Assign { device, path } => {
-            warn!(%device, %path, "assign is not wired into the daemon yet (see docs/runtime-handoff-04.3.md)");
-            false
-        }
-        ControlCommand::Unassign { device } => {
-            warn!(%device, "unassign is not wired into the daemon yet (see docs/runtime-handoff-04.3.md)");
-            false
-        }
+        ControlCommand::Resume { device } => match device {
+            Some(name) => match resolve(&name) {
+                Ok(device) => { runtime.runtime.set_user_paused(Some(&device), false); }
+                Err(e) => warn!("{e}"),
+            },
+            None => { runtime.runtime.set_user_paused(None, false); }
+        },
+        ControlCommand::SetProfile(profile) => runtime.runtime.set_profile(profile),
+        ControlCommand::Assign { device, path } => match resolve(&device) {
+            Ok(device) => {
+                let path = PathBuf::from(path);
+                if !path.is_file() {
+                    warn!(path = %path.display(), "Assignment rejected: file does not exist");
+                } else {
+                    match runtime.assign_user(
+                        &device,
+                        Assignment::new(path),
+                        manager,
+                        now,
+                    ) {
+                        Ok(()) => info!(%device, "Persistent wallpaper assignment applied"),
+                        Err(e) => warn!(%device, %e, "Assignment applied in memory but persistence failed"),
+                    }
+                }
+            }
+            Err(e) => warn!("{e}"),
+        },
+        ControlCommand::Unassign { device } => match resolve(&device) {
+            Ok(device) => match runtime.unassign_user(&device, manager, now) {
+                Ok(()) => info!(%device, "User assignment removed; default policy restored"),
+                Err(e) => warn!(%device, %e, "Unassignment applied in memory but persistence failed"),
+            },
+            Err(e) => warn!("{e}"),
+        },
         ControlCommand::Status => {
-            for m in runtime.status(known) {
-                let reasons: Vec<&str> = m.reasons.iter().map(|r| r.as_str()).collect();
+            for m in runtime.runtime.status(known) {
                 info!(
                     device = %m.device,
                     suspended = m.suspended,
-                    reasons = ?reasons,
-                    "Status"
+                    reasons = ?m.reasons.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
+                    "Runtime status"
                 );
             }
-            false
+            for h in runtime.health() {
+                info!(device = %h.device, health = ?h.status, unverified = ?h.unverified(), "Player health");
+            }
+            for device in runtime.lifecycle.wanted_devices() {
+                info!(%device, "Monitor has an assigned wallpaper");
+            }
         }
         ControlCommand::Quit => {
-            info!("Quit requested from console");
+            info!("Quit requested");
             RUNNING.store(false, Ordering::SeqCst);
-            false
-        }
-    }
-}
-
-#[cfg(windows)]
-fn apply_user_pause(
-    runtime: &mut PlaybackSupervisor,
-    device: &Result<Option<String>, String>,
-    paused: bool,
-) -> bool {
-    match device {
-        Ok(device) => {
-            runtime.set_user_paused(device.as_deref(), paused);
-            true
-        }
-        Err(e) => {
-            warn!("{e}");
-            false
         }
     }
 }
