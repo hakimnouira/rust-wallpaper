@@ -494,6 +494,29 @@ mod platform {
                 }
             };
 
+            // Do not report a healthy listener when a critical registration failed.
+            // The daemon will retry listener creation; partial coverage is safer to expose as
+            // unavailable than to silently miss lock or display-power transitions.
+            if !wts_registered || power_notify.is_none() || taskbar_msg == 0 {
+                if let Some(handle) = power_notify {
+                    let _ = UnregisterPowerSettingNotification(handle);
+                }
+                if wts_registered {
+                    let _ = WTSUnRegisterSessionNotification(hwnd);
+                }
+                let _ = DestroyWindow(hwnd);
+                release_class(hinstance);
+                let mut missing = Vec::new();
+                if !wts_registered { missing.push("WTS session notifications"); }
+                if power_notify.is_none() { missing.push("display power notifications"); }
+                if taskbar_msg == 0 { missing.push("TaskbarCreated broadcast registration"); }
+                let _ = init_tx.send(Err(format!(
+                    "System event listener has incomplete registration: {}",
+                    missing.join(", ")
+                )));
+                return;
+            }
+
             let state = Box::new(ListenerState {
                 tx,
                 taskbar_created_msg: taskbar_msg,
