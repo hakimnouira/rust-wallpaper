@@ -1063,4 +1063,227 @@ mod tests {
             manager.stop_all();
         }
     }
+
+    #[test]
+    fn test_stale_hwnd_and_mpv_player_synchronization() {
+        use wallpaper_windows::manager::{WallpaperManager, WallpaperManagerError};
+        use windows::Win32::UI::WindowsAndMessaging::DestroyWindow;
+
+        let mut manager = WallpaperManager::init().expect("init manager");
+        let devices = manager.active_devices();
+        assert!(!devices.is_empty(), "must have at least one active device");
+        let dev = devices[0].clone();
+
+        let mut valid_video = PathBuf::from("assets/wallpapers/sample-nature.mp4");
+        if !valid_video.exists() {
+            valid_video = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets/wallpapers/sample-nature.mp4");
+        }
+
+        // 1. Launch MPV player on monitor
+        manager
+            .play_video_on_monitor(&dev, valid_video.clone(), PlaybackConfig::default())
+            .expect("play video on monitor");
+        assert_eq!(manager.player_count(), 1);
+        let orig_pid = manager.player_mut(&dev).unwrap().child_id();
+        let orig_hwnd = manager.window(&dev).unwrap().hwnd;
+
+        // 2. Invalidate window HWND externally to simulate stale HWND
+        unsafe {
+            let res = DestroyWindow(orig_hwnd);
+            assert!(
+                res.is_ok(),
+                "destroying window HWND externally must succeed"
+            );
+        }
+        assert!(!manager.window(&dev).unwrap().is_valid());
+
+        // 3. Reconcile via refresh(): must stop old player, recreate window, and restore playback
+        manager
+            .refresh()
+            .expect("refresh must reconcile stale window and player");
+        assert_eq!(manager.player_count(), 1);
+        let new_hwnd = manager.window(&dev).unwrap().hwnd;
+        assert_ne!(new_hwnd, orig_hwnd, "recreated window must have fresh HWND");
+        assert!(manager.window(&dev).unwrap().is_valid());
+
+        let new_pid = manager.player_mut(&dev).unwrap().child_id();
+        assert_ne!(
+            new_pid, orig_pid,
+            "replacement player must be a new process"
+        );
+        assert!(manager.player_mut(&dev).unwrap().is_alive());
+        assert!(manager.has_active_source(&dev));
+
+        // 4. Inject shutdown failure and simulate stale HWND again
+        manager
+            .player_mut(&dev)
+            .unwrap()
+            .set_mock_stop_failure(true);
+        unsafe {
+            let _ = DestroyWindow(new_hwnd);
+        }
+        assert!(!manager.window(&dev).unwrap().is_valid());
+
+        // 5. Reconcile via refresh(): must report error, retain old player, and NOT create duplicate
+        let res = manager.refresh();
+        match res {
+            Err(WallpaperManagerError::MonitorSyncFailed {
+                failed_monitors, ..
+            }) => {
+                assert!(
+                    failed_monitors.contains(&dev),
+                    "failed_monitors must report {dev}"
+                );
+            }
+            other => panic!("expected MonitorSyncFailed error, got {other:?}"),
+        }
+
+        // Old player is retained, no duplicate player created
+        assert_eq!(manager.player_count(), 1);
+        assert_eq!(
+            manager.player(&dev).unwrap().child_id(),
+            new_pid,
+            "failed player must be retained in tracking"
+        );
+        assert!(
+            manager.has_active_source(&dev),
+            "assignment must be preserved for later retry"
+        );
+
+        // 6. Reset failure and retry recovery: must succeed and restore playback
+        manager
+            .player_mut(&dev)
+            .unwrap()
+            .set_mock_stop_failure(false);
+        manager
+            .refresh()
+            .expect("recovery retry must succeed once failure cleared");
+
+        assert_eq!(manager.player_count(), 1);
+        assert!(manager.window(&dev).unwrap().is_valid());
+        let recovered_pid = manager.player_mut(&dev).unwrap().child_id();
+        assert_ne!(
+            recovered_pid, new_pid,
+            "recovered player must be a replacement process"
+        );
+        assert!(manager.player_mut(&dev).unwrap().is_alive());
+
+        manager.stop_all();
+        assert_eq!(manager.player_count(), 0);
+    }
+
+    #[test]
+    fn test_disconnected_and_reconnected_monitor_lifecycle() {
+        use wallpaper_windows::manager::{WallpaperManager, WallpaperManagerError};
+        use wallpaper_windows::MonitorInfo;
+
+        let mut manager = WallpaperManager::init().expect("init manager");
+
+        let m1 = MonitorInfo {
+            device_name: "\\\\.\\TEST_DISP_1".to_string(),
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            is_primary: true,
+        };
+        let m2 = MonitorInfo {
+            device_name: "\\\\.\\TEST_DISP_2".to_string(),
+            x: 1920,
+            y: 0,
+            width: 1920,
+            height: 1080,
+            is_primary: false,
+        };
+
+        manager.set_test_monitors(Some(vec![m1.clone(), m2.clone()]));
+        manager.refresh().expect("configure initial two monitors");
+        let dev1 = m1.device_name.clone();
+        let dev2 = m2.device_name.clone();
+
+        let mut valid_video = PathBuf::from("assets/wallpapers/sample-nature.mp4");
+        if !valid_video.exists() {
+            valid_video = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets/wallpapers/sample-nature.mp4");
+        }
+
+        // 1. Launch players on both monitors
+        manager
+            .play_video_on_monitor(&dev1, valid_video.clone(), PlaybackConfig::default())
+            .expect("play dev1");
+        manager
+            .play_video_on_monitor(&dev2, valid_video.clone(), PlaybackConfig::default())
+            .expect("play dev2");
+        assert_eq!(manager.player_count(), 2);
+        assert!(manager.has_active_source(&dev1));
+        assert!(manager.has_active_source(&dev2));
+
+        // 2. Disconnect dev2: only m1 remains active
+        manager.set_test_monitors(Some(vec![m1.clone()]));
+        manager
+            .refresh()
+            .expect("refresh with dev2 disconnected must succeed");
+
+        // dev2 window removed, dev2 player stopped and removed
+        assert!(
+            manager.window(&dev2).is_none(),
+            "dev2 window must be removed"
+        );
+        assert!(
+            manager.player(&dev2).is_none(),
+            "dev2 player must be removed"
+        );
+        assert_eq!(manager.player_count(), 1);
+        assert!(manager.player_mut(&dev1).unwrap().is_alive());
+
+        // dev2 active source must remain PRESERVED for when it reconnects
+        assert!(
+            manager.has_active_source(&dev2),
+            "dev2 active source must be preserved while disconnected"
+        );
+
+        // 3. Reconnect dev2: both monitors active again
+        manager.set_test_monitors(Some(vec![m1.clone(), m2.clone()]));
+        manager
+            .refresh()
+            .expect("refresh with dev2 reconnected must succeed");
+
+        // dev2 window is recreated and dev2 playback is automatically restored from preserved source
+        assert!(manager.window(&dev2).unwrap().is_valid());
+        assert!(manager.player(&dev2).is_some());
+        assert!(manager.player_mut(&dev2).unwrap().is_alive());
+        assert_eq!(manager.player_count(), 2);
+
+        // 4. Test disconnected monitor with injected player shutdown failure
+        manager
+            .player_mut(&dev2)
+            .unwrap()
+            .set_mock_stop_failure(true);
+        manager.set_test_monitors(Some(vec![m1.clone()]));
+        let res = manager.refresh();
+
+        // Must report failure and retain player in tracking
+        match res {
+            Err(WallpaperManagerError::MonitorSyncFailed {
+                failed_monitors, ..
+            }) => {
+                assert!(failed_monitors.contains(&dev2));
+            }
+            other => panic!("expected MonitorSyncFailed error, got {other:?}"),
+        }
+
+        // dev2 failed player is retained
+        assert!(manager.player(&dev2).is_some());
+        assert_eq!(manager.player_count(), 2); // 1 active for dev1, 1 retained failed for dev2
+        assert!(manager.has_active_source(&dev2));
+
+        // Reset failure and teardown
+        manager
+            .player_mut(&dev2)
+            .unwrap()
+            .set_mock_stop_failure(false);
+        manager.stop_all();
+        assert_eq!(manager.player_count(), 0);
+    }
 }

@@ -50,6 +50,11 @@ pub enum WallpaperManagerError {
         failed_monitors: Vec<String>,
         errors: Vec<(String, String)>,
     },
+    #[error("Monitor synchronization completed with failure on monitors: {failed_monitors:?}")]
+    MonitorSyncFailed {
+        failed_monitors: Vec<String>,
+        errors: Vec<(String, String)>,
+    },
 }
 
 /// Summary of results from a global shutdown operation.
@@ -127,41 +132,105 @@ impl WallpaperManager {
         #[cfg(windows)]
         {
             let mut active_devices = std::collections::HashSet::new();
+            let mut sync_failures = Vec::new();
 
             for (idx, monitor) in monitors.into_iter().enumerate() {
                 active_devices.insert(monitor.device_name.clone());
 
+                let dev = monitor.device_name.clone();
                 let (client_x, client_y) = self.host.screen_to_client(monitor.x, monitor.y);
                 let (r, g, b) = MONITOR_PALETTE[idx % MONITOR_PALETTE.len()];
                 let bg_color = color_to_colorref(r, g, b);
 
-                // Recreate window if existing handle has become invalid or stale
+                // 1. Detect stale wallpaper HWND
                 let is_stale = self
                     .windows
-                    .get(&monitor.device_name)
+                    .get(&dev)
                     .map(|w| !w.is_valid())
                     .unwrap_or(false);
 
                 if is_stale {
                     warn!(
-                        device = %monitor.device_name,
-                        "Existing wallpaper window has become invalid or stale; recreating"
+                        device = %dev,
+                        "Existing wallpaper window has become invalid or stale; reconciling player and window"
                     );
-                    self.windows.remove(&monitor.device_name);
-                }
 
-                if let Some(existing) = self.windows.get_mut(&monitor.device_name) {
+                    // Reconcile MPV player associated with this stale monitor
+                    let mut player_stopped_cleanly = true;
+                    if let Some(player) = self.players.get_mut(&dev) {
+                        match player.stop() {
+                            Ok(()) => {
+                                info!(device = %dev, "Stopped MPV player associated with stale window");
+                                self.players.remove(&dev);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    device = %dev,
+                                    %e,
+                                    "Failed to stop MPV player on stale window; retaining player tracking"
+                                );
+                                sync_failures.push((
+                                    dev.clone(),
+                                    format!("Failed to stop player on stale window: {e}"),
+                                ));
+                                player_stopped_cleanly = false;
+                            }
+                        }
+                    }
+
+                    if !player_stopped_cleanly {
+                        // When player shutdown fails:
+                        // - Retain the player in tracking.
+                        // - Do not launch a duplicate player for that monitor.
+                        // - Keep wallpaper assignment available for later retry.
+                        // - Skip window recreation until player can be stopped cleanly.
+                        continue;
+                    }
+
+                    // Player shutdown succeeded (or no player was running): remove stale window
+                    self.windows.remove(&dev);
+
+                    // Recreate wallpaper window
+                    let win = WallpaperWindow::create(
+                        self.host.hwnd,
+                        dev.clone(),
+                        client_x,
+                        client_y,
+                        monitor.width,
+                        monitor.height,
+                        monitor.is_primary,
+                        bg_color,
+                    )?;
+                    self.windows.insert(dev.clone(), win);
+
+                    // Restore playback from preserved source/configuration if one exists
+                    if let Some((path, cfg)) = self.active_sources.get(&dev).cloned() {
+                        info!(device = %dev, "Restoring playback on recreated wallpaper window");
+                        if let Err(e) = self.play_video_on_monitor(&dev, path, cfg) {
+                            error!(
+                                device = %dev,
+                                %e,
+                                "Failed to restore playback on recreated wallpaper window"
+                            );
+                            sync_failures.push((
+                                dev.clone(),
+                                format!("Failed to restore playback on recreated window: {e}"),
+                            ));
+                        }
+                    }
+                } else if let Some(existing) = self.windows.get_mut(&dev) {
                     if existing.client_x != client_x
                         || existing.client_y != client_y
                         || existing.width != monitor.width
                         || existing.height != monitor.height
                     {
-                        info!(device = %monitor.device_name, "Updating monitor geometry");
+                        info!(device = %dev, "Updating monitor geometry");
                         existing.update_geometry(client_x, client_y, monitor.width, monitor.height);
                     }
                 } else {
+                    // Window missing (e.g. initial attach, reconnected monitor, or recreated host)
                     info!(
-                        device = %monitor.device_name,
+                        device = %dev,
                         primary = monitor.is_primary,
                         client_x,
                         client_y,
@@ -172,7 +241,7 @@ impl WallpaperManager {
 
                     let win = WallpaperWindow::create(
                         self.host.hwnd,
-                        monitor.device_name.clone(),
+                        dev.clone(),
                         client_x,
                         client_y,
                         monitor.width,
@@ -180,16 +249,115 @@ impl WallpaperManager {
                         monitor.is_primary,
                         bg_color,
                     )?;
+                    self.windows.insert(dev.clone(), win);
 
-                    self.windows.insert(monitor.device_name, win);
+                    // Reconnected monitor with preserved source: restore playback
+                    if let Some((path, cfg)) = self.active_sources.get(&dev).cloned() {
+                        // If an old player was retained from an earlier failure, attempt to stop it
+                        let can_play = if let Some(player) = self.players.get_mut(&dev) {
+                            match player.stop() {
+                                Ok(()) => {
+                                    info!(device = %dev, "Stopped retained player prior to reconnected playback");
+                                    self.players.remove(&dev);
+                                    true
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        device = %dev,
+                                        %e,
+                                        "Failed to stop retained player on reconnected monitor; skipping playback to prevent duplicate"
+                                    );
+                                    sync_failures.push((
+                                        dev.clone(),
+                                        format!("Failed to stop retained player on reconnected monitor: {e}"),
+                                    ));
+                                    false
+                                }
+                            }
+                        } else {
+                            true
+                        };
+
+                        if can_play {
+                            info!(device = %dev, "Reconnected monitor: restoring preserved wallpaper playback");
+                            if let Err(e) = self.play_video_on_monitor(&dev, path, cfg) {
+                                error!(
+                                    device = %dev,
+                                    %e,
+                                    "Failed to restore playback on reconnected monitor"
+                                );
+                                sync_failures.push((
+                                    dev.clone(),
+                                    format!(
+                                        "Failed to restore playback on reconnected monitor: {e}"
+                                    ),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
 
-            // Remove disconnected displays and stop their players
-            self.windows
-                .retain(|device, _| active_devices.contains(device));
-            self.players
-                .retain(|device, _| active_devices.contains(device));
+            // Disconnected displays cleanup:
+            // 1. Remove windows for disconnected displays
+            let disconnected_windows: Vec<String> = self
+                .windows
+                .keys()
+                .filter(|d| !active_devices.contains(*d))
+                .cloned()
+                .collect();
+            for dev in disconnected_windows {
+                info!(device = %dev, "Display disconnected: removing wallpaper window");
+                self.windows.remove(&dev);
+            }
+
+            // 2. Deliberately stop players on disconnected displays and retain failed players
+            let disconnected_players: Vec<String> = self
+                .players
+                .keys()
+                .filter(|d| !active_devices.contains(*d))
+                .cloned()
+                .collect();
+            for dev in disconnected_players {
+                info!(device = %dev, "Display disconnected: stopping video player");
+                if let Some(player) = self.players.get_mut(&dev) {
+                    match player.stop() {
+                        Ok(()) => {
+                            info!(device = %dev, "Disconnected monitor player stopped successfully");
+                            self.players.remove(&dev);
+                        }
+                        Err(e) => {
+                            warn!(
+                                device = %dev,
+                                %e,
+                                "Failed to stop player on disconnected display; retaining tracking"
+                            );
+                            sync_failures.push((
+                                dev.clone(),
+                                format!("Failed to stop player on disconnected display: {e}"),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if !sync_failures.is_empty() {
+                let mut failed_monitors = Vec::new();
+                for (d, _) in &sync_failures {
+                    if !failed_monitors.contains(d) {
+                        failed_monitors.push(d.clone());
+                    }
+                }
+                warn!(
+                    failed_count = failed_monitors.len(),
+                    failed_monitors = ?failed_monitors,
+                    "Monitor synchronization completed with failures"
+                );
+                return Err(WallpaperManagerError::MonitorSyncFailed {
+                    failed_monitors,
+                    errors: sync_failures,
+                });
+            }
         }
 
         Ok(())
@@ -214,6 +382,14 @@ impl WallpaperManager {
             .windows
             .get(device)
             .ok_or_else(|| WallpaperManagerError::MonitorNotFound(device.to_string()))?;
+
+        if !win.is_valid() {
+            return Err(WallpaperManagerError::Window(WindowError::ApiError(
+                format!(
+                    "Wallpaper window for monitor '{device}' has become invalid or was destroyed"
+                ),
+            )));
+        }
 
         if !win.is_valid() {
             return Err(WallpaperManagerError::Window(WindowError::ApiError(
