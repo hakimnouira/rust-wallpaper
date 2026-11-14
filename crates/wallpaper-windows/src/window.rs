@@ -268,6 +268,11 @@ mod platform {
             self.find_child_hwnd().is_some()
         }
 
+        /// Checks if the Win32 window handle is still valid.
+        pub fn is_valid(&self) -> bool {
+            unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(self.hwnd).as_bool() }
+        }
+
         /// Returns the first child window handle inside this window if one exists.
         pub fn find_child_hwnd(&self) -> Option<HWND> {
             unsafe {
@@ -477,6 +482,10 @@ impl WallpaperWindow {
     }
 
     pub fn has_child_window(&self) -> bool {
+        false
+    }
+
+    pub fn is_valid(&self) -> bool {
         false
     }
 }

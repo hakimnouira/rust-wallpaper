@@ -714,4 +714,200 @@ mod tests {
         );
         assert!(manager.player(&primary_device).is_none());
     }
+
+    #[test]
+    fn test_explorer_recovery_all_players_succeed() {
+        use wallpaper_windows::manager::WallpaperManager;
+
+        let mut manager = WallpaperManager::init().expect("initialize wallpaper manager");
+        let devices = manager.active_devices();
+        assert!(!devices.is_empty(), "must have active monitor device");
+        let primary_device = devices[0].clone();
+
+        let mut valid_video = PathBuf::from("assets/wallpapers/sample-nature.mp4");
+        if !valid_video.exists() {
+            valid_video = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets/wallpapers/sample-nature.mp4");
+        }
+
+        // 1. Start playback on primary monitor
+        manager
+            .play_video_on_monitor(&primary_device, valid_video, PlaybackConfig::default())
+            .expect("initial playback must succeed");
+        assert_eq!(manager.player_count(), 1);
+        let initial_pid = manager.player(&primary_device).unwrap().child_id();
+
+        // 2. Execute Explorer recovery: all players stop and restart successfully
+        let res = manager.force_recover_explorer();
+        assert!(
+            res.is_ok(),
+            "Explorer recovery must succeed when all players stop cleanly: {res:?}"
+        );
+
+        // 3. Verify clean state after recovery
+        assert_eq!(manager.player_count(), 1);
+        assert!(manager.has_active_source(&primary_device));
+        let new_pid = {
+            let player = manager
+                .player_mut(&primary_device)
+                .expect("player must exist");
+            assert!(player.is_alive());
+            player.child_id()
+        };
+        assert_ne!(
+            new_pid, initial_pid,
+            "replacement player must be a fresh process"
+        );
+
+        // 4. Teardown
+        manager.stop_all();
+        assert_eq!(manager.player_count(), 0);
+    }
+
+    #[test]
+    fn test_explorer_recovery_partial_failure_preserves_failed_player_and_retries() {
+        use wallpaper_windows::manager::{WallpaperManager, WallpaperManagerError};
+        use wallpaper_windows::MonitorInfo;
+
+        let mut manager = WallpaperManager::init().expect("initialize wallpaper manager");
+        let mut devices = manager.active_devices();
+
+        // If fewer than 2 real monitors, configure deterministic simulated topology
+        if devices.len() < 2 {
+            let test_monitors = vec![
+                MonitorInfo {
+                    device_name: "\\\\.\\DISPLAY1".to_string(),
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    is_primary: true,
+                },
+                MonitorInfo {
+                    device_name: "\\\\.\\DISPLAY2".to_string(),
+                    x: 1920,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                    is_primary: false,
+                },
+            ];
+            manager.set_test_monitors(Some(test_monitors));
+            manager.refresh().expect("synchronize test monitors");
+            devices = manager.active_devices();
+        }
+
+        assert!(devices.len() >= 2, "test requires at least two monitors");
+        let dev1 = devices[0].clone();
+        let dev2 = devices[1].clone();
+
+        let mut valid_video = PathBuf::from("assets/wallpapers/sample-nature.mp4");
+        if !valid_video.exists() {
+            valid_video = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets/wallpapers/sample-nature.mp4");
+        }
+
+        // 1. Launch players on both monitors
+        manager
+            .play_video_on_monitor(&dev1, valid_video.clone(), PlaybackConfig::default())
+            .expect("play dev1 must succeed");
+        manager
+            .play_video_on_monitor(&dev2, valid_video.clone(), PlaybackConfig::default())
+            .expect("play dev2 must succeed");
+        assert_eq!(manager.player_count(), 2);
+
+        let pid1_initial = manager.player(&dev1).unwrap().child_id();
+        let pid2_initial = manager.player(&dev2).unwrap().child_id();
+
+        // 2. Inject stop failure on dev2 only
+        manager
+            .player_mut(&dev2)
+            .expect("dev2 player must exist")
+            .set_mock_stop_failure(true);
+
+        // 3. Execute Explorer recovery: dev1 succeeds, dev2 fails
+        let res = manager.force_recover_explorer();
+
+        // 4. Verify recovery failure is exposed clearly
+        match res {
+            Err(WallpaperManagerError::ExplorerRecoveryPartial {
+                failed_monitors, ..
+            }) => {
+                assert!(
+                    failed_monitors.contains(&dev2),
+                    "failed_monitors must report dev2"
+                );
+                assert!(
+                    !failed_monitors.contains(&dev1),
+                    "failed_monitors must not report dev1"
+                );
+            }
+            other => panic!("expected ExplorerRecoveryPartial error, got {other:?}"),
+        }
+
+        // 5. Verify dev1 was recovered independently with a new player
+        let pid1_new = {
+            let p1 = manager.player_mut(&dev1).expect("dev1 player must exist");
+            assert!(p1.is_alive());
+            p1.child_id()
+        };
+        assert_ne!(
+            pid1_new, pid1_initial,
+            "dev1 must have a new replacement player process"
+        );
+        assert!(manager.has_active_source(&dev1));
+
+        // 6. Verify dev2 failed player is RETAINED and NO duplicate player was created
+        let p2 = manager
+            .player(&dev2)
+            .expect("dev2 player must be retained in manager");
+        assert_eq!(
+            p2.child_id(),
+            pid2_initial,
+            "dev2 must retain the original player process, no duplicate process created"
+        );
+        assert!(
+            manager.has_active_source(&dev2),
+            "dev2 saved source must be preserved for future recovery"
+        );
+        assert_eq!(
+            manager.player_count(),
+            2,
+            "total player count must remain exactly 2 (1 new for dev1, 1 retained for dev2)"
+        );
+
+        // 7. Verify check_and_recover_players() does not launch a duplicate player for dev2
+        manager.check_and_recover_players();
+        assert_eq!(manager.player_count(), 2);
+        assert_eq!(manager.player(&dev2).unwrap().child_id(), pid2_initial);
+
+        // 8. Test subsequent retry: reset mock failure and re-run recovery
+        manager
+            .player_mut(&dev2)
+            .expect("dev2 player exists")
+            .set_mock_stop_failure(false);
+
+        let retry_res = manager.force_recover_explorer();
+        assert!(
+            retry_res.is_ok(),
+            "Explorer recovery retry must succeed once failure condition is cleared: {retry_res:?}"
+        );
+
+        // 9. Both monitors are now recovered with fresh players
+        assert_eq!(manager.player_count(), 2);
+        assert!(manager.player_mut(&dev1).unwrap().is_alive());
+        let p2_final = manager.player_mut(&dev2).unwrap();
+        assert!(p2_final.is_alive());
+        let p2_final_pid = p2_final.child_id();
+        assert_ne!(
+            p2_final_pid, pid2_initial,
+            "dev2 must now have a replacement player process after successful retry"
+        );
+        assert!(manager.has_active_source(&dev1));
+        assert!(manager.has_active_source(&dev2));
+
+        // 10. Clean teardown
+        manager.stop_all();
+        assert_eq!(manager.player_count(), 0);
+    }
 }

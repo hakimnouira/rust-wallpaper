@@ -13,7 +13,7 @@ use crate::window::{WallpaperWindow, WindowError};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use wallpaper_core::{PlaybackConfig, PlaybackState, PlayerTelemetry};
 
 #[derive(Debug, Error)]
@@ -42,6 +42,13 @@ pub enum WallpaperManagerError {
     AttachmentRecoveryFailed {
         original: String,
         recovery: WindowError,
+    },
+    #[error(
+        "Explorer recovery completed with partial failure: failed to stop or recover monitors: {failed_monitors:?}"
+    )]
+    ExplorerRecoveryPartial {
+        failed_monitors: Vec<String>,
+        errors: Vec<(String, String)>,
     },
 }
 
@@ -80,6 +87,8 @@ pub struct WallpaperManager {
     players: HashMap<String, MpvPlayer>,
     active_sources: HashMap<String, (PathBuf, PlaybackConfig)>,
     backoffs: HashMap<String, ProcessBackoff>,
+    #[doc(hidden)]
+    test_monitors: Option<Vec<crate::MonitorInfo>>,
 }
 
 impl WallpaperManager {
@@ -94,6 +103,7 @@ impl WallpaperManager {
             players: HashMap::new(),
             active_sources: HashMap::new(),
             backoffs: HashMap::new(),
+            test_monitors: None,
         };
 
         manager.attach_all_monitors()?;
@@ -103,8 +113,11 @@ impl WallpaperManager {
 
     /// Attaches or synchronizes wallpaper windows for all detected monitors.
     fn attach_all_monitors(&mut self) -> Result<(), WallpaperManagerError> {
-        let monitors =
-            enumerate_monitors().map_err(|e| WallpaperManagerError::MonitorError(e.to_string()))?;
+        let monitors = if let Some(test_mons) = &self.test_monitors {
+            test_mons.clone()
+        } else {
+            enumerate_monitors().map_err(|e| WallpaperManagerError::MonitorError(e.to_string()))?
+        };
 
         debug!(
             count = monitors.len(),
@@ -473,26 +486,100 @@ impl WallpaperManager {
         #[cfg(windows)]
         {
             warn!("Explorer restart detected: tearing down existing MPV players and windows");
+
+            // 1. Preserve active sources across all failure and recovery paths
             let saved_sources = self.active_sources.clone();
-            self.stop_all();
+
+            // 2. Stop all players and inspect shutdown outcomes
+            let shutdown_summary = self.stop_all();
+            let failed_devices: std::collections::HashSet<String> = shutdown_summary
+                .failed
+                .iter()
+                .map(|(d, _)| d.clone())
+                .collect();
+
+            // 3. Clear windows that belong to successfully stopped players or dead host.
+            // When Explorer restarts, old WorkerW and its child HWNDs may already be destroyed.
+            // WallpaperWindow::drop safely handles already-destroyed HWNDs.
             self.windows.clear();
 
-            // Re-discover fresh host
-            self.host = ensure_desktop_host()?;
+            // 4. Re-discover fresh desktop host.
+            // If Explorer is still initializing and WorkerW is not yet ready, restore
+            // active sources so future recovery attempts retain the assignments.
+            let host_res = ensure_desktop_host();
+            let new_host = match host_res {
+                Ok(h) => h,
+                Err(e) => {
+                    self.active_sources = saved_sources;
+                    return Err(WallpaperManagerError::DesktopHost(e));
+                }
+            };
+            self.host = new_host;
             info!(
                 selected_host = format_args!("0x{:X}", self.host.hwnd.0 as isize),
                 "Re-discovered new desktop host after Explorer restart"
             );
 
-            // Re-attach windows
-            self.attach_all_monitors()?;
+            // 5. Re-attach wallpaper windows to the new host.
+            // If attachment fails, restore active sources for future recovery attempts.
+            if let Err(e) = self.attach_all_monitors() {
+                self.active_sources = saved_sources;
+                return Err(e);
+            }
 
-            // Re-launch players on active sources
+            // 6. Handle successful and failed monitors independently:
+            // - NEVER launch a replacement player for a monitor whose previous player failed to terminate.
+            // - Preserve saved wallpaper assignments in self.active_sources for all monitors.
+            // - Launch replacement players only on healthy monitors where shutdown succeeded.
+            let mut launch_errors = Vec::new();
             for (dev, (path, cfg)) in saved_sources {
+                if failed_devices.contains(&dev) {
+                    warn!(
+                        device = %dev,
+                        "Skipping player launch during Explorer recovery: previous player failed to terminate"
+                    );
+                    // Preserve assignment in active_sources for future recovery retry
+                    self.active_sources.insert(dev, (path, cfg));
+                    continue;
+                }
+
                 if self.windows.contains_key(&dev) {
                     info!(device = %dev, "Restoring video wallpaper on recreated host window");
-                    let _ = self.play_video_on_monitor(&dev, path, cfg);
+                    if let Err(e) = self.play_video_on_monitor(&dev, path.clone(), cfg.clone()) {
+                        error!(device = %dev, error = %e, "Failed to launch replacement player during Explorer recovery");
+                        launch_errors.push((dev.clone(), e.to_string()));
+                        // Preserve assignment even if launch failed
+                        self.active_sources.insert(dev, (path, cfg));
+                    }
                 }
+            }
+
+            // 7. Clearly expose recovery failure if any player failed shutdown or launch
+            if !shutdown_summary.failed.is_empty() || !launch_errors.is_empty() {
+                let mut all_failed_monitors = Vec::new();
+                for (d, _) in &shutdown_summary.failed {
+                    if !all_failed_monitors.contains(d) {
+                        all_failed_monitors.push(d.clone());
+                    }
+                }
+                for (d, _) in &launch_errors {
+                    if !all_failed_monitors.contains(d) {
+                        all_failed_monitors.push(d.clone());
+                    }
+                }
+                let mut all_errors = shutdown_summary.failed;
+                all_errors.extend(launch_errors);
+
+                warn!(
+                    failed_count = all_failed_monitors.len(),
+                    failed_monitors = ?all_failed_monitors,
+                    "Explorer recovery completed with partial failure; retained failed players"
+                );
+
+                return Err(WallpaperManagerError::ExplorerRecoveryPartial {
+                    failed_monitors: all_failed_monitors,
+                    errors: all_errors,
+                });
             }
         }
 
@@ -565,6 +652,12 @@ impl WallpaperManager {
     /// Returns the number of configured active video sources.
     pub fn active_source_count(&self) -> usize {
         self.active_sources.len()
+    }
+
+    /// For testing: overrides monitor enumeration with a simulated monitor topology.
+    #[doc(hidden)]
+    pub fn set_test_monitors(&mut self, monitors: Option<Vec<crate::MonitorInfo>>) {
+        self.test_monitors = monitors;
     }
 }
 
