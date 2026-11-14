@@ -501,7 +501,7 @@ pub trait WallpaperHost: PlaybackSink {
     /// Stops and forgets the wallpaper when a monitor has no effective assignment.
     /// The default keeps lightweight test hosts source-compatible.
     fn stop_wallpaper(&mut self, _device: &str) -> Result<(), String> { Ok(()) }
-    fn player_reports(&self) -> Vec<PlayerReport>;
+    fn player_reports(&mut self) -> Vec<PlayerReport>;
 }
 
 /// Attempts before giving up on starting a wallpaper until something changes.
@@ -960,7 +960,7 @@ mod tests {
             self.sources.remove(device);
             Ok(())
         }
-        fn player_reports(&self) -> Vec<PlayerReport> {
+        fn player_reports(&mut self) -> Vec<PlayerReport> {
             Vec::new()
         }
     }
