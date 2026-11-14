@@ -412,3 +412,67 @@ impl Drop for WallpaperManager {
         self.stop_all();
     }
 }
+
+impl wallpaper_core::monitors::WallpaperHost for WallpaperManager {
+    fn start_wallpaper(
+        &mut self,
+        device: &str,
+        assignment: &wallpaper_core::monitors::Assignment,
+    ) -> Result<(), wallpaper_core::monitors::StartError> {
+        if !assignment.video_path.is_file() {
+            return Err(wallpaper_core::monitors::StartError::Failed(format!(
+                "wallpaper file does not exist: {}",
+                assignment.video_path.display()
+            )));
+        }
+        self.play_video_on_monitor(
+            device,
+            assignment.video_path.clone(),
+            assignment.config.clone(),
+        )
+        .map_err(|e| wallpaper_core::monitors::StartError::Failed(e.to_string()))
+    }
+
+    fn player_reports(&self) -> Vec<wallpaper_core::health::PlayerReport> {
+        use wallpaper_core::health::{PlayerReport, RecoveryState, Signal};
+        let mut reports = Vec::with_capacity(self.players.len());
+        for (device, player) in &self.players {
+            let recovery = self.backoffs.get(device).and_then(|b| {
+                if b.consecutive_failures == 0 {
+                    None
+                } else if b.consecutive_failures > b.max_failures {
+                    Some(RecoveryState::Exhausted { attempts: b.consecutive_failures })
+                } else {
+                    Some(RecoveryState::InProgress { attempt: b.consecutive_failures })
+                }
+            });
+            reports.push(PlayerReport {
+                device: device.clone(),
+                state: player.state(),
+                uptime: Some(std::time::Duration::from_secs(player.uptime_secs())),
+                memory_bytes: player.get_memory_bytes(),
+                // Child::try_wait requires mutable access. Keep this read-only snapshot
+                // non-blocking; scheduled recovery and IPC probes provide fault evidence.
+                process_alive: Signal::Unknown,
+                recovery,
+            });
+        }
+        reports
+    }
+}
+
+impl WallpaperManager {
+    /// Potentially blocking IPC probe round, scheduled by RuntimeSupervisor.
+    pub fn probe_players(&mut self) -> Vec<wallpaper_core::health::ProbeResult> {
+        let mut results = Vec::with_capacity(self.players.len());
+        for (device, player) in &mut self.players {
+            let (width, height, _, _) = player.query_video_details();
+            results.push(wallpaper_core::health::ProbeResult {
+                device: device.clone(),
+                ipc_responded: width.is_some() || height.is_some(),
+                video_initialized: width.unwrap_or(0) > 0 && height.unwrap_or(0) > 0,
+            });
+        }
+        results
+    }
+}
