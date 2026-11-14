@@ -12,11 +12,17 @@ pub mod policy;
 pub mod window;
 
 pub use desktop_host::{ensure_desktop_host, DesktopHost, DesktopHostDiagnostics, DesktopHostKind};
-pub use events::{SystemEventListener, SystemPlatformEvent};
-pub use fullscreen::{check_foreground_fullscreen, FullscreenStatus};
+pub use events::{ListenerPoll, SystemEventListener, SystemPlatformEvent};
+pub use fullscreen::{
+    check_foreground_fullscreen, FullscreenProbe, FullscreenStatus, FullscreenTracker,
+};
 pub use manager::{WallpaperManager, WallpaperManagerError};
 pub use mpv::{find_mpv_executable, MpvError, MpvLaunchConfig, MpvPlayer};
-pub use policy::{PlaybackSupervisor, PlayerSuspensionManager, ProcessBackoff, StateDebouncer};
+pub use policy::{
+    ActualPlayback, ControlCommand, ForegroundObservation, MonitorStatus, PendingWork,
+    PlaybackSink, PlaybackSupervisor, PlayerCommand, PlayerSuspensionManager, ProcessBackoff,
+    RuntimeEvent, StateDebouncer,
+};
 pub use window::WallpaperWindow;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
