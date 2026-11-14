@@ -135,6 +135,21 @@ impl WallpaperManager {
                 let (r, g, b) = MONITOR_PALETTE[idx % MONITOR_PALETTE.len()];
                 let bg_color = color_to_colorref(r, g, b);
 
+                // Recreate window if existing handle has become invalid or stale
+                let is_stale = self
+                    .windows
+                    .get(&monitor.device_name)
+                    .map(|w| !w.is_valid())
+                    .unwrap_or(false);
+
+                if is_stale {
+                    warn!(
+                        device = %monitor.device_name,
+                        "Existing wallpaper window has become invalid or stale; recreating"
+                    );
+                    self.windows.remove(&monitor.device_name);
+                }
+
                 if let Some(existing) = self.windows.get_mut(&monitor.device_name) {
                     if existing.client_x != client_x
                         || existing.client_y != client_y
@@ -199,6 +214,14 @@ impl WallpaperManager {
             .windows
             .get(device)
             .ok_or_else(|| WallpaperManagerError::MonitorNotFound(device.to_string()))?;
+
+        if !win.is_valid() {
+            return Err(WallpaperManagerError::Window(WindowError::ApiError(
+                format!(
+                    "Wallpaper window for monitor '{device}' has become invalid or was destroyed"
+                ),
+            )));
+        }
 
         // 2. Stop any existing player on this monitor; report failure and preserve manager state
         if let Some(existing_player) = self.players.get_mut(device) {

@@ -33,7 +33,7 @@ mod platform {
     };
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, IsWindow,
         RegisterClassExW, SetWindowLongPtrW, SetWindowPos, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE,
         HWND_BOTTOM, MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW, WM_DESTROY,
         WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_PAINT, WM_SETFOCUS, WNDCLASSEXW, WS_CHILD,
@@ -268,9 +268,54 @@ mod platform {
             self.find_child_hwnd().is_some()
         }
 
-        /// Checks if the Win32 window handle is still valid.
+        /// Checks if the Win32 window handle is currently valid.
+        ///
+        /// # Win32 Semantics and Limits
+        /// `IsWindow` verifies that the HWND identifies an existing window at the moment of the check.
+        /// Callers should note:
+        /// 1. Windows can asynchronously destroy windows if a parent (`WorkerW` or Explorer) exits or crashes.
+        /// 2. `IsWindow` is a point-in-time check and does not eliminate check-then-act concurrency races.
+        /// 3. In destruction and cleanup paths, `IsWindow` is used to skip `DestroyWindow` and `InvalidateRect`
+        ///    on handles already reaped by the OS, avoiding spurious Win32 errors.
         pub fn is_valid(&self) -> bool {
-            unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(self.hwnd).as_bool() }
+            unsafe { IsWindow(self.hwnd).as_bool() }
+        }
+
+        /// Safely destroys the Win32 window and releases associated GDI resources.
+        ///
+        /// Idempotent and safe to invoke multiple times or prior to drop.
+        pub fn destroy(&mut self) {
+            debug!(
+                hwnd = format_args!("0x{:X}", self.hwnd.0 as isize),
+                device = %self.device_name,
+                "Cleaning up wallpaper window"
+            );
+            unsafe {
+                // 1. Check IsWindow(self.hwnd) before calling DestroyWindow.
+                // Skip destruction when the HWND is already invalid (e.g. destroyed by Explorer/OS).
+                if IsWindow(self.hwnd).as_bool() {
+                    let _ = DestroyWindow(self.hwnd);
+                } else {
+                    debug!(
+                        hwnd = format_args!("0x{:X}", self.hwnd.0 as isize),
+                        device = %self.device_name,
+                        "Skipping DestroyWindow on already-invalid HWND"
+                    );
+                }
+                self.hwnd = HWND::default();
+
+                // 2. Always release the owned GDI brush exactly once.
+                if !self.brush.0.is_null() {
+                    let _ = DeleteObject(self.brush);
+                    self.brush = windows::Win32::Graphics::Gdi::HBRUSH::default();
+                }
+
+                // 3. Check IsWindow(self.host_hwnd) before calling InvalidateRect.
+                if IsWindow(self.host_hwnd).as_bool() {
+                    let _ = InvalidateRect(self.host_hwnd, None, true);
+                }
+                self.host_hwnd = HWND::default();
+            }
         }
 
         /// Returns the first child window handle inside this window if one exists.
@@ -427,17 +472,7 @@ mod platform {
 
     impl Drop for WallpaperWindow {
         fn drop(&mut self) {
-            debug!(
-                hwnd = format_args!("0x{:X}", self.hwnd.0 as isize),
-                device = %self.device_name,
-                "Destroying wallpaper window"
-            );
-            unsafe {
-                let _ = DestroyWindow(self.hwnd);
-                let _ = DeleteObject(self.brush);
-                // Invalidate host region so desktop redraws cleanly
-                let _ = InvalidateRect(self.host_hwnd, None, true);
-            }
+            self.destroy();
         }
     }
 }
@@ -488,4 +523,6 @@ impl WallpaperWindow {
     pub fn is_valid(&self) -> bool {
         false
     }
+
+    pub fn destroy(&mut self) {}
 }

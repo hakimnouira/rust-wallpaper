@@ -910,4 +910,157 @@ mod tests {
         manager.stop_all();
         assert_eq!(manager.player_count(), 0);
     }
+
+    #[test]
+    fn test_wallpaper_window_safe_drop_and_stale_cleanup() {
+        use windows::core::w;
+        use windows::Win32::Foundation::COLORREF;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, IsWindow, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        };
+
+        let host = ensure_desktop_host().expect("host");
+
+        // 1. Dropping a valid wallpaper window
+        {
+            let win = WallpaperWindow::create(
+                host.hwnd,
+                "TEST_DROP_VALID".to_string(),
+                0,
+                0,
+                300,
+                200,
+                false,
+                COLORREF(0),
+            )
+            .expect("create window");
+            let hwnd = win.hwnd;
+            assert!(win.is_valid());
+            drop(win);
+            assert!(!unsafe { IsWindow(hwnd).as_bool() });
+        }
+
+        // 2. Dropping a window whose HWND has already been destroyed
+        {
+            let win = WallpaperWindow::create(
+                host.hwnd,
+                "TEST_DROP_ALREADY_DESTROYED".to_string(),
+                0,
+                0,
+                300,
+                200,
+                false,
+                COLORREF(0),
+            )
+            .expect("create window");
+            let hwnd = win.hwnd;
+            assert!(win.is_valid());
+
+            unsafe {
+                let res = DestroyWindow(hwnd);
+                assert!(res.is_ok(), "direct DestroyWindow must succeed");
+            }
+            assert!(!win.is_valid(), "window must report invalid before drop");
+            drop(win); // Must not panic or double-destroy
+        }
+
+        // 3. Dropping a window after its host HWND has been destroyed
+        {
+            let dummy_host = unsafe {
+                CreateWindowExW(
+                    Default::default(),
+                    w!("STATIC"),
+                    w!("DummyHostWindow"),
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    100,
+                    100,
+                    400,
+                    300,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .expect("create dummy host window")
+            };
+            assert!(unsafe { IsWindow(dummy_host).as_bool() });
+
+            let win = WallpaperWindow::create(
+                dummy_host,
+                "TEST_DROP_HOST_DESTROYED".to_string(),
+                0,
+                0,
+                200,
+                150,
+                false,
+                COLORREF(0),
+            )
+            .expect("create child window parented to dummy host");
+            win.attach_to_host().expect("attach to dummy host");
+            let child_hwnd = win.hwnd;
+            assert!(win.is_valid());
+
+            // Destroy the host window: cascades destruction to child in Win32
+            unsafe {
+                let res = DestroyWindow(dummy_host);
+                assert!(res.is_ok(), "destroying dummy host must succeed");
+            }
+            assert!(!unsafe { IsWindow(dummy_host).as_bool() });
+            assert!(!unsafe { IsWindow(child_hwnd).as_bool() });
+            assert!(!win.is_valid());
+
+            drop(win); // Must safely handle both child and host HWND already dead
+        }
+
+        // 4. Repeated cleanup without panic or double-free
+        {
+            let mut win = WallpaperWindow::create(
+                host.hwnd,
+                "TEST_REPEAT_CLEANUP".to_string(),
+                0,
+                0,
+                300,
+                200,
+                false,
+                COLORREF(0),
+            )
+            .expect("create window");
+            let hwnd = win.hwnd;
+            assert!(win.is_valid());
+
+            // First manual cleanup
+            win.destroy();
+            assert!(!win.is_valid());
+            assert!(!unsafe { IsWindow(hwnd).as_bool() });
+
+            // Second manual cleanup (idempotent, must not double-free brush or fail)
+            win.destroy();
+
+            // Third cleanup via Drop (must not panic or double-free)
+            drop(win);
+        }
+
+        // 5. Manager detects and recreates stale window upon refresh
+        {
+            let mut manager =
+                wallpaper_windows::manager::WallpaperManager::init().expect("init manager");
+            let devices = manager.active_devices();
+            let dev = devices[0].clone();
+            let orig_hwnd = manager.window(&dev).unwrap().hwnd;
+
+            // Invalidate the HWND externally
+            unsafe {
+                let _ = DestroyWindow(orig_hwnd);
+            }
+            assert!(!manager.window(&dev).unwrap().is_valid());
+
+            // Calling refresh() must detect the stale window and recreate a fresh valid window
+            manager.refresh().expect("refresh must handle stale window");
+            let new_hwnd = manager.window(&dev).unwrap().hwnd;
+            assert_ne!(orig_hwnd, new_hwnd);
+            assert!(manager.window(&dev).unwrap().is_valid());
+
+            manager.stop_all();
+        }
+    }
 }
