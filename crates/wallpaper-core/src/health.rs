@@ -212,6 +212,9 @@ pub struct HealthTracker {
     tracks: HashMap<String, DeviceTrack>,
     /// Time since which each device has had no player at all.
     missing_since: HashMap<String, Instant>,
+    /// Devices whose player vanished and came back since the last [`take_new_processes`]:
+    /// the process is a different one, so evidence gathered about the old one is void.
+    new_processes: Vec<String>,
 }
 
 impl HealthTracker {
@@ -220,6 +223,7 @@ impl HealthTracker {
             policy,
             tracks: HashMap::new(),
             missing_since: HashMap::new(),
+            new_processes: Vec::new(),
         }
     }
 
@@ -240,6 +244,11 @@ impl HealthTracker {
         } else {
             track.probe_failures = track.probe_failures.saturating_add(1);
         }
+    }
+
+    /// Devices whose player was replaced since the last call (it disappeared, then returned).
+    pub fn take_new_processes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.new_processes)
     }
 
     /// Drops all state for a device (monitor removed).
@@ -281,7 +290,9 @@ impl HealthTracker {
         let Some(report) = report else {
             return self.evaluate_missing(device, now);
         };
-        self.missing_since.remove(device);
+        if self.missing_since.remove(device).is_some() {
+            self.new_processes.push(device.to_string());
+        }
 
         let track = self
             .tracks
@@ -436,6 +447,13 @@ impl ProbeScheduler {
 
     pub fn interval(&self) -> Duration {
         self.current
+    }
+
+    /// Makes the next round due immediately and returns to the base interval. Used when a player
+    /// was just replaced and deserves a prompt, fresh verdict.
+    pub fn request_now(&mut self) {
+        self.last_round = None;
+        self.current = self.base;
     }
 
     pub fn is_due(&self, now: Instant) -> bool {

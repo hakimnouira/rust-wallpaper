@@ -5,6 +5,7 @@ pub mod library;
 pub mod monitors;
 pub mod registration;
 pub mod runtime;
+pub mod supervisor;
 
 pub use library::{LibraryError, WallpaperLibrary};
 use serde::{Deserialize, Serialize};

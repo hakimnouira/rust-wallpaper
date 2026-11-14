@@ -14,6 +14,7 @@
 //!
 //! Every time-dependent method takes `now: Instant` explicitly so tests never need `sleep`.
 
+use crate::health::PlayerHealth;
 use crate::{
     ForegroundKind, PerformanceProfile, PlaybackPolicy, SuspensionFlags, SuspensionReason,
 };
@@ -473,14 +474,29 @@ struct Reconciler {
     /// Last command issued per device. Only a *repeat of the same command* is throttled:
     /// the opposite command (pause then resume) reflects a genuine new decision.
     last_attempt: HashMap<String, (Instant, PlayerCommand)>,
+    /// Consecutive attempts of the same command that had no effect, per device. This is the
+    /// evidence that a player's IPC has stopped answering.
+    failures: HashMap<String, u32>,
 }
+
+/// Longest wait between retries of a command that keeps failing. Each failed attempt can block
+/// for the IPC timeout, so this caps the loop-blocking duty cycle for a hung player.
+pub const MAX_COMMAND_RETRY: Duration = Duration::from_secs(30);
 
 impl Reconciler {
     fn new(retry_interval: Duration) -> Self {
         Self {
             retry_interval,
             last_attempt: HashMap::new(),
+            failures: HashMap::new(),
         }
+    }
+
+    /// Wait before retrying after `failed` consecutive ineffective attempts.
+    fn backoff(&self, failed: u32) -> Duration {
+        self.retry_interval
+            .saturating_mul(1u32 << failed.min(6))
+            .min(MAX_COMMAND_RETRY)
     }
 
     fn run<S: PlaybackSink>(
@@ -494,6 +510,7 @@ impl Reconciler {
         let present: HashSet<&str> = states.iter().map(|(d, _)| d.as_str()).collect();
         self.last_attempt
             .retain(|d, _| present.contains(d.as_str()));
+        self.failures.retain(|d, _| present.contains(d.as_str()));
 
         for (device, actual) in &states {
             let want_suspended = suspension.should_suspend(device);
@@ -503,15 +520,22 @@ impl Reconciler {
                 _ => {
                     // In sync (or not commandable): forget any retry bookkeeping.
                     self.last_attempt.remove(device);
+                    self.failures.remove(device);
                     continue;
                 }
             };
 
-            if let Some((last, last_command)) = self.last_attempt.get(device) {
-                if *last_command == command
-                    && now.saturating_duration_since(*last) < self.retry_interval
-                {
-                    continue; // same command had no effect yet; do not hammer IPC
+            if let Some((last, last_command)) = self.last_attempt.get(device).copied() {
+                if last_command == command {
+                    let failed = self.failures.get(device).copied().unwrap_or(0);
+                    if now.saturating_duration_since(last) < self.backoff(failed) {
+                        continue; // same command had no effect yet; do not hammer IPC
+                    }
+                    // The wait elapsed and the mismatch persists: the last attempt failed.
+                    *self.failures.entry(device.clone()).or_insert(0) += 1;
+                } else {
+                    // Opposite command: a genuine new decision, not a retry.
+                    self.failures.remove(device);
                 }
             }
             self.last_attempt.insert(device.clone(), (now, command));
@@ -521,6 +545,22 @@ impl Reconciler {
                 PlayerCommand::Resume => sink.resume_player(device),
             }
             issued.push((device.clone(), command));
+
+            // Verify the effect right away (state reads are cheap and never block). A command
+            // that took must not leave retry bookkeeping behind: otherwise a player respawned
+            // `Playing` a moment later would see its legitimate re-pause throttled as a "retry".
+            let wanted = match command {
+                PlayerCommand::Pause => ActualPlayback::Paused,
+                PlayerCommand::Resume => ActualPlayback::Playing,
+            };
+            let took_effect = sink
+                .player_states()
+                .iter()
+                .any(|(d, state)| d == device && *state == wanted);
+            if took_effect {
+                self.last_attempt.remove(device);
+                self.failures.remove(device);
+            }
         }
         issued
     }
@@ -561,9 +601,22 @@ pub struct PendingWork {
 /// A command received from the user (CLI, console, future IPC).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlCommand {
-    Pause { device: Option<String> },
-    Resume { device: Option<String> },
+    Pause {
+        device: Option<String>,
+    },
+    Resume {
+        device: Option<String>,
+    },
     SetProfile(PerformanceProfile),
+    /// Persistently assign a wallpaper to a monitor (a user preference).
+    Assign {
+        device: String,
+        path: String,
+    },
+    /// Remove the user's assignment for a monitor; the default policy applies again.
+    Unassign {
+        device: String,
+    },
     Status,
     Quit,
 }
@@ -574,6 +627,21 @@ pub fn parse_control_command(line: &str) -> Result<ControlCommand, String> {
     let Some(verb) = parts.next() else {
         return Err("empty command".to_string());
     };
+
+    // `assign` takes a path that may contain spaces: everything after the device is the path.
+    if verb.eq_ignore_ascii_case("assign") {
+        let device = parts
+            .next()
+            .ok_or("usage: assign <DISPLAYn> <video path>")?
+            .to_string();
+        let rest = line.trim_start();
+        let rest = rest[verb.len()..].trim_start();
+        let path = rest[device.len()..].trim().trim_matches('"').to_string();
+        if path.is_empty() {
+            return Err("usage: assign <DISPLAYn> <video path>".to_string());
+        }
+        return Ok(ControlCommand::Assign { device, path });
+    }
     let arg = parts.next().map(str::to_string);
     if parts.next().is_some() {
         return Err("too many arguments".to_string());
@@ -588,6 +656,9 @@ pub fn parse_control_command(line: &str) -> Result<ControlCommand, String> {
                 .map(ControlCommand::SetProfile)
                 .ok_or_else(|| format!("unknown profile '{name}'"))
         }
+        "unassign" => Ok(ControlCommand::Unassign {
+            device: arg.ok_or("usage: unassign <DISPLAYn>")?,
+        }),
         "status" => Ok(ControlCommand::Status),
         "quit" | "exit" => Ok(ControlCommand::Quit),
         other => Err(format!("unknown command '{other}'")),
@@ -908,6 +979,53 @@ impl RuntimeState {
                 }
             }
         }
+    }
+
+    /// Maps health verdicts onto `RuntimeError`: exactly the monitors whose player is unhealthy,
+    /// missing, recovering or out of recovery budget carry the reason; everything else (including
+    /// monitors with no assignment) has it cleared. `Starting` is not an error.
+    pub fn sync_player_health(&mut self, health: &[PlayerHealth]) {
+        let failing: HashSet<&str> = health
+            .iter()
+            .filter(|h| h.status.is_error())
+            .map(|h| h.device.as_str())
+            .collect();
+
+        for h in health.iter().filter(|h| h.status.is_error()) {
+            if self
+                .suspension
+                .set_monitor(&h.device, SuspensionReason::RuntimeError, true)
+            {
+                warn!(device = %h.device, status = ?h.status, "Player unhealthy: marking RuntimeError");
+            }
+        }
+        for device in self
+            .suspension
+            .monitors_with(SuspensionReason::RuntimeError)
+        {
+            if !failing.contains(device.as_str())
+                && self
+                    .suspension
+                    .remove_monitor(&device, SuspensionReason::RuntimeError)
+            {
+                info!(device = %device, "Player healthy again: clearing RuntimeError");
+            }
+        }
+    }
+
+    /// Forgets failed-command evidence for `device`, so the next reconcile may retry at once.
+    ///
+    /// That evidence describes one *process*. Call this when the process was replaced, or when a
+    /// probe has since shown its IPC answering; otherwise stale failures keep condemning (and
+    /// delaying commands to) a healthy replacement.
+    pub fn reset_command_history(&mut self, device: &str) {
+        self.reconciler.last_attempt.remove(device);
+        self.reconciler.failures.remove(device);
+    }
+
+    /// Consecutive pause/resume commands that did not take effect for `device`.
+    pub fn command_failures(&self, device: &str) -> u32 {
+        self.reconciler.failures.get(device).copied().unwrap_or(0)
     }
 
     // ---- reconcile & reporting ------------------------------------------------------

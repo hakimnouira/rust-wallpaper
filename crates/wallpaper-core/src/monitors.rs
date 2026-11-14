@@ -557,6 +557,17 @@ impl MonitorLifecycle {
             .collect()
     }
 
+    /// Connected monitors that *should* be showing a wallpaper, whether or not starting it has
+    /// succeeded yet. A monitor in this set with no healthy player is a fault: this is the set
+    /// player health is judged against.
+    pub fn wanted_devices(&self) -> Vec<String> {
+        self.registry
+            .connected()
+            .filter(|m| self.registry.desired(&m.id).is_some())
+            .map(|m| m.device_name.clone())
+            .collect()
+    }
+
     /// Devices whose wallpaper has not been started yet (window pending or retries running).
     pub fn pending_devices(&self) -> Vec<String> {
         let mut v: Vec<String> = self.start_retry.keys().cloned().collect();
