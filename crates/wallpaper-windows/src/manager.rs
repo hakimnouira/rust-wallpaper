@@ -10,7 +10,7 @@ use crate::enumerate_monitors;
 use crate::mpv::{MpvError, MpvLaunchConfig, MpvPlayer};
 use crate::policy::ProcessBackoff;
 use crate::window::{WallpaperWindow, WindowError};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -92,8 +92,11 @@ pub struct WallpaperManager {
     players: HashMap<String, MpvPlayer>,
     active_sources: HashMap<String, (PathBuf, PlaybackConfig)>,
     backoffs: HashMap<String, ProcessBackoff>,
+    disconnected_failed_players: HashSet<String>,
     #[doc(hidden)]
     test_monitors: Option<Vec<crate::MonitorInfo>>,
+    #[doc(hidden)]
+    lifecycle_recorder: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
 }
 
 impl WallpaperManager {
@@ -108,7 +111,9 @@ impl WallpaperManager {
             players: HashMap::new(),
             active_sources: HashMap::new(),
             backoffs: HashMap::new(),
+            disconnected_failed_players: HashSet::new(),
             test_monitors: None,
+            lifecycle_recorder: None,
         };
 
         manager.attach_all_monitors()?;
@@ -142,7 +147,85 @@ impl WallpaperManager {
                 let (r, g, b) = MONITOR_PALETTE[idx % MONITOR_PALETTE.len()];
                 let bg_color = color_to_colorref(r, g, b);
 
-                // 1. Detect stale wallpaper HWND
+                // 1. Reconcile reconnected monitor that had a failed player on earlier disconnect
+                if self.disconnected_failed_players.contains(&dev) {
+                    warn!(
+                        device = %dev,
+                        "Reconnected monitor had a retained failed player; attempting shutdown before restoring"
+                    );
+                    let has_player = self.players.contains_key(&dev);
+                    if has_player {
+                        self.record_lifecycle_event(&format!("player_stop_attempt:{dev}"));
+                    }
+                    let mut player_stopped_cleanly = true;
+                    if let Some(res) = self.players.get_mut(&dev).map(|p| p.stop()) {
+                        match res {
+                            Ok(()) => {
+                                self.record_lifecycle_event(&format!("player_stop_success:{dev}"));
+                                info!(device = %dev, "Retained player on reconnected monitor stopped successfully");
+                                self.players.remove(&dev);
+                                self.disconnected_failed_players.remove(&dev);
+                            }
+                            Err(e) => {
+                                self.record_lifecycle_event(&format!("player_stop_fail:{dev}"));
+                                warn!(
+                                    device = %dev,
+                                    %e,
+                                    "Failed to stop retained player on reconnected monitor; skipping playback to prevent duplicate"
+                                );
+                                sync_failures.push((
+                                    dev.clone(),
+                                    format!("Failed to stop retained player on reconnected monitor: {e}"),
+                                ));
+                                player_stopped_cleanly = false;
+                            }
+                        }
+                    } else {
+                        self.disconnected_failed_players.remove(&dev);
+                    }
+
+                    if !player_stopped_cleanly {
+                        self.record_lifecycle_event(&format!("window_preserved:{dev}"));
+                        continue;
+                    }
+
+                    // Shutdown succeeded: clean up the old preserved window
+                    if self.windows.remove(&dev).is_some() {
+                        self.record_lifecycle_event(&format!("window_destroy:{dev}"));
+                    }
+
+                    // Reconnection must create a valid new window
+                    let win = WallpaperWindow::create(
+                        self.host.hwnd,
+                        dev.clone(),
+                        client_x,
+                        client_y,
+                        monitor.width,
+                        monitor.height,
+                        monitor.is_primary,
+                        bg_color,
+                    )?;
+                    self.windows.insert(dev.clone(), win);
+
+                    // Restore playback from preserved source/configuration if one exists
+                    if let Some((path, cfg)) = self.active_sources.get(&dev).cloned() {
+                        info!(device = %dev, "Reconnected monitor: restoring preserved wallpaper playback");
+                        if let Err(e) = self.play_video_on_monitor(&dev, path, cfg) {
+                            error!(
+                                device = %dev,
+                                %e,
+                                "Failed to restore playback on reconnected monitor"
+                            );
+                            sync_failures.push((
+                                dev.clone(),
+                                format!("Failed to restore playback on reconnected monitor: {e}"),
+                            ));
+                        }
+                    }
+                    continue;
+                }
+
+                // 2. Detect stale wallpaper HWND
                 let is_stale = self
                     .windows
                     .get(&dev)
@@ -156,14 +239,20 @@ impl WallpaperManager {
                     );
 
                     // Reconcile MPV player associated with this stale monitor
+                    let has_player = self.players.contains_key(&dev);
+                    if has_player {
+                        self.record_lifecycle_event(&format!("player_stop_attempt:{dev}"));
+                    }
                     let mut player_stopped_cleanly = true;
-                    if let Some(player) = self.players.get_mut(&dev) {
-                        match player.stop() {
+                    if let Some(res) = self.players.get_mut(&dev).map(|p| p.stop()) {
+                        match res {
                             Ok(()) => {
+                                self.record_lifecycle_event(&format!("player_stop_success:{dev}"));
                                 info!(device = %dev, "Stopped MPV player associated with stale window");
                                 self.players.remove(&dev);
                             }
                             Err(e) => {
+                                self.record_lifecycle_event(&format!("player_stop_fail:{dev}"));
                                 warn!(
                                     device = %dev,
                                     %e,
@@ -179,16 +268,14 @@ impl WallpaperManager {
                     }
 
                     if !player_stopped_cleanly {
-                        // When player shutdown fails:
-                        // - Retain the player in tracking.
-                        // - Do not launch a duplicate player for that monitor.
-                        // - Keep wallpaper assignment available for later retry.
-                        // - Skip window recreation until player can be stopped cleanly.
+                        self.record_lifecycle_event(&format!("window_preserved:{dev}"));
                         continue;
                     }
 
                     // Player shutdown succeeded (or no player was running): remove stale window
-                    self.windows.remove(&dev);
+                    if self.windows.remove(&dev).is_some() {
+                        self.record_lifecycle_event(&format!("window_destroy:{dev}"));
+                    }
 
                     // Recreate wallpaper window
                     let win = WallpaperWindow::create(
@@ -299,45 +386,62 @@ impl WallpaperManager {
             }
 
             // Disconnected displays cleanup:
-            // 1. Remove windows for disconnected displays
-            let disconnected_windows: Vec<String> = self
+            // Strictly enforce process-before-render-target teardown ordering:
+            // 1. For each disconnected monitor, attempt to stop its MPV player first.
+            // 2. Only destroy the wallpaper window after the player has successfully terminated.
+            // 3. If shutdown fails, retain the player and window in tracking and preserve source.
+            let mut disconnected_devs: Vec<String> = self
                 .windows
                 .keys()
+                .chain(self.players.keys())
                 .filter(|d| !active_devices.contains(*d))
                 .cloned()
                 .collect();
-            for dev in disconnected_windows {
-                info!(device = %dev, "Display disconnected: removing wallpaper window");
-                self.windows.remove(&dev);
-            }
+            disconnected_devs.sort();
+            disconnected_devs.dedup();
 
-            // 2. Deliberately stop players on disconnected displays and retain failed players
-            let disconnected_players: Vec<String> = self
-                .players
-                .keys()
-                .filter(|d| !active_devices.contains(*d))
-                .cloned()
-                .collect();
-            for dev in disconnected_players {
-                info!(device = %dev, "Display disconnected: stopping video player");
-                if let Some(player) = self.players.get_mut(&dev) {
-                    match player.stop() {
+            for dev in disconnected_devs {
+                info!(device = %dev, "Display disconnected: stopping video player and reconciling window");
+
+                let has_player = self.players.contains_key(&dev);
+                if has_player {
+                    self.record_lifecycle_event(&format!("player_stop_attempt:{dev}"));
+                }
+                let mut player_stopped_cleanly = true;
+                if let Some(res) = self.players.get_mut(&dev).map(|p| p.stop()) {
+                    match res {
                         Ok(()) => {
+                            self.record_lifecycle_event(&format!("player_stop_success:{dev}"));
                             info!(device = %dev, "Disconnected monitor player stopped successfully");
                             self.players.remove(&dev);
+                            self.disconnected_failed_players.remove(&dev);
                         }
                         Err(e) => {
+                            self.record_lifecycle_event(&format!("player_stop_fail:{dev}"));
                             warn!(
                                 device = %dev,
                                 %e,
                                 "Failed to stop player on disconnected display; retaining tracking"
                             );
+                            self.disconnected_failed_players.insert(dev.clone());
                             sync_failures.push((
                                 dev.clone(),
                                 format!("Failed to stop player on disconnected display: {e}"),
                             ));
+                            player_stopped_cleanly = false;
                         }
                     }
+                }
+
+                if player_stopped_cleanly {
+                    // Only destroy the wallpaper window after the player has successfully terminated
+                    if self.windows.remove(&dev).is_some() {
+                        info!(device = %dev, "Display disconnected: removed wallpaper window");
+                        self.record_lifecycle_event(&format!("window_destroy:{dev}"));
+                    }
+                } else {
+                    // Avoid unnecessarily destroying the wallpaper HWND while the failed player may still depend on it
+                    self.record_lifecycle_event(&format!("window_preserved:{dev}"));
                 }
             }
 
@@ -568,6 +672,7 @@ impl WallpaperManager {
         // Failed players remain in self.players so they stay observable and can be retried.
         for dev in &summary.stopped {
             self.players.remove(dev);
+            self.disconnected_failed_players.remove(dev);
         }
 
         let failed_ids: Vec<&str> = summary.failed.iter().map(|(d, _)| d.as_str()).collect();
@@ -608,6 +713,11 @@ impl WallpaperManager {
         let devices: Vec<String> = self.windows.keys().cloned().collect();
 
         for dev in devices {
+            // Do not attempt to recover a player on a monitor that is tracked as failed on disconnect
+            if self.disconnected_failed_players.contains(&dev) {
+                continue;
+            }
+
             // Only check/recover if there is an active configured source for this device
             if !self.active_sources.contains_key(&dev) {
                 continue;
@@ -857,6 +967,24 @@ impl WallpaperManager {
     #[doc(hidden)]
     pub fn set_test_monitors(&mut self, monitors: Option<Vec<crate::MonitorInfo>>) {
         self.test_monitors = monitors;
+    }
+
+    /// For testing: sets an event recorder to verify execution order deterministically.
+    #[doc(hidden)]
+    pub fn set_lifecycle_recorder(
+        &mut self,
+        recorder: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+    ) {
+        self.lifecycle_recorder = recorder;
+    }
+
+    #[doc(hidden)]
+    pub fn record_lifecycle_event(&self, event: &str) {
+        if let Some(recorder) = &self.lifecycle_recorder {
+            if let Ok(mut list) = recorder.lock() {
+                list.push(event.to_string());
+            }
+        }
     }
 }
 

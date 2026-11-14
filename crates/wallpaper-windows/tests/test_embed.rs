@@ -1175,10 +1175,13 @@ mod tests {
 
     #[test]
     fn test_disconnected_and_reconnected_monitor_lifecycle() {
+        use std::sync::{Arc, Mutex};
         use wallpaper_windows::manager::{WallpaperManager, WallpaperManagerError};
         use wallpaper_windows::MonitorInfo;
 
         let mut manager = WallpaperManager::init().expect("init manager");
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+        manager.set_lifecycle_recorder(Some(events.clone()));
 
         let m1 = MonitorInfo {
             device_name: "\\\\.\\TEST_DISP_1".to_string(),
@@ -1220,10 +1223,36 @@ mod tests {
         assert!(manager.has_active_source(&dev2));
 
         // 2. Disconnect dev2: only m1 remains active
+        events.lock().unwrap().clear();
         manager.set_test_monitors(Some(vec![m1.clone()]));
         manager
             .refresh()
             .expect("refresh with dev2 disconnected must succeed");
+
+        // Verify ordering: player_stop_attempt must occur before window_destroy
+        {
+            let evs = events.lock().unwrap().clone();
+            let stop_attempt_idx = evs
+                .iter()
+                .position(|e| e == &format!("player_stop_attempt:{dev2}"))
+                .expect("player_stop_attempt must be recorded");
+            let stop_success_idx = evs
+                .iter()
+                .position(|e| e == &format!("player_stop_success:{dev2}"))
+                .expect("player_stop_success must be recorded");
+            let win_destroy_idx = evs
+                .iter()
+                .position(|e| e == &format!("window_destroy:{dev2}"))
+                .expect("window_destroy must be recorded");
+            assert!(
+                stop_attempt_idx < win_destroy_idx,
+                "player stop attempt must precede window destruction"
+            );
+            assert!(
+                stop_success_idx < win_destroy_idx,
+                "player stop success must precede window destruction"
+            );
+        }
 
         // dev2 window removed, dev2 player stopped and removed
         assert!(
@@ -1244,6 +1273,7 @@ mod tests {
         );
 
         // 3. Reconnect dev2: both monitors active again
+        events.lock().unwrap().clear();
         manager.set_test_monitors(Some(vec![m1.clone(), m2.clone()]));
         manager
             .refresh()
@@ -1256,6 +1286,10 @@ mod tests {
         assert_eq!(manager.player_count(), 2);
 
         // 4. Test disconnected monitor with injected player shutdown failure
+        let orig_hwnd2 = manager.window(&dev2).unwrap().hwnd;
+        let orig_pid2 = manager.player_mut(&dev2).unwrap().child_id();
+
+        events.lock().unwrap().clear();
         manager
             .player_mut(&dev2)
             .unwrap()
@@ -1273,16 +1307,134 @@ mod tests {
             other => panic!("expected MonitorSyncFailed error, got {other:?}"),
         }
 
-        // dev2 failed player is retained
+        // Verify lifecycle order on failure:
+        // - player_stop_attempt occurred
+        // - player_stop_fail occurred
+        // - window_preserved occurred
+        // - NO window_destroy occurred for dev2!
+        {
+            let evs = events.lock().unwrap().clone();
+            assert!(
+                evs.contains(&format!("player_stop_attempt:{dev2}")),
+                "must attempt stop"
+            );
+            assert!(
+                evs.contains(&format!("player_stop_fail:{dev2}")),
+                "must record stop fail"
+            );
+            assert!(
+                evs.contains(&format!("window_preserved:{dev2}")),
+                "must preserve window on failure"
+            );
+            assert!(
+                !evs.contains(&format!("window_destroy:{dev2}")),
+                "window must NOT be destroyed when player stop fails"
+            );
+        }
+
+        // dev2 failed player is retained, dev2 window is preserved and valid
         assert!(manager.player(&dev2).is_some());
+        assert_eq!(manager.player(&dev2).unwrap().child_id(), orig_pid2);
+        assert!(manager.window(&dev2).is_some());
+        assert_eq!(manager.window(&dev2).unwrap().hwnd, orig_hwnd2);
+        assert!(manager.window(&dev2).unwrap().is_valid());
         assert_eq!(manager.player_count(), 2); // 1 active for dev1, 1 retained failed for dev2
         assert!(manager.has_active_source(&dev2));
 
-        // Reset failure and teardown
+        // 5. Retry refresh while STILL disconnected (mock failure cleared)
+        events.lock().unwrap().clear();
         manager
             .player_mut(&dev2)
             .unwrap()
             .set_mock_stop_failure(false);
+        manager
+            .refresh()
+            .expect("subsequent retry while disconnected must succeed once failure cleared");
+
+        // Verify ordering on retry: stop attempt precedes window destruction
+        {
+            let evs = events.lock().unwrap().clone();
+            let stop_attempt_idx = evs
+                .iter()
+                .position(|e| e == &format!("player_stop_attempt:{dev2}"))
+                .expect("player_stop_attempt must be recorded on retry");
+            let win_destroy_idx = evs
+                .iter()
+                .position(|e| e == &format!("window_destroy:{dev2}"))
+                .expect("window_destroy must be recorded on retry");
+            assert!(
+                stop_attempt_idx < win_destroy_idx,
+                "player stop attempt must precede window destruction on retry"
+            );
+        }
+
+        // Now both player and window are cleanly cleaned up, source preserved
+        assert!(manager.player(&dev2).is_none());
+        assert!(manager.window(&dev2).is_none());
+        assert_eq!(manager.player_count(), 1);
+        assert!(manager.has_active_source(&dev2));
+
+        // 6. Reconnect dev2 after successful cleanup: creates fresh window and restores playback
+        events.lock().unwrap().clear();
+        manager.set_test_monitors(Some(vec![m1.clone(), m2.clone()]));
+        manager
+            .refresh()
+            .expect("reconnect after successful cleanup must succeed");
+
+        assert_eq!(manager.player_count(), 2);
+        let fresh_hwnd2 = manager.window(&dev2).unwrap().hwnd;
+        let fresh_pid2 = manager.player_mut(&dev2).unwrap().child_id();
+        assert_ne!(
+            fresh_hwnd2, orig_hwnd2,
+            "reconnection must create a new window"
+        );
+        assert_ne!(
+            fresh_pid2, orig_pid2,
+            "reconnection must spawn a new process"
+        );
+        assert!(manager.window(&dev2).unwrap().is_valid());
+        assert!(manager.player_mut(&dev2).unwrap().is_alive());
+
+        // 7. Disconnect with failure, then reconnect directly WHILE STILL FAILED
+        manager
+            .player_mut(&dev2)
+            .unwrap()
+            .set_mock_stop_failure(true);
+        manager.set_test_monitors(Some(vec![m1.clone()]));
+        assert!(manager.refresh().is_err());
+
+        // Reconnect dev2 while failure remains: must retry stop, fail, and refuse to launch duplicate player
+        events.lock().unwrap().clear();
+        manager.set_test_monitors(Some(vec![m1.clone(), m2.clone()]));
+        let reconn_err = manager.refresh();
+        assert!(
+            reconn_err.is_err(),
+            "reconnection must fail if retained player stop fails"
+        );
+        assert_eq!(manager.player_count(), 2);
+        assert_eq!(
+            manager.player(&dev2).unwrap().child_id(),
+            fresh_pid2,
+            "must NOT launch replacement player while old player termination fails"
+        );
+
+        // Now clear mock failure and refresh: recovery must succeed without duplicates
+        manager
+            .player_mut(&dev2)
+            .unwrap()
+            .set_mock_stop_failure(false);
+        manager
+            .refresh()
+            .expect("reconnection must succeed once retained player stops");
+        assert_eq!(manager.player_count(), 2);
+        let final_pid2 = manager.player_mut(&dev2).unwrap().child_id();
+        assert_ne!(
+            final_pid2, fresh_pid2,
+            "must have spawned a single clean replacement player"
+        );
+        assert!(manager.player_mut(&dev2).unwrap().is_alive());
+
+        // Teardown
         manager.stop_all();
         assert_eq!(manager.player_count(), 0);
     }
