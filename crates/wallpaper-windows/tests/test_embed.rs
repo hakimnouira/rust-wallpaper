@@ -537,8 +537,8 @@ mod tests {
     }
 
     #[test]
-    fn test_wallpaper_manager_failure_recovery() {
-        use wallpaper_windows::manager::WallpaperManager;
+    fn test_manager_missing_file_validation_preserves_existing_player() {
+        use wallpaper_windows::manager::{WallpaperManager, WallpaperManagerError};
 
         let mut manager = WallpaperManager::init().expect("initialize wallpaper manager");
         let devices = manager.active_devices();
@@ -549,18 +549,46 @@ mod tests {
 
         let primary_device = devices[0].clone();
 
-        // 1. Play with non-existent video path to trigger MpvPlayer::launch failure
-        let invalid_video = PathBuf::from("assets/non_existent_video_path_xyz123.mp4");
+        let mut valid_video = PathBuf::from("assets/wallpapers/sample-nature.mp4");
+        if !valid_video.exists() {
+            valid_video = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets/wallpapers/sample-nature.mp4");
+        }
+
+        // 1. Start a valid video player on primary monitor
+        manager
+            .play_video_on_monitor(&primary_device, valid_video, PlaybackConfig::default())
+            .expect("initial playback must succeed");
+        assert_eq!(manager.player_count(), 1, "must have 1 active player");
+
+        // 2. Attempt to play a non-existent file on the same monitor
+        let missing_video = PathBuf::from("assets/definitely_missing_wallpaper_12345.mp4");
         let res = manager.play_video_on_monitor(
             &primary_device,
-            invalid_video,
+            missing_video,
             PlaybackConfig::default(),
         );
 
-        // Must report error
-        assert!(res.is_err(), "launching non-existent video must fail");
+        // Must fail with VideoFileInaccessible
+        assert!(
+            matches!(
+                res,
+                Err(WallpaperManagerError::VideoFileInaccessible { .. })
+            ),
+            "must return VideoFileInaccessible error"
+        );
 
-        // 2. Verify monitor's wallpaper window was restored and attached to WorkerW host
+        // 3. Verify manager state was PRESERVED: existing player was NOT stopped or removed
+        assert_eq!(
+            manager.player_count(),
+            1,
+            "existing player must not be removed when new video path is invalid"
+        );
+        let statuses = manager.player_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].0, primary_device);
+
+        // 4. Verify window state was preserved and was never left detached
         let win = manager
             .window(&primary_device)
             .expect("wallpaper window must still exist");
@@ -568,12 +596,17 @@ mod tests {
         assert_ne!(
             style & windows::Win32::UI::WindowsAndMessaging::WS_CHILD.0,
             0,
-            "window must remain WS_CHILD attached to host after failure recovery"
+            "window must remain WS_CHILD attached to host"
         );
         assert_eq!(
             style & windows::Win32::UI::WindowsAndMessaging::WS_POPUP.0,
             0,
-            "window must clear WS_POPUP after failure recovery"
+            "window must not have WS_POPUP"
         );
+
+        // 5. Clean shutdown
+        manager.stop_all();
+        assert_eq!(manager.player_count(), 0);
+        manager.stop_all(); // Idempotent stop_all
     }
 }

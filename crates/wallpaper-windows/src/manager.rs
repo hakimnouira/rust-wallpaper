@@ -28,6 +28,21 @@ pub enum WallpaperManagerError {
     MonitorError(String),
     #[error("monitor not found: {0}")]
     MonitorNotFound(String),
+    #[error("video file not found or inaccessible: {path} ({error})")]
+    VideoFileInaccessible { path: PathBuf, error: String },
+    #[error("failed to stop existing player on monitor '{device}': {source}")]
+    PlayerShutdownFailed {
+        device: String,
+        #[source]
+        source: MpvError,
+    },
+    #[error(
+        "operation failed ({original}) and window attachment recovery also failed: {recovery}"
+    )]
+    AttachmentRecoveryFailed {
+        original: String,
+        recovery: WindowError,
+    },
 }
 
 /// Palette of background colors for different displays.
@@ -143,20 +158,39 @@ impl WallpaperManager {
         video_path: PathBuf,
         config: PlaybackConfig,
     ) -> Result<(), WallpaperManagerError> {
+        // 1. Explicit video-file existence and accessibility validation before modifying window state
+        if let Err(err) = std::fs::File::open(&video_path) {
+            return Err(WallpaperManagerError::VideoFileInaccessible {
+                path: video_path,
+                error: err.to_string(),
+            });
+        }
+
         let win = self
             .windows
             .get(device)
             .ok_or_else(|| WallpaperManagerError::MonitorNotFound(device.to_string()))?;
 
-        // Stop any existing player on this monitor before reconfiguring
-        if let Some(mut existing_player) = self.players.remove(device) {
-            let _ = existing_player.stop();
+        // 2. Stop any existing player on this monitor; report failure and preserve manager state
+        if let Some(existing_player) = self.players.get_mut(device) {
+            if let Err(source) = existing_player.stop() {
+                return Err(WallpaperManagerError::PlayerShutdownFailed {
+                    device: device.to_string(),
+                    source,
+                });
+            }
         }
+        self.players.remove(device);
+        self.active_sources.remove(device);
 
-        // Temporarily detach window to top-level popup so MPV can embed without cross-process child restrictions
+        // 3. Temporarily detach window to top-level popup so MPV can embed without cross-process child restrictions
         if let Err(detach_err) = win.detach_from_host() {
-            // Recover original attached state if detach failed partway through
-            let _ = win.attach_to_host();
+            if let Err(recov_err) = win.attach_to_host() {
+                return Err(WallpaperManagerError::AttachmentRecoveryFailed {
+                    original: format!("detach_from_host failed: {detach_err}"),
+                    recovery: recov_err,
+                });
+            }
             return Err(WallpaperManagerError::Window(detach_err));
         }
 
@@ -178,16 +212,29 @@ impl WallpaperManager {
         let mut player = match MpvPlayer::launch(launch_cfg) {
             Ok(p) => p,
             Err(e) => {
-                let _ = win.attach_to_host();
+                if let Err(recov_err) = win.attach_to_host() {
+                    return Err(WallpaperManagerError::AttachmentRecoveryFailed {
+                        original: format!("MpvPlayer::launch failed: {e}"),
+                        recovery: recov_err,
+                    });
+                }
                 return Err(WallpaperManagerError::Player(e));
             }
         };
 
-        // Ensure window is in correct bottom z-order behind desktop icons
+        // 4. Ensure window is in correct bottom z-order behind desktop icons
         if let Err(attach_err) = win.attach_to_host() {
-            // If reattachment fails, terminate player and restore window as safely as possible
-            let _ = player.stop();
-            let _ = win.attach_to_host();
+            let stop_res = player.stop();
+            if let Err(recov_err) = win.attach_to_host() {
+                let stop_msg = match stop_res {
+                    Ok(()) => String::new(),
+                    Err(e) => format!(" (player termination also failed: {e})"),
+                };
+                return Err(WallpaperManagerError::AttachmentRecoveryFailed {
+                    original: format!("attach_to_host failed: {attach_err}{stop_msg}"),
+                    recovery: recov_err,
+                });
+            }
             return Err(WallpaperManagerError::Window(attach_err));
         }
 
@@ -265,11 +312,17 @@ impl WallpaperManager {
         }
     }
 
-    /// Stops all video players.
+    /// Stops all video players and accurately reports individual outcomes.
     pub fn stop_all(&mut self) {
         for (dev, player) in &mut self.players {
-            let _ = player.stop();
-            info!(device = %dev, "Stopped video player");
+            match player.stop() {
+                Ok(()) => {
+                    info!(device = %dev, "Stopped video player");
+                }
+                Err(err) => {
+                    warn!(device = %dev, %err, "Failed to stop video player");
+                }
+            }
         }
         self.players.clear();
     }
