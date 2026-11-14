@@ -488,6 +488,18 @@ impl MpvPlayer {
         self.started_at.elapsed().as_secs()
     }
 
+    /// One-round-trip health probe. Unlike the telemetry query this sends exactly one
+    /// IPC request, so a hung player can delay the daemon by at most one IPC timeout.
+    pub fn probe_video_output(&mut self) -> Result<(bool, bool), MpvError> {
+        let params = self.send_command(&[json!("get_property"), json!("video-params")])?;
+        let dimensions = params.as_ref().and_then(|value| {
+            let width = value.get("w").or_else(|| value.get("dw"))?.as_u64()?;
+            let height = value.get("h").or_else(|| value.get("dh"))?.as_u64()?;
+            Some(width > 0 && height > 0)
+        });
+        Ok((true, dimensions.unwrap_or(false)))
+    }
+
     /// Queries video rendering details (width, height, fps, gpu context, estimated-vf-fps).
     pub fn query_video_details(
         &mut self,
