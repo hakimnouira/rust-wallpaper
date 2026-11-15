@@ -662,18 +662,29 @@ mod platform {
             let retry_pending = state.registration.has_pending_retries();
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
-            if retry_pending {
-                let timer = SetTimer(hwnd, REGISTRATION_TIMER_ID, REGISTRATION_TIMER_MS, None);
-                if timer == 0 {
-                    error!(
-                        error = %windows::core::Error::from_win32(),
-                        "Could not start event-registration retry timer"
-                    );
+            hwnd_holder.store(hwnd.0 as isize, Ordering::SeqCst);
+
+            // A listener without its retry timer would silently keep failed event sources
+            // unavailable forever. Fail initialization instead: the daemon's existing
+            // listener-restart policy will retry the complete registration sequence.
+            let timer_started = !retry_pending
+                || SetTimer(hwnd, REGISTRATION_TIMER_ID, REGISTRATION_TIMER_MS, None) != 0;
+            if timer_started {
+                let _ = init_tx.send(Ok(()));
+            } else {
+                let error = windows::core::Error::from_win32();
+                error!(
+                    %error,
+                    "Could not start event-registration retry timer; restarting listener is required"
+                );
+                let _ = init_tx.send(Err(format!(
+                    "Could not start event-registration retry timer: {error}"
+                )));
+                if let Err(destroy_error) = DestroyWindow(hwnd) {
+                    error!(%destroy_error, "Could not destroy partially initialized notification window");
+                    PostQuitMessage(0);
                 }
             }
-
-            hwnd_holder.store(hwnd.0 as isize, Ordering::SeqCst);
-            let _ = init_tx.send(Ok(()));
 
             debug!("Notification message loop starting");
             let mut msg = MSG::default();
