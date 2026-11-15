@@ -52,10 +52,7 @@ async fn listener_loop(tx: SyncSender<PendingRequest>) {
         options.max_instances(16);
         options.reject_remote_clients(true);
         let mut server = match options.create(PIPE_NAME) {
-            Ok(server) => {
-                first_instance = false;
-                server
-            }
+            Ok(server) => server
             Err(error) => {
                 tracing::warn!(%error, "Could not create IPC named pipe; retrying");
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -67,6 +64,7 @@ async fn listener_loop(tx: SyncSender<PendingRequest>) {
             tracing::warn!(%error, "IPC client connection failed");
             continue;
         }
+        first_instance = false;
 
         let client_tx = tx.clone();
         tokio::spawn(async move {
