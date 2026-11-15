@@ -46,6 +46,7 @@ Commands with fields use the tagged JSON representation, for example:
 | `remove_wallpaper` | Removes a wallpaper record from the library by ID, provided no runtime assignment references its source. |
 | `set_profile` / `get_profile` | Updates or reads the persisted Eco, Balanced or Performance runtime profile. |
 | `apply_wallpaper` | Applies a library video by ID to one monitor or all connected monitors. Web/scene entries are not playable yet. |
+| `unassign_wallpaper` | Clears a monitor's user assignment and restores the runtime's default assignment policy. |
 | `pause` / `resume` | Adds/removes the user-pause reason for one monitor or globally. |
 | `set_volume` | Sets volume from 0 through 100 on one monitor or all active players. |
 | `set_mute` | Sets mute state on one monitor or all active players. |
