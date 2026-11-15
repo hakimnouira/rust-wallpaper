@@ -558,6 +558,7 @@ mod platform {
         tx: Sender<SystemPlatformEvent>,
         hwnd_holder: Arc<AtomicIsize>,
         init_tx: Sender<Result<(), String>>,
+        registration_report: Arc<Mutex<RegistrationReport>>,
     ) {
         unsafe {
             let hinstance: HINSTANCE = match GetModuleHandleW(PCWSTR::null()) {
@@ -573,10 +574,6 @@ mod platform {
                 return;
             }
 
-            // Explorer announces a fresh taskbar by broadcasting this registered message.
-            let taskbar_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
-
-            // Hidden TOP-LEVEL window (see module docs).
             let hwnd = match CreateWindowExW(
                 WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 NOTIFY_WINDOW_CLASS,
@@ -602,67 +599,84 @@ mod platform {
                 }
             };
 
-            let wts_registered = match WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION)
-            {
-                Ok(()) => true,
-                Err(e) => {
-                    error!(%e, "WTSRegisterSessionNotification failed: lock/unlock not reported");
-                    false
-                }
-            };
+            let mut registration = RegistrationTracker::new(RetryPolicy::default());
+            // These two event sources are delivered by the live top-level window itself.
+            registration.mark_active(EventSource::SuspendResume);
+            registration.mark_active(EventSource::DisplayTopology);
 
-            // Windows sends the current display state right after registration.
-            let power_notify = match RegisterPowerSettingNotification(
+            let mut wts_registered = false;
+            match WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
+                Ok(()) => {
+                    wts_registered = true;
+                    registration.mark_active(EventSource::SessionNotifications);
+                }
+                Err(e) => {
+                    let decision = registration.record_failure(
+                        EventSource::SessionNotifications,
+                        e.to_string(),
+                        Instant::now(),
+                    );
+                    warn!(%e, ?decision, "WTS registration unavailable; retrying");
+                }
+            }
+
+            let mut power_notify_handle = None;
+            match RegisterPowerSettingNotification(
                 HANDLE(hwnd.0),
                 &GUID_CONSOLE_DISPLAY_STATE,
-                REGISTER_NOTIFICATION_FLAGS(0), // DEVICE_NOTIFY_WINDOW_HANDLE
+                REGISTER_NOTIFICATION_FLAGS(0),
             ) {
-                Ok(h) => Some(h),
+                Ok(handle) => {
+                    power_notify_handle = Some(handle);
+                    registration.mark_active(EventSource::DisplayPower);
+                }
                 Err(e) => {
-                    error!(%e, "RegisterPowerSettingNotification failed: display power not reported");
-                    None
+                    let decision = registration.record_failure(
+                        EventSource::DisplayPower,
+                        e.to_string(),
+                        Instant::now(),
+                    );
+                    warn!(%e, ?decision, "Display-power registration unavailable; retrying");
                 }
-            };
+            }
 
-            // Do not report a healthy listener when a critical registration failed.
-            // The daemon will retry listener creation; partial coverage is safer to expose as
-            // unavailable than to silently miss lock or display-power transitions.
-            if !wts_registered || power_notify.is_none() || taskbar_msg == 0 {
-                if let Some(handle) = power_notify.as_ref() {
-                    let _ = UnregisterPowerSettingNotification(*handle);
-                }
-                if wts_registered {
-                    let _ = WTSUnRegisterSessionNotification(hwnd);
-                }
-                let _ = DestroyWindow(hwnd);
-                release_class(hinstance);
-                let mut missing = Vec::new();
-                if !wts_registered {
-                    missing.push("WTS session notifications");
-                }
-                if power_notify.is_none() {
-                    missing.push("display power notifications");
-                }
-                if taskbar_msg == 0 {
-                    missing.push("TaskbarCreated broadcast registration");
-                }
-                let _ = init_tx.send(Err(format!(
-                    "System event listener has incomplete registration: {}",
-                    missing.join(", ")
-                )));
-                return;
+            let mut taskbar_created_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
+            if taskbar_created_msg != 0 {
+                registration.mark_active(EventSource::ExplorerRestart);
+            } else {
+                let error = windows::core::Error::from_win32().to_string();
+                let decision = registration.record_failure(
+                    EventSource::ExplorerRestart,
+                    error.clone(),
+                    Instant::now(),
+                );
+                warn!(%error, ?decision, "TaskbarCreated registration unavailable; retrying");
             }
 
             let state = Box::new(ListenerState {
                 tx,
-                taskbar_created_msg: taskbar_msg,
-                power_notify_handle: power_notify,
+                taskbar_created_msg,
+                power_notify_handle,
                 wts_registered,
+                registration,
+                registration_report,
                 last_locked: None,
                 last_display_on: None,
                 last_suspended: None,
             });
+            state.publish_registration_report();
+            let retry_pending = state.registration.has_pending_retries();
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+
+            if retry_pending {
+                let timer = SetTimer(hwnd, REGISTRATION_TIMER_ID, REGISTRATION_TIMER_MS, None);
+                if timer == 0 {
+                    error!(
+                        error = %windows::core::Error::from_win32(),
+                        "Could not start event-registration retry timer"
+                    );
+                }
+            }
 
             hwnd_holder.store(hwnd.0 as isize, Ordering::SeqCst);
             let _ = init_tx.send(Ok(()));
