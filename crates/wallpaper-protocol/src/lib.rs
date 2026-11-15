@@ -124,7 +124,13 @@ impl ResponseEnvelope {
     }
 
     pub fn error(request_id: Uuid, code: ErrorCode, message: impl Into<String>) -> Self {
-        Self::new(request_id, Response::Error { code, message: message.into() })
+        Self::new(
+            request_id,
+            Response::Error {
+                code,
+                message: message.into(),
+            },
+        )
     }
 }
 
