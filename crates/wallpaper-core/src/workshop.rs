@@ -197,12 +197,84 @@ fn scan_directory_for_items(
     }
 }
 
+const MAX_PROJECT_JSON_BYTES: u64 = 1024 * 1024; // 1 MB security limit
+
+fn normalize_canonical_path(path: PathBuf) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path
+    }
+}
+
+/// Safely resolves a relative path from within an item directory.
+/// Strictly enforces that the target file exists and its canonicalized path
+/// resides strictly within the item directory (preventing directory traversal attacks like `../`).
+pub fn resolve_safe_item_file(item_dir: &Path, rel_path: &str) -> Option<PathBuf> {
+    let rel = Path::new(rel_path);
+    if rel.is_absolute() || rel_path.trim().is_empty() {
+        return None;
+    }
+
+    // Reject obvious traversal components
+    for component in rel.components() {
+        if let std::path::Component::ParentDir = component {
+            return None;
+        }
+    }
+
+    let candidate = item_dir.join(rel);
+    let canonical_dir = std::fs::canonicalize(item_dir).ok()?;
+    let canonical_target = std::fs::canonicalize(&candidate).ok()?;
+
+    // Must be inside item_dir
+    if !canonical_target.starts_with(&canonical_dir) {
+        return None;
+    }
+
+    // Inspect symlinks to ensure they do not escape item_dir
+    if let Ok(sym_meta) = std::fs::symlink_metadata(&candidate) {
+        if sym_meta.file_type().is_symlink() {
+            let link_target = std::fs::read_link(&candidate).ok()?;
+            let resolved_sym = if link_target.is_absolute() {
+                std::fs::canonicalize(link_target).ok()?
+            } else {
+                std::fs::canonicalize(item_dir.join(link_target)).ok()?
+            };
+            if !resolved_sym.starts_with(&canonical_dir) {
+                return None;
+            }
+        }
+    }
+
+    if canonical_target.is_file() {
+        Some(normalize_canonical_path(canonical_target))
+    } else {
+        None
+    }
+}
+
 /// Parses a directory containing a `project.json` file.
 pub fn parse_workshop_directory(dir: &Path) -> Option<WorkshopItem> {
     let project_json_path = dir.join("project.json");
     if !project_json_path.is_file() {
         // If no project.json, check if there's a standalone video file in the folder
         return parse_unstructured_directory(dir);
+    }
+
+    // Security check: limit project.json file size
+    if let Ok(meta) = fs::metadata(&project_json_path) {
+        if meta.len() > MAX_PROJECT_JSON_BYTES {
+            tracing::warn!(
+                path = %project_json_path.display(),
+                size = meta.len(),
+                "Rejecting oversized project.json (> 1MB)"
+            );
+            return None;
+        }
+    } else {
+        return None;
     }
 
     let content = fs::read_to_string(&project_json_path).ok()?;
@@ -221,16 +293,22 @@ pub fn parse_workshop_directory(dir: &Path) -> Option<WorkshopItem> {
 
     let item_type = raw.item_type.unwrap_or_else(|| "unknown".to_string());
 
-    // Resolve main file
+    // Resolve main file safely
     let (file_path, is_compatible) = if let Some(ref rel_file) = raw.file {
-        let target = dir.join(rel_file);
-        let ext = target
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let compatible = ext == "mp4" || ext == "webm" || ext == "mkv" || ext == "mov";
-        (target, compatible)
+        if let Some(target) = resolve_safe_item_file(dir, rel_file) {
+            let ext = target
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let compatible = ext == "mp4" || ext == "webm" || ext == "mkv" || ext == "mov";
+            (target, compatible)
+        } else {
+            // Unsafe or missing relative file: attempt finding first video
+            find_first_video(dir)
+                .map(|p| (p, true))
+                .unwrap_or_else(|| (project_json_path.clone(), false))
+        }
     } else {
         // Find first video file if unspecified
         find_first_video(dir)
@@ -238,10 +316,9 @@ pub fn parse_workshop_directory(dir: &Path) -> Option<WorkshopItem> {
             .unwrap_or_else(|| (project_json_path.clone(), false))
     };
 
-    // Resolve preview thumbnail
+    // Resolve preview thumbnail safely
     let preview_path = if let Some(ref rel_prev) = raw.preview {
-        let prev_path = dir.join(rel_prev);
-        if prev_path.is_file() {
+        if let Some(prev_path) = resolve_safe_item_file(dir, rel_prev) {
             Some(prev_path)
         } else {
             find_first_preview(dir)
@@ -493,8 +570,16 @@ mod tests {
         assert_eq!(item.item_type, "video");
         assert!(item.is_compatible_video);
         assert_eq!(item.tags, vec!["Anime", "Synthwave"]);
-        assert_eq!(item.file_path, video_file);
-        assert_eq!(item.preview_path, Some(prev_file));
+        assert_eq!(
+            item.file_path,
+            normalize_canonical_path(std::fs::canonicalize(&video_file).unwrap())
+        );
+        assert_eq!(
+            item.preview_path,
+            Some(normalize_canonical_path(
+                std::fs::canonicalize(&prev_file).unwrap()
+            ))
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -542,6 +627,54 @@ mod tests {
 
         let folders = find_steam_library_folders(&temp_dir);
         assert!(folders.contains(&temp_dir));
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_oversized_project_json_rejected() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_wp_oversized_{}", uuid::Uuid::new_v4()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let project_json = temp_dir.join("project.json");
+        // Create 1.5MB file
+        let big_content = vec![b' '; 1_500_000];
+        fs::write(&project_json, big_content).unwrap();
+
+        let item = parse_workshop_directory(&temp_dir);
+        assert!(item.is_none(), "Oversized project.json must be rejected");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_path_traversal_rejected() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("test_wp_traversal_{}", uuid::Uuid::new_v4()));
+        let item_dir = temp_dir.join("item_123");
+        let _ = fs::create_dir_all(&item_dir);
+
+        // Put an outside file
+        let outside_secret = temp_dir.join("secret.mp4");
+        fs::write(&outside_secret, b"secret video").unwrap();
+
+        // Craft malicious project.json targeting outside file
+        let malicious_json = r#"{
+            "title": "Malicious Traversal",
+            "file": "../secret.mp4",
+            "preview": "../secret.mp4",
+            "type": "video"
+        }"#;
+        fs::write(item_dir.join("project.json"), malicious_json).unwrap();
+
+        let resolved = resolve_safe_item_file(&item_dir, "../secret.mp4");
+        assert!(resolved.is_none(), "Path traversal must be rejected");
+
+        let item = parse_workshop_directory(&item_dir).unwrap();
+        // Since the traversal file was rejected and no video is inside item_dir,
+        // it must not resolve to the outside secret file!
+        assert_ne!(item.file_path, outside_secret);
+        assert!(!item.is_compatible_video);
+
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }

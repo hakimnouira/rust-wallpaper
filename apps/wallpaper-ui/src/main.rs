@@ -105,6 +105,44 @@ mod desktop {
         }
     }
 
+    struct ThumbnailRequest {
+        path: std::path::PathBuf,
+        frame_requested: u64,
+    }
+
+    struct DecodedThumbnail {
+        path: std::path::PathBuf,
+        image: egui::ColorImage,
+        byte_size: usize,
+        frame_requested: u64,
+    }
+
+    struct CachedTexture {
+        handle: egui::TextureHandle,
+        byte_size: usize,
+        last_accessed_frame: u64,
+    }
+
+    struct OnlineSearchRequest {
+        search_id: u64,
+        query: String,
+        category: String,
+    }
+
+    enum OnlineSearchResponse {
+        Success {
+            search_id: u64,
+            items: Vec<wallpaper_core::OnlineWallpaper>,
+        },
+        Error {
+            search_id: u64,
+            error: String,
+        },
+    }
+
+    const MAX_TEXTURE_CACHE_BYTES: usize = 64 * 1024 * 1024; // 64 MB
+    const TARGET_TEXTURE_CACHE_BYTES: usize = 48 * 1024 * 1024; // 48 MB low watermark
+
     struct DesktopApp {
         snapshot: Arc<Mutex<Snapshot>>,
         commands: mpsc::Sender<Command>,
@@ -119,7 +157,12 @@ mod desktop {
         view_mode: ViewMode,
         thumb_scale: ThumbnailScale,
         notice: String,
-        textures: HashMap<std::path::PathBuf, (egui::TextureHandle, u64)>,
+        textures: HashMap<std::path::PathBuf, CachedTexture>,
+        current_cache_bytes: usize,
+        visible_thumbnails: HashSet<std::path::PathBuf>,
+        in_flight_thumbnails: HashSet<std::path::PathBuf>,
+        thumb_req_tx: mpsc::SyncSender<ThumbnailRequest>,
+        thumb_res_rx: mpsc::Receiver<DecodedThumbnail>,
         frame_counter: u64,
         browse_tab: BrowseTab,
         workshop_items: Vec<wallpaper_core::WorkshopItem>,
@@ -133,12 +176,99 @@ mod desktop {
         online_download_status: HashMap<String, String>,
         download_tx: mpsc::Sender<DownloadMessage>,
         download_rx: mpsc::Receiver<DownloadMessage>,
+        online_search_tx: mpsc::Sender<OnlineSearchRequest>,
+        online_search_rx: mpsc::Receiver<OnlineSearchResponse>,
+        online_search_id: u64,
+        online_is_searching: bool,
+        online_search_cache: HashMap<(String, String), Vec<wallpaper_core::OnlineWallpaper>>,
         pending_apply_source: Option<String>,
     }
 
     impl DesktopApp {
         fn new(snapshot: Arc<Mutex<Snapshot>>, commands: mpsc::Sender<Command>) -> Self {
             let (download_tx, download_rx) = mpsc::channel();
+
+            // Asynchronous thumbnail decoding worker pool
+            let (thumb_req_tx, thumb_req_rx) = mpsc::sync_channel::<ThumbnailRequest>(128);
+            let (thumb_res_tx, thumb_res_rx) = mpsc::channel::<DecodedThumbnail>();
+            let thumb_req_rx = Arc::new(Mutex::new(thumb_req_rx));
+
+            for i in 0..2 {
+                let req_rx = thumb_req_rx.clone();
+                let res_tx = thumb_res_tx.clone();
+                std::thread::Builder::new()
+                    .name(format!("thumbnail-worker-{i}"))
+                    .spawn(move || {
+                        loop {
+                            let req = {
+                                let rx = match req_rx.lock() {
+                                    Ok(guard) => guard,
+                                    Err(_) => break,
+                                };
+                                match rx.recv() {
+                                    Ok(r) => r,
+                                    Err(_) => break, // Channel closed
+                                }
+                            };
+
+                            if let Ok(bytes) = std::fs::read(&req.path) {
+                                if let Ok(img) = image::load_from_memory(&bytes) {
+                                    // Downsample large preview images to max 320x240 to conserve GPU memory
+                                    let thumb = if img.width() > 320 || img.height() > 240 {
+                                        img.thumbnail(320, 240)
+                                    } else {
+                                        img
+                                    };
+                                    let rgba = thumb.to_rgba8();
+                                    let size = [rgba.width() as usize, rgba.height() as usize];
+                                    let byte_size = size[0] * size[1] * 4;
+                                    let pixels = rgba.into_raw();
+                                    let color_image =
+                                        egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                                    let _ = res_tx.send(DecodedThumbnail {
+                                        path: req.path,
+                                        image: color_image,
+                                        byte_size,
+                                        frame_requested: req.frame_requested,
+                                    });
+                                }
+                            }
+                        }
+                    })
+                    .expect("failed to spawn thumbnail worker thread");
+            }
+
+            // Asynchronous online search background worker
+            let (online_search_tx, online_search_incoming) = mpsc::channel::<OnlineSearchRequest>();
+            let (online_search_res_tx, online_search_rx) = mpsc::channel::<OnlineSearchResponse>();
+
+            std::thread::Builder::new()
+                .name("online-search-worker".into())
+                .spawn(move || {
+                    while let Ok(req) = online_search_incoming.recv() {
+                        let cat = if req.category.trim().is_empty() || req.category == "All" {
+                            None
+                        } else {
+                            Some(req.category.as_str())
+                        };
+                        match wallpaper_core::search_wallhaven(&req.query, cat, 1) {
+                            Ok(items) => {
+                                let _ = online_search_res_tx.send(OnlineSearchResponse::Success {
+                                    search_id: req.search_id,
+                                    items,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = online_search_res_tx.send(OnlineSearchResponse::Error {
+                                    search_id: req.search_id,
+                                    error: e.to_string(),
+                                });
+                            }
+                        }
+                    }
+                })
+                .expect("failed to spawn online search worker");
+
             Self {
                 snapshot,
                 commands,
@@ -154,6 +284,11 @@ mod desktop {
                 thumb_scale: ThumbnailScale::Medium,
                 notice: "Connect to the wallpaper daemon to get started.".into(),
                 textures: HashMap::new(),
+                current_cache_bytes: 0,
+                visible_thumbnails: HashSet::new(),
+                in_flight_thumbnails: HashSet::new(),
+                thumb_req_tx,
+                thumb_res_rx,
                 frame_counter: 0,
                 browse_tab: BrowseTab::SteamWorkshop,
                 workshop_items: Vec::new(),
@@ -167,6 +302,11 @@ mod desktop {
                 online_download_status: HashMap::new(),
                 download_tx,
                 download_rx,
+                online_search_tx,
+                online_search_rx,
+                online_search_id: 0,
+                online_is_searching: false,
+                online_search_cache: HashMap::new(),
                 pending_apply_source: None,
             }
         }
@@ -179,51 +319,51 @@ mod desktop {
         }
 
         fn prune_texture_cache(&mut self) {
-            if self.textures.len() > 120 {
-                let mut entries: Vec<(std::path::PathBuf, u64)> = self
+            if self.current_cache_bytes > MAX_TEXTURE_CACHE_BYTES || self.textures.len() > 300 {
+                let mut entries: Vec<(std::path::PathBuf, u64, usize)> = self
                     .textures
                     .iter()
-                    .map(|(p, (_, frame))| (p.clone(), *frame))
+                    .map(|(p, c)| (p.clone(), c.last_accessed_frame, c.byte_size))
                     .collect();
-                entries.sort_by_key(|(_, frame)| *frame);
-                let to_remove = entries.len().saturating_sub(80);
-                for (path, _) in entries.into_iter().take(to_remove) {
-                    self.textures.remove(&path);
+                // Oldest accessed first
+                entries.sort_by_key(|(_, frame, _)| *frame);
+
+                for (path, _, byte_size) in entries {
+                    if self.current_cache_bytes <= TARGET_TEXTURE_CACHE_BYTES
+                        && self.textures.len() <= 150
+                    {
+                        break;
+                    }
+                    if !self.visible_thumbnails.contains(&path)
+                        && self.textures.remove(&path).is_some()
+                    {
+                        self.current_cache_bytes =
+                            self.current_cache_bytes.saturating_sub(byte_size);
+                    }
                 }
             }
         }
 
-        fn get_or_load_texture(
-            &mut self,
-            ctx: &egui::Context,
-            path: &std::path::Path,
-            decodes_left: &mut usize,
-        ) -> Option<egui::TextureId> {
-            if let Some((handle, frame)) = self.textures.get_mut(path) {
-                *frame = self.frame_counter;
-                return Some(handle.id());
+        fn get_or_load_texture(&mut self, path: &std::path::Path) -> Option<egui::TextureId> {
+            self.visible_thumbnails.insert(path.to_path_buf());
+
+            if let Some(cached) = self.textures.get_mut(path) {
+                cached.last_accessed_frame = self.frame_counter;
+                return Some(cached.handle.id());
             }
 
-            if *decodes_left > 0 && path.is_file() {
-                if let Ok(bytes) = std::fs::read(path) {
-                    if let Ok(img) = image::load_from_memory(&bytes) {
-                        let rgba = img.to_rgba8();
-                        let size = [rgba.width() as usize, rgba.height() as usize];
-                        let pixels = rgba.into_raw();
-                        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                        let handle = ctx.load_texture(
-                            path.to_string_lossy(),
-                            color_image,
-                            egui::TextureOptions::LINEAR,
-                        );
-                        *decodes_left -= 1;
-                        ctx.request_repaint();
-                        let id = handle.id();
-                        self.textures
-                            .insert(path.to_path_buf(), (handle, self.frame_counter));
-                        return Some(id);
-                    }
-                }
+            if !self.in_flight_thumbnails.contains(path)
+                && path.is_file()
+                && self.in_flight_thumbnails.len() < 32
+                && self
+                    .thumb_req_tx
+                    .try_send(ThumbnailRequest {
+                        path: path.to_path_buf(),
+                        frame_requested: self.frame_counter,
+                    })
+                    .is_ok()
+            {
+                self.in_flight_thumbnails.insert(path.to_path_buf());
             }
 
             None
@@ -232,7 +372,6 @@ mod desktop {
         fn render_library(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
             self.frame_counter = self.frame_counter.wrapping_add(1);
             self.prune_texture_cache();
-            let mut decodes_budget: usize = 4;
 
             ui.heading("Wallpaper library");
             ui.label("Import local videos, filter, and assign them to your displays.");
@@ -497,8 +636,6 @@ mod desktop {
             let mut remove_req = None;
             let mut toggle_select_req = None;
 
-            let ctx = ui.ctx().clone();
-
             match self.view_mode {
                 ViewMode::List => {
                     let row_height = 56.0;
@@ -530,9 +667,9 @@ mod desktop {
                                             .as_ref()
                                             .map(std::path::PathBuf::from);
 
-                                        let tex_id = thumb_path.as_deref().and_then(|p| {
-                                            self.get_or_load_texture(&ctx, p, &mut decodes_budget)
-                                        });
+                                        let tex_id = thumb_path
+                                            .as_deref()
+                                            .and_then(|p| self.get_or_load_texture(p));
 
                                         if let Some(id) = tex_id {
                                             ui.image((id, thumb_size));
@@ -661,14 +798,9 @@ mod desktop {
                                                         .as_ref()
                                                         .map(std::path::PathBuf::from);
 
-                                                    let tex_id =
-                                                        thumb_path.as_deref().and_then(|p| {
-                                                            self.get_or_load_texture(
-                                                                &ctx,
-                                                                p,
-                                                                &mut decodes_budget,
-                                                            )
-                                                        });
+                                                    let tex_id = thumb_path
+                                                        .as_deref()
+                                                        .and_then(|p| self.get_or_load_texture(p));
 
                                                     if let Some(id) = tex_id {
                                                         ui.image((id, thumb_dim));
@@ -834,6 +966,33 @@ mod desktop {
                 }
             }
 
+            // Process any background online search responses
+            while let Ok(resp) = self.online_search_rx.try_recv() {
+                match resp {
+                    OnlineSearchResponse::Success { search_id, items } => {
+                        if search_id == self.online_search_id {
+                            let key = (
+                                self.online_search_query.trim().to_lowercase(),
+                                self.online_category.clone(),
+                            );
+                            self.online_search_cache.insert(key, items.clone());
+                            self.online_items = items;
+                            self.online_is_searching = false;
+                            self.notice = format!(
+                                "Found {} wallpapers from Wallhaven",
+                                self.online_items.len()
+                            );
+                        }
+                    }
+                    OnlineSearchResponse::Error { search_id, error } => {
+                        if search_id == self.online_search_id {
+                            self.online_is_searching = false;
+                            self.notice = format!("Wallhaven search error: {error}");
+                        }
+                    }
+                }
+            }
+
             // Auto-scan Steam Workshop on first visit
             if !self.workshop_scanned {
                 let custom = if !self.custom_steam_path.trim().is_empty() {
@@ -950,8 +1109,6 @@ mod desktop {
             let card_width = 240.0;
             let cols = ((available_width / (card_width + 16.0)).floor() as usize).max(1);
 
-            let ctx = ui.ctx().clone();
-            let mut decodes_left = 4;
             let mut import_req: Option<(String, String, bool)> = None;
             let mut apply_req: Option<WallpaperId> = None;
 
@@ -968,9 +1125,10 @@ mod desktop {
 
                                         // Preview thumbnail
                                         let thumb_size = egui::vec2(card_width - 16.0, 110.0);
-                                        let tex = item.preview_path.as_deref().and_then(|p| {
-                                            self.get_or_load_texture(&ctx, p, &mut decodes_left)
-                                        });
+                                        let tex = item
+                                            .preview_path
+                                            .as_deref()
+                                            .and_then(|p| self.get_or_load_texture(p));
 
                                         if let Some(tex_id) = tex {
                                             ui.image((tex_id, thumb_size));
@@ -1108,21 +1266,39 @@ mod desktop {
                 if search_clicked || hit_enter {
                     if self.online_category == "Videos (Free Loops)" {
                         self.online_items = wallpaper_core::get_curated_video_wallpapers();
+                        self.online_is_searching = false;
+                        self.notice =
+                            format!("Loaded {} curated video loops", self.online_items.len());
                     } else {
-                        let query = self.online_search_query.clone();
-                        let cat = self.online_category.clone();
-                        match wallpaper_core::search_wallhaven(&query, Some(&cat), 1) {
-                            Ok(results) => {
-                                self.online_items = results;
-                                self.notice = format!(
-                                    "Found {} wallpapers from Wallhaven",
-                                    self.online_items.len()
-                                );
-                            }
-                            Err(e) => {
-                                self.notice = format!("Wallhaven search error: {e}");
-                            }
+                        let key = (
+                            self.online_search_query.trim().to_lowercase(),
+                            self.online_category.clone(),
+                        );
+                        if let Some(cached) = self.online_search_cache.get(&key) {
+                            self.online_items = cached.clone();
+                            self.online_is_searching = false;
+                            self.notice =
+                                format!("Loaded {} cached wallpapers", self.online_items.len());
+                        } else {
+                            self.online_search_id += 1;
+                            self.online_is_searching = true;
+                            let _ = self.online_search_tx.send(OnlineSearchRequest {
+                                search_id: self.online_search_id,
+                                query: self.online_search_query.clone(),
+                                category: self.online_category.clone(),
+                            });
+                            self.notice = "Searching Wallhaven in background…".into();
                         }
+                    }
+                }
+
+                if self.online_is_searching {
+                    ui.spinner();
+                    ui.small("Searching…");
+                    if ui.button("Cancel").clicked() {
+                        self.online_search_id += 1;
+                        self.online_is_searching = false;
+                        self.notice = "Search cancelled".into();
                     }
                 }
             });
@@ -1185,6 +1361,11 @@ mod desktop {
                                                 egui::Color32::from_rgb(255, 200, 80),
                                                 status_text,
                                             );
+                                        } else if !item.is_video {
+                                            ui.add_enabled_ui(false, |ui| {
+                                                ui.button("🖼 Image (Video Only)")
+                                                    .on_disabled_hover_text("Static image wallpapers are not supported by the video playback engine yet. Only video wallpapers (.mp4, .webm) are supported.");
+                                            });
                                         } else {
                                             ui.horizontal(|ui| {
                                                 if ui.button("⬇ Import").clicked() {
@@ -1215,13 +1396,22 @@ mod desktop {
                                                             &dest,
                                                         ) {
                                                             Ok(_) => {
-                                                                let _ = tx.send(
-                                                                    DownloadMessage::Complete {
-                                                                        id: it.id,
-                                                                        path: dest,
-                                                                        title: it.title,
-                                                                    },
-                                                                );
+                                                                if it.is_video {
+                                                                    let _ = tx.send(
+                                                                        DownloadMessage::Complete {
+                                                                            id: it.id,
+                                                                            path: dest,
+                                                                            title: it.title,
+                                                                        },
+                                                                    );
+                                                                } else {
+                                                                    let _ = tx.send(
+                                                                        DownloadMessage::Failed {
+                                                                            id: it.id,
+                                                                            error: "Static images cannot be imported into video engine".into(),
+                                                                        },
+                                                                    );
+                                                                }
                                                             }
                                                             Err(e) => {
                                                                 let _ = tx.send(
@@ -1265,13 +1455,22 @@ mod desktop {
                                                             &dest,
                                                         ) {
                                                             Ok(_) => {
-                                                                let _ = tx.send(
-                                                                    DownloadMessage::Complete {
-                                                                        id: it.id,
-                                                                        path: dest,
-                                                                        title: it.title,
-                                                                    },
-                                                                );
+                                                                if it.is_video {
+                                                                    let _ = tx.send(
+                                                                        DownloadMessage::Complete {
+                                                                            id: it.id,
+                                                                            path: dest,
+                                                                            title: it.title,
+                                                                        },
+                                                                    );
+                                                                } else {
+                                                                    let _ = tx.send(
+                                                                        DownloadMessage::Failed {
+                                                                            id: it.id,
+                                                                            error: "Static images cannot be imported into video engine".into(),
+                                                                        },
+                                                                    );
+                                                                }
                                                             }
                                                             Err(e) => {
                                                                 let _ = tx.send(
@@ -1548,7 +1747,31 @@ mod desktop {
 
     impl eframe::App for DesktopApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-            ctx.request_repaint_after(Duration::from_millis(300));
+            ctx.request_repaint_after(Duration::from_millis(100));
+
+            // Drain completed asynchronous thumbnail decodes and upload to GPU
+            while let Ok(decoded) = self.thumb_res_rx.try_recv() {
+                self.in_flight_thumbnails.remove(&decoded.path);
+                let is_recent = self.frame_counter.saturating_sub(decoded.frame_requested) < 180;
+                if is_recent || self.visible_thumbnails.contains(&decoded.path) {
+                    let handle = ctx.load_texture(
+                        decoded.path.to_string_lossy(),
+                        decoded.image,
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.current_cache_bytes += decoded.byte_size;
+                    self.textures.insert(
+                        decoded.path,
+                        CachedTexture {
+                            handle,
+                            byte_size: decoded.byte_size,
+                            last_accessed_frame: self.frame_counter,
+                        },
+                    );
+                    ctx.request_repaint();
+                }
+            }
+
             let snapshot = self
                 .snapshot
                 .lock()

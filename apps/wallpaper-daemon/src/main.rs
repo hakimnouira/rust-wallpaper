@@ -105,6 +105,7 @@ fn main() -> anyhow::Result<()> {
                 thumbnails_dir.display()
             )
         })?;
+        pipeline::cleanup_orphaned_thumbnails(&library, &thumbnails_dir);
         let pipeline = pipeline::ExtractionPipeline::start(library.clone(), thumbnails_dir.clone());
         let saved_profile = library
             .get_setting("performance_profile")?

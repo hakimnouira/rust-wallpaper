@@ -1,7 +1,7 @@
 //! Background processing worker and pipeline for video metadata and thumbnail extraction.
 
 use crate::metadata::extract_video_metadata_and_thumbnail;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::thread;
 use tracing::{error, info, warn};
@@ -14,8 +14,65 @@ pub struct ExtractionJob {
     pub source: PathBuf,
 }
 
-/// Orchestrates asynchronous metadata and thumbnail extraction with bounded concurrency.
-#[derive(Clone)]
+/// Scans the thumbnail directory and deletes any thumbnail file whose ID does not belong to an active wallpaper.
+pub fn cleanup_orphaned_thumbnails(library: &WallpaperLibrary, thumb_dir: &Path) {
+    if !thumb_dir.is_dir() {
+        return;
+    }
+    let existing_wallpapers = library.list().unwrap_or_default();
+    let known_ids: std::collections::HashSet<String> = existing_wallpapers
+        .iter()
+        .map(|w| w.id.to_string())
+        .collect();
+
+    if let Ok(entries) = std::fs::read_dir(thumb_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("jpg"))
+                    .unwrap_or(false)
+            {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if !known_ids.contains(stem) {
+                        info!(thumbnail = %path.display(), "Pruning orphaned thumbnail during startup cleanup");
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    pub struct TestSync {
+        pub extraction_done: Arc<Barrier>,
+        pub delete_done: Arc<Barrier>,
+    }
+
+    static TEST_SYNC: Mutex<Option<TestSync>> = Mutex::new(None);
+
+    pub fn set_test_sync(sync: Option<TestSync>) {
+        *TEST_SYNC.lock().unwrap() = sync;
+    }
+
+    pub fn wait_test_sync() {
+        let opt = TEST_SYNC.lock().unwrap().clone();
+        if let Some(sync) = opt {
+            sync.extraction_done.wait();
+            sync.delete_done.wait();
+        }
+    }
+}
+
 pub struct ExtractionPipeline {
     sender: SyncSender<ExtractionJob>,
     thumbnail_dir: PathBuf,
@@ -89,6 +146,9 @@ impl ExtractionPipeline {
 
             match extract_video_metadata_and_thumbnail(&source_path, &thumb_path) {
                 Ok(meta) => {
+                    #[cfg(test)]
+                    test_hooks::wait_test_sync();
+
                     if let Ok(Some(existing)) = library.get(wallpaper_id) {
                         let mut updated_meta = existing.metadata;
                         updated_meta.duration_secs = meta.duration_secs;
@@ -104,17 +164,33 @@ impl ExtractionPipeline {
                         updated_meta.processing_state = ProcessingStatus::Completed;
                         updated_meta.processing_error = None;
 
-                        if let Err(e) = library.update_metadata(wallpaper_id, &updated_meta) {
-                            error!(%wallpaper_id, %e, "Failed to persist extracted metadata to database");
-                        } else {
-                            info!(
-                                %wallpaper_id,
-                                width = ?updated_meta.width,
-                                height = ?updated_meta.height,
-                                resolution = ?updated_meta.resolution_category,
-                                duration = ?updated_meta.duration_secs,
-                                "Metadata and thumbnail extraction completed successfully"
-                            );
+                        match library.update_metadata(wallpaper_id, &updated_meta) {
+                            Ok(true) => {
+                                info!(
+                                    %wallpaper_id,
+                                    width = ?updated_meta.width,
+                                    height = ?updated_meta.height,
+                                    resolution = ?updated_meta.resolution_category,
+                                    duration = ?updated_meta.duration_secs,
+                                    "Metadata and thumbnail extraction completed successfully"
+                                );
+                            }
+                            Ok(false) => {
+                                // Wallpaper was deleted concurrently before metadata write!
+                                info!(
+                                    %wallpaper_id,
+                                    "Wallpaper was deleted concurrently before metadata write; pruning orphan thumbnail"
+                                );
+                                if thumb_path.is_file() {
+                                    let _ = std::fs::remove_file(&thumb_path);
+                                }
+                            }
+                            Err(e) => {
+                                error!(%wallpaper_id, %e, "Failed to persist extracted metadata to database");
+                                if thumb_path.is_file() {
+                                    let _ = std::fs::remove_file(&thumb_path);
+                                }
+                            }
                         }
                     } else {
                         // Wallpaper was deleted while extraction was running.
@@ -297,6 +373,14 @@ mod tests {
         std::fs::create_dir_all(&thumb_dir).unwrap();
 
         let library = WallpaperLibrary::in_memory().unwrap();
+
+        // Setup synchronization barriers
+        let sync = test_hooks::TestSync {
+            extraction_done: std::sync::Arc::new(std::sync::Barrier::new(2)),
+            delete_done: std::sync::Arc::new(std::sync::Barrier::new(2)),
+        };
+        test_hooks::set_test_sync(Some(sync.clone()));
+
         let pipeline = ExtractionPipeline::start(library.clone(), thumb_dir.clone());
 
         let wp = library
@@ -304,20 +388,40 @@ mod tests {
             .unwrap();
         let expected_thumb = thumb_dir.join(format!("{}.jpg", wp.id));
 
-        // Submit job and immediately delete wallpaper from library
+        // Submit extraction job
         pipeline.submit(wp.id, video_path);
-        let _ = library.delete(wp.id);
 
-        // Wait a short duration for worker to process and prune
+        // Wait until thumbnail is generated on disk and worker is paused right before metadata write
+        sync.extraction_done.wait();
+
+        // Assert thumbnail is currently present on disk
+        assert!(
+            expected_thumb.is_file(),
+            "Thumbnail must have been extracted and written before database update"
+        );
+
+        // Delete the wallpaper concurrently from the library
+        let deleted = library.delete(wp.id).unwrap();
+        assert!(deleted, "Wallpaper must be deleted");
+
+        // Allow worker to proceed with atomic update
+        sync.delete_done.wait();
+
+        // Wait for worker to finish processing and prune the thumbnail
         let start = Instant::now();
-        while start.elapsed() < Duration::from_millis(1500) {
-            std::thread::sleep(Duration::from_millis(50));
+        let mut pruned = false;
+        while start.elapsed() < Duration::from_secs(3) {
+            if !expected_thumb.exists() {
+                pruned = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
 
-        // Verify that no orphaned thumbnail remains on disk
+        test_hooks::set_test_sync(None);
         assert!(
-            !expected_thumb.exists(),
-            "Orphaned thumbnail should have been pruned when wallpaper was deleted"
+            pruned,
+            "Orphaned thumbnail should have been atomically pruned when wallpaper was deleted"
         );
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -328,11 +328,13 @@ impl WallpaperLibrary {
     }
 
     /// Updates metadata and processing state for a wallpaper.
+    /// Returns `Ok(true)` if the wallpaper row was updated, or `Ok(false)` if the wallpaper
+    /// was deleted concurrently.
     pub fn update_metadata(
         &self,
         id: WallpaperId,
         metadata: &WallpaperMetadata,
-    ) -> Result<(), LibraryError> {
+    ) -> Result<bool, LibraryError> {
         let conn = self.conn.lock().unwrap();
         let state_str = match metadata.processing_state {
             ProcessingStatus::Pending => "pending",
@@ -341,7 +343,7 @@ impl WallpaperLibrary {
             ProcessingStatus::Failed => "failed",
         };
 
-        conn.execute(
+        let affected = conn.execute(
             r#"
             UPDATE wallpapers SET
                 title = ?2,
@@ -378,16 +380,17 @@ impl WallpaperLibrary {
                 metadata.source_mtime,
             ],
         )?;
-        Ok(())
+        Ok(affected > 0)
     }
 
     /// Updates only the processing state and optional error message.
+    /// Returns `Ok(true)` if the wallpaper row was updated, or `Ok(false)` if the wallpaper was deleted.
     pub fn set_processing_state(
         &self,
         id: WallpaperId,
         state: ProcessingStatus,
         error: Option<&str>,
-    ) -> Result<(), LibraryError> {
+    ) -> Result<bool, LibraryError> {
         let conn = self.conn.lock().unwrap();
         let state_str = match state {
             ProcessingStatus::Pending => "pending",
@@ -396,7 +399,7 @@ impl WallpaperLibrary {
             ProcessingStatus::Failed => "failed",
         };
 
-        conn.execute(
+        let affected = conn.execute(
             r#"
             UPDATE wallpapers SET
                 processing_state = ?2,
@@ -405,7 +408,7 @@ impl WallpaperLibrary {
             "#,
             params![id.to_string(), state_str, error],
         )?;
-        Ok(())
+        Ok(affected > 0)
     }
 
     /// Deletes a wallpaper by ID.
@@ -689,7 +692,11 @@ mod tests {
         meta.thumbnail_path = Some("C:\\AppData\\thumbnails\\test.jpg".into());
         meta.processing_state = ProcessingStatus::Completed;
 
-        library.update_metadata(wp.id, &meta).unwrap();
+        let updated = library.update_metadata(wp.id, &meta).unwrap();
+        assert!(
+            updated,
+            "update_metadata on existing wallpaper should return true"
+        );
 
         let completed = library.get(wp.id).unwrap().unwrap();
         assert_eq!(
