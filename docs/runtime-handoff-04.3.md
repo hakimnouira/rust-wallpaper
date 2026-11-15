@@ -53,9 +53,16 @@ Implemented on the working branch:
 
 ## Validation status
 
-Do not infer successful compilation or Windows behavior from the code changes alone.
-The GitHub Actions run is the validation source for formatting, native tests, and cross-target
-checking. A cross-target `cargo check` is not a substitute for running the daemon on Windows.
+GitHub Actions run [#43656212682](https://github.com/hakimnouira/rust-wallpaper/actions/runs/43656212682)
+completed successfully on commit `8c87939551744ff749de91eb12b899f50875c6c4`:
+
+- `cargo fmt --all -- --check`: passed.
+- `cargo test -p wallpaper-core`: **109 passed, 0 failed**.
+- `cargo check --workspace --target x86_64-pc-windows-gnu`: passed after installing MinGW
+  for the bundled SQLite build.
+
+This proves native core tests and a Windows GNU cross-target type/build check. It does not prove
+the daemon's runtime behavior on a real Windows desktop.
 
 Still required on a real Windows machine:
 - Start the daemon with two monitors and confirm both assignments render.
