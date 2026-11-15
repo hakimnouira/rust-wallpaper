@@ -136,8 +136,10 @@ async fn serve_client(
             }
         };
 
-        if let Err(ProtocolError::VersionMismatch { received, supported }) =
-            request.validate()
+        if let Err(ProtocolError::VersionMismatch {
+            received,
+            supported,
+        }) = request.validate()
         {
             let response = ResponseEnvelope::error(
                 request.request_id,
