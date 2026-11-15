@@ -626,6 +626,14 @@ fn dispatch_ipc(
             }
         }
         Command::RemoveWallpaper { wallpaper_id } => {
+            let wallpaper = match library.get(wallpaper_id) {
+                Ok(Some(wallpaper)) => wallpaper,
+                Ok(None) => return failure(ErrorCode::NotFound, format!("wallpaper {wallpaper_id} was not found")),
+                Err(error) => return failure(ErrorCode::Internal, error.to_string()),
+            };
+            if runtime.lifecycle.registry().is_path_assigned(std::path::Path::new(&wallpaper.metadata.source)) {
+                return failure(ErrorCode::InvalidRequest, "wallpaper is assigned to a monitor or configured as the fallback; unassign it before removing it from the library".into());
+            }
             match library.delete(wallpaper_id) {
                 Ok(true) => Response::Accepted,
                 Ok(false) => return failure(ErrorCode::NotFound, format!("wallpaper {wallpaper_id} was not found")),
