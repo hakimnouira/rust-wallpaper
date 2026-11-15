@@ -6,6 +6,7 @@
 #[cfg(windows)]
 mod desktop {
     use eframe::egui;
+    use std::collections::HashMap;
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::runtime::Builder;
@@ -38,6 +39,8 @@ mod desktop {
         page: Page,
         selected_monitor: Option<String>,
         selected_wallpaper: Option<WallpaperId>,
+        volumes: HashMap<String, u32>,
+        muted: HashMap<String, bool>,
         import_path: String,
         import_title: String,
         search: String,
@@ -52,6 +55,8 @@ mod desktop {
                 page: Page::Library,
                 selected_monitor: None,
                 selected_wallpaper: None,
+                volumes: HashMap::new(),
+                muted: HashMap::new(),
                 import_path: String::new(),
                 import_title: String::new(),
                 search: String::new(),
@@ -314,6 +319,33 @@ mod desktop {
                             } else {
                                 ui.label("No active video player");
                             }
+                            ui.horizontal(|ui| {
+                                let mut volume = self.volumes.get(&device).copied().unwrap_or(100);
+                                if ui
+                                    .add(egui::Slider::new(&mut volume, 0..=100).text("Volume"))
+                                    .changed()
+                                {
+                                    self.volumes.insert(device.clone(), volume);
+                                    self.send(
+                                        Command::SetVolume {
+                                            monitor: Some(device.clone()),
+                                            volume,
+                                        },
+                                        "Volume updated…",
+                                    );
+                                }
+                                let mut muted = self.muted.get(&device).copied().unwrap_or(false);
+                                if ui.checkbox(&mut muted, "Mute").changed() {
+                                    self.muted.insert(device.clone(), muted);
+                                    self.send(
+                                        Command::SetMute {
+                                            monitor: Some(device.clone()),
+                                            muted,
+                                        },
+                                        "Mute setting updated…",
+                                    );
+                                }
+                            });
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
