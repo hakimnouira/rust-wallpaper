@@ -208,6 +208,74 @@ mod desktop {
                 ui.label("No monitors reported yet.");
                 return;
             }
+
+            ui.label("Display layout · click a screen to select its target");
+            let min_x = snapshot.monitors.iter().map(|m| m.x).min().unwrap_or(0);
+            let min_y = snapshot.monitors.iter().map(|m| m.y).min().unwrap_or(0);
+            let max_x = snapshot
+                .monitors
+                .iter()
+                .map(|m| m.x.saturating_add(m.width as i32))
+                .max()
+                .unwrap_or(1);
+            let max_y = snapshot
+                .monitors
+                .iter()
+                .map(|m| m.y.saturating_add(m.height as i32))
+                .max()
+                .unwrap_or(1);
+            let desktop_width = (max_x - min_x).max(1) as f32;
+            let desktop_height = (max_y - min_y).max(1) as f32;
+            let (layout_response, painter) = ui.allocate_painter(
+                egui::vec2(ui.available_width(), 190.0),
+                egui::Sense::click(),
+            );
+            let bounds = layout_response.rect.shrink(12.0);
+            let scale = ((bounds.width() / desktop_width)
+                .min(bounds.height() / desktop_height))
+                .max(0.01);
+            let rendered_size = egui::vec2(desktop_width * scale, desktop_height * scale);
+            let origin = bounds.center() - rendered_size * 0.5;
+            let pointer = layout_response.interact_pointer_pos();
+            for monitor in &snapshot.monitors {
+                let position = egui::pos2(
+                    origin.x + (monitor.x - min_x) as f32 * scale,
+                    origin.y + (monitor.y - min_y) as f32 * scale,
+                );
+                let size = egui::vec2(
+                    (monitor.width as f32 * scale).max(28.0),
+                    (monitor.height as f32 * scale).max(24.0),
+                );
+                let monitor_rect = egui::Rect::from_min_size(position, size);
+                let selected = self.selected_monitor.as_deref() == Some(&monitor.device_name);
+                let fill = if selected {
+                    egui::Color32::from_rgb(54, 105, 154)
+                } else if monitor.is_primary {
+                    egui::Color32::from_rgb(57, 78, 96)
+                } else {
+                    egui::Color32::from_rgb(65, 70, 80)
+                };
+                painter.rect_filled(monitor_rect, 5.0, fill);
+                painter.rect_stroke(
+                    monitor_rect,
+                    5.0,
+                    egui::Stroke::new(1.0, egui::Color32::LIGHT_GRAY),
+                    egui::StrokeKind::Inside,
+                );
+                painter.text(
+                    monitor_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &monitor.device_name,
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::WHITE,
+                );
+                if layout_response.clicked()
+                    && pointer.is_some_and(|position| monitor_rect.contains(position))
+                {
+                    self.selected_monitor = Some(monitor.device_name.clone());
+                }
+            }
+            ui.add_space(8.0);
             for monitor in &snapshot.monitors {
                 let device = monitor.device_name.clone();
                 let status = snapshot
