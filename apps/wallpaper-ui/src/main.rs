@@ -441,10 +441,7 @@ mod desktop {
     async fn send(client: &mut IpcClient, command: Command) -> Result<Response, String> {
         let request = RequestEnvelope::new(command);
         match timeout(Duration::from_secs(5), client.request(&request)).await {
-            Ok(Ok(response)) => match response.result {
-                Response::Error { message, .. } => Err(message),
-                result => Ok(result),
-            },
+            Ok(Ok(response)) => Ok(response.result),
             Ok(Err(error)) => Err(error.to_string()),
             Err(_) => Err("daemon request timed out".into()),
         }
@@ -491,12 +488,20 @@ mod desktop {
                         if let Some(connection) = client.as_mut() {
                             let mut disconnected = false;
                             while let Ok(command) = rx.try_recv() {
-                                if let Err(error) = send(connection, command).await {
-                                    if let Ok(mut state) = snapshot.lock() {
-                                        state.last_error = Some(error);
+                                match send(connection, command).await {
+                                    Ok(Response::Error { message, .. }) => {
+                                        if let Ok(mut state) = snapshot.lock() {
+                                            state.last_error = Some(message);
+                                        }
                                     }
-                                    disconnected = true;
-                                    break;
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        if let Ok(mut state) = snapshot.lock() {
+                                            state.last_error = Some(error);
+                                        }
+                                        disconnected = true;
+                                        break;
+                                    }
                                 }
                             }
                             if !disconnected && Instant::now() >= next_refresh {
@@ -525,6 +530,11 @@ mod desktop {
                                         Ok(Response::Profile(profile)) => {
                                             if let Ok(mut state) = snapshot.lock() {
                                                 state.profile = profile;
+                                            }
+                                        }
+                                        Ok(Response::Error { message, .. }) => {
+                                            if let Ok(mut state) = snapshot.lock() {
+                                                state.last_error = Some(message);
                                             }
                                         }
                                         Ok(_) => {}
