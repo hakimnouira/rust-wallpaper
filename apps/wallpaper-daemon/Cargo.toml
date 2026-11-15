@@ -8,6 +8,8 @@ license.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tokio.workspace = true
+wallpaper-protocol = { path = "../../crates/wallpaper-protocol" }
 wallpaper-core = { path = "../../crates/wallpaper-core" }
 wallpaper-windows = { path = "../../crates/wallpaper-windows" }
 
