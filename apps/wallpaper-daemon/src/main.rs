@@ -575,7 +575,7 @@ fn dispatch_ipc(
     known: &[String],
     now: Instant,
 ) -> wallpaper_protocol::ResponseEnvelope {
-    use wallpaper_protocol::{Command, ErrorCode, PlayerStatusInfo, Response, ResponseEnvelope};
+    use wallpaper_protocol::{Command, ErrorCode, MonitorInfo, PlayerStatusInfo, Response, ResponseEnvelope};
 
     let request_id = request.request_id;
     if let Err(error) = request.validate() {
@@ -588,6 +588,27 @@ fn dispatch_ipc(
         Command::ListWallpapers => match library.list() {
             Ok(items) => Response::WallpaperList(items),
             Err(error) => return failure(ErrorCode::Internal, error.to_string()),
+        },
+        Command::ListMonitors => match enumerate_monitor_details() {
+            Ok(monitors) => {
+                let items = monitors
+                    .into_iter()
+                    .map(|details| {
+                        let descriptor = details.into_descriptor();
+                        MonitorInfo {
+                            id: descriptor.id.to_string(),
+                            device_name: descriptor.device_name,
+                            x: descriptor.x,
+                            y: descriptor.y,
+                            width: descriptor.width,
+                            height: descriptor.height,
+                            is_primary: descriptor.is_primary,
+                        }
+                    })
+                    .collect();
+                Response::MonitorList(items)
+            }
+            Err(error) => return failure(ErrorCode::RuntimeFailure, error.to_string()),
         },
         Command::ApplyWallpaper { wallpaper_id, monitor } => {
             let wallpaper = match library.get(wallpaper_id) {
