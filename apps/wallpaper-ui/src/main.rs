@@ -131,23 +131,56 @@ mod desktop {
                             ui.vertical(|ui| {
                                 ui.strong(wallpaper.title());
                                 ui.small(wallpaper.source());
-                                let dimensions = match (wallpaper.metadata.width, wallpaper.metadata.height) {
-                                    (Some(w), Some(h)) => format!("{w} × {h}"),
-                                    _ => "Metadata not scanned yet".into(),
-                                };
+                                let dimensions =
+                                    match (wallpaper.metadata.width, wallpaper.metadata.height) {
+                                        (Some(w), Some(h)) => format!("{w} × {h}"),
+                                        _ => "Metadata not scanned yet".into(),
+                                    };
                                 ui.small(format!("{:?} · {}", wallpaper.kind, dimensions));
                             });
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.add_enabled(snapshot.connected, egui::Button::new("Assign")).clicked() {
-                                    self.send(Command::ApplyWallpaper { wallpaper_id: wallpaper.id, monitor: selected_monitor.clone() }, "Wallpaper assignment requested…");
-                                }
-                                if ui.selectable_label(self.selected_wallpaper == Some(wallpaper.id), "Select").clicked() {
-                                    self.selected_wallpaper = Some(wallpaper.id);
-                                }
-                                if ui.add_enabled(snapshot.connected, egui::Button::new("Remove from library")).clicked() {
-                                    self.send(Command::RemoveWallpaper { wallpaper_id: wallpaper.id }, "Removal requested…");
-                                }
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            snapshot.connected,
+                                            egui::Button::new("Assign"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.send(
+                                            Command::ApplyWallpaper {
+                                                wallpaper_id: wallpaper.id,
+                                                monitor: selected_monitor.clone(),
+                                            },
+                                            "Wallpaper assignment requested…",
+                                        );
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            self.selected_wallpaper == Some(wallpaper.id),
+                                            "Select",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.selected_wallpaper = Some(wallpaper.id);
+                                    }
+                                    if ui
+                                        .add_enabled(
+                                            snapshot.connected,
+                                            egui::Button::new("Remove from library"),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.send(
+                                            Command::RemoveWallpaper {
+                                                wallpaper_id: wallpaper.id,
+                                            },
+                                            "Removal requested…",
+                                        );
+                                    }
+                                },
+                            );
                         });
                     });
                     ui.add_space(5.0);
