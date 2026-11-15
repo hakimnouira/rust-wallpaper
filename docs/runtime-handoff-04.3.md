@@ -37,14 +37,16 @@ Implemented on the working branch:
    - Defaults use the primary monitor's fallback wallpaper, then mirror that primary choice
      to secondary monitors unless they have explicit user assignments.
 
-4. **Event listener safety**
-   - A listener is not reported as started if WTS session registration, display-power
-     registration, or the `TaskbarCreated` message registration fails.
-   - The daemon retries listener creation every two seconds. This is fail-closed behavior:
-     partial registration is not silently presented as complete coverage.
-   - The platform-independent `RegistrationTracker` remains available and tested, but its
-     per-source `WM_TIMER` retry/report integration is not yet wired into the Win32 listener.
-     This is the one remaining implementation gap in the event-registration requirement.
+4. **Event listener registration**
+   - The listener owns a shared `RegistrationReport` and `RegistrationTracker`.
+   - WTS session, display-power, and `TaskbarCreated` registration are tracked independently.
+     Suspend/resume and display topology are marked active when the top-level notifier window exists.
+   - Failed sources retry on the listener's own `WM_TIMER` message thread with bounded exponential
+     backoff (six total attempts, 500 ms initial delay, capped at eight seconds).
+   - Coverage is exposed through `SystemEventListener::registration_report()`; the daemon logs
+     changes and includes coverage plus diagnostics in the `status` command.
+   - A listener can remain alive with partial coverage while retrying; it never reports full
+     coverage until every event source is active.
 
 5. **CI**
    - Added `.github/workflows/ci.yml` to run formatting, workspace tests, and a
