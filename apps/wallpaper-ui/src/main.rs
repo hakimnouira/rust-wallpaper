@@ -25,6 +25,7 @@ mod desktop {
         last_updated: Option<Instant>,
     }
 
+    #[derive(Clone, Copy)]
     enum Page {
         Library,
         Monitors,
@@ -361,19 +362,19 @@ mod desktop {
                 .show(ctx, |ui| {
                     ui.add_space(12.0);
                     if ui
-                        .selectable_label(matches!(&self.page, Page::Library), "▦  Library")
+                        .selectable_label(matches!(self.page, Page::Library), "▦  Library")
                         .clicked()
                     {
                         self.page = Page::Library;
                     }
                     if ui
-                        .selectable_label(matches!(&self.page, Page::Monitors), "▣  Monitors")
+                        .selectable_label(matches!(self.page, Page::Monitors), "▣  Monitors")
                         .clicked()
                     {
                         self.page = Page::Monitors;
                     }
                     if ui
-                        .selectable_label(matches!(&self.page, Page::Settings), "⚙  Settings")
+                        .selectable_label(matches!(self.page, Page::Settings), "⚙  Settings")
                         .clicked()
                     {
                         self.page = Page::Settings;
@@ -406,7 +407,7 @@ mod desktop {
                         ui.label("v0.1 · Early access");
                     });
                 });
-            egui::CentralPanel::default().show(ctx, |ui| match &self.page {
+            egui::CentralPanel::default().show(ctx, |ui| match self.page {
                 Page::Library => self.render_library(ui, &snapshot),
                 Page::Monitors => self.render_monitors(ui, &snapshot),
                 Page::Settings => self.render_settings(ui, &snapshot),
