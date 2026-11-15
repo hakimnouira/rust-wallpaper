@@ -507,9 +507,15 @@ mod platform {
                 let _ = DestroyWindow(hwnd);
                 release_class(hinstance);
                 let mut missing = Vec::new();
-                if !wts_registered { missing.push("WTS session notifications"); }
-                if power_notify.is_none() { missing.push("display power notifications"); }
-                if taskbar_msg == 0 { missing.push("TaskbarCreated broadcast registration"); }
+                if !wts_registered {
+                    missing.push("WTS session notifications");
+                }
+                if power_notify.is_none() {
+                    missing.push("display power notifications");
+                }
+                if taskbar_msg == 0 {
+                    missing.push("TaskbarCreated broadcast registration");
+                }
                 let _ = init_tx.send(Err(format!(
                     "System event listener has incomplete registration: {}",
                     missing.join(", ")
