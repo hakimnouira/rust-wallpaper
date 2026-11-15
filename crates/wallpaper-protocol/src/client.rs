@@ -37,7 +37,7 @@ pub struct IpcClient {
 }
 
 impl IpcClient {
-    pub fn connect() -> Result<Self, ClientError> {
+    pub async fn connect() -> Result<Self, ClientError> {
         let stream = ClientOptions::new()
             .open(PIPE_NAME)
             .map_err(ClientError::Connect)?;
@@ -57,7 +57,7 @@ impl IpcClient {
         let mut delay = initial_backoff;
         let mut last_error = None;
         for attempt in 0..attempts {
-            match Self::connect() {
+            match Self::connect().await {
                 Ok(client) => return Ok(client),
                 Err(error) => last_error = Some(error),
             }
