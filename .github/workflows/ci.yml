@@ -32,4 +32,4 @@ jobs:
       - name: Cross-check Windows target
         env:
           CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
-        run: cargo check --workspace --target x86_64-pc-windows-gnu
+        run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
