@@ -263,7 +263,6 @@ mod desktop {
                     monitor_rect,
                     5.0,
                     egui::Stroke::new(1.0, egui::Color32::LIGHT_GRAY),
-                    egui::StrokeKind::Inside,
                 );
                 painter.text(
                     monitor_rect.center(),
