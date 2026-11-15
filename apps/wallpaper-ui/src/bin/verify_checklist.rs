@@ -11,7 +11,10 @@ use wallpaper_protocol::{Command, ErrorCode, RequestEnvelope, Response};
 struct ManagedChild(Child);
 
 impl ManagedChild {
-    fn id(&self) -> u32 { self.0.id() }
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
         self.0.try_wait()
     }
@@ -21,11 +24,15 @@ impl ManagedChild {
     }
 }
 impl Drop for ManagedChild {
-    fn drop(&mut self) { self.stop(); }
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 struct TempFile(PathBuf);
 impl Drop for TempFile {
-    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 fn spawn_daemon() -> ManagedChild {
@@ -421,7 +428,9 @@ async fn async_main() {
         "  -> PASS: A fresh IPC client reconnected to daemon PID: {}",
         restarted_daemon.id()
     );
-    println!("  -> This does not exercise the UI background worker; verify UI reconnection manually.");
+    println!(
+        "  -> This does not exercise the UI background worker; verify UI reconnection manually."
+    );
 
     // -----------------------------------------------------------------
     // Checklist 13: Wallpaper survives Explorer restarting
@@ -429,7 +438,9 @@ async fn async_main() {
     println!("\n[CHECKLIST 13/13] Wallpaper survives Explorer restarting");
     println!("  -> NOT EXERCISED by this binary: no Explorer process is restarted.");
     println!("  -> Existing unit/integration tests cover recovery orchestration.");
-    println!("  -> Manual confirmation required: restart Explorer while wallpaper is playing and inspect reattachment.");
+    println!(
+        "  -> Manual confirmation required: restart Explorer while wallpaper is playing and inspect reattachment."
+    );
 
     // Clean teardown
     println!(
