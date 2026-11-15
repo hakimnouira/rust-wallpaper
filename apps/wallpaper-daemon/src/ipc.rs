@@ -4,13 +4,12 @@
 //! the daemon's main loop and waits for that loop to produce the response.
 
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::sync::oneshot;
 use tokio::time::{timeout, Duration};
 use wallpaper_protocol::{
-    Command, ErrorCode, ProtocolError, RequestEnvelope, Response, ResponseEnvelope,
-    MAX_FRAME_BYTES, PROTOCOL_VERSION,
+    ErrorCode, ProtocolError, RequestEnvelope, ResponseEnvelope, MAX_FRAME_BYTES,
 };
 
 pub const PIPE_NAME: &str = r"\\.\pipe\rust-wallpaper-ipc";
@@ -182,8 +181,3 @@ async fn serve_client(
     }
     Ok(())
 }
-
-// Keep the command import visible here as a compile-time reminder that the
-// transport accepts only the typed protocol contract, never arbitrary strings.
-const _: Option<Command> = None;
-const _: u16 = PROTOCOL_VERSION;
