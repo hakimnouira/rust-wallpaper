@@ -114,7 +114,7 @@ mod desktop {
                                 if ui.selectable_label(self.selected_wallpaper == Some(wallpaper.id), "Select").clicked() {
                                     self.selected_wallpaper = Some(wallpaper.id);
                                 }
-                                if ui.add_enabled(snapshot.connected, egui::Button::new("Remove")).clicked() {
+                                if ui.add_enabled(snapshot.connected, egui::Button::new("Remove from library")).clicked() {
                                     self.send(Command::RemoveWallpaper { wallpaper_id: wallpaper.id }, "Removal requested…");
                                 }
                             });
