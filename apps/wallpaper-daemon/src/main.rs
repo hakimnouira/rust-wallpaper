@@ -613,11 +613,7 @@ fn dispatch_ipc(
             Err(error) => return failure(ErrorCode::RuntimeFailure, error.to_string()),
         },
         Command::ImportWallpaper { path, title } => {
-            match library.import_video(
-                &path,
-                title.as_deref(),
-                None,
-            ) {
+            match library.import_video(&path, title.as_deref(), None) {
                 Ok(wallpaper) => {
                     info!(wallpaper_id = %wallpaper.id, source = %path, "Wallpaper imported through IPC");
                     Response::Accepted
@@ -636,7 +632,12 @@ fn dispatch_ipc(
             }
             match library.delete(wallpaper_id) {
                 Ok(true) => Response::Accepted,
-                Ok(false) => return failure(ErrorCode::NotFound, format!("wallpaper {wallpaper_id} was not found")),
+                Ok(false) => {
+                    return failure(
+                        ErrorCode::NotFound,
+                        format!("wallpaper {wallpaper_id} was not found"),
+                    )
+                }
                 Err(error) => return failure(ErrorCode::RuntimeFailure, error.to_string()),
             }
         }
