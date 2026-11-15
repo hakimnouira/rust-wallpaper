@@ -234,9 +234,8 @@ mod desktop {
                 egui::Sense::click(),
             );
             let bounds = layout_response.rect.shrink(12.0);
-            let scale = ((bounds.width() / desktop_width)
-                .min(bounds.height() / desktop_height))
-                .max(0.01);
+            let scale =
+                ((bounds.width() / desktop_width).min(bounds.height() / desktop_height)).max(0.01);
             let rendered_size = egui::vec2(desktop_width * scale, desktop_height * scale);
             let origin = bounds.center() - rendered_size * 0.5;
             let pointer = layout_response.interact_pointer_pos();
@@ -250,7 +249,8 @@ mod desktop {
                     (monitor.height as f32 * scale).max(24.0),
                 );
                 let monitor_rect = egui::Rect::from_min_size(position, size);
-                let selected = self.selected_monitor.as_deref() == Some(monitor.device_name.as_str());
+                let selected =
+                    self.selected_monitor.as_deref() == Some(monitor.device_name.as_str());
                 let fill = if selected {
                     egui::Color32::from_rgb(54, 105, 154)
                 } else if monitor.is_primary {
