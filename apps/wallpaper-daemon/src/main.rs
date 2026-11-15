@@ -44,7 +44,10 @@ fn parse_cli_args() -> (Option<Duration>, PerformanceProfile) {
         }
         if args[i] == "--profile" && i + 1 < args.len() {
             profile = PerformanceProfile::parse(&args[i + 1]).unwrap_or_else(|| {
-                eprintln!("unknown profile '{}', using balanced (eco|balanced|performance)", args[i + 1]);
+                eprintln!(
+                    "unknown profile '{}', using balanced (eco|balanced|performance)",
+                    args[i + 1]
+                );
                 PerformanceProfile::Balanced
             });
         }
@@ -67,10 +70,8 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     {
         unsafe {
-            let _ = windows::Win32::System::Console::SetConsoleCtrlHandler(
-                Some(ctrl_handler),
-                true,
-            );
+            let _ =
+                windows::Win32::System::Console::SetConsoleCtrlHandler(Some(ctrl_handler), true);
         }
 
         let db_path = PathBuf::from("library.db");
@@ -88,12 +89,23 @@ fn main() -> anyhow::Result<()> {
             hardware_acceleration: HardwareAcceleration::Auto,
         };
         if nature_mp4.is_file() {
-            let _ = library.import_video(&nature_mp4, Some("Nature Test Video (MP4)"), Some(demo_config.clone()));
+            let _ = library.import_video(
+                &nature_mp4,
+                Some("Nature Test Video (MP4)"),
+                Some(demo_config.clone()),
+            );
         }
         if abstract_webm.is_file() {
-            let _ = library.import_video(&abstract_webm, Some("Abstract Test Video (WebM)"), Some(demo_config.clone()));
+            let _ = library.import_video(
+                &abstract_webm,
+                Some("Abstract Test Video (WebM)"),
+                Some(demo_config.clone()),
+            );
         }
-        info!(count = library.list().unwrap_or_default().len(), "Wallpaper library loaded");
+        info!(
+            count = library.list().unwrap_or_default().len(),
+            "Wallpaper library loaded"
+        );
 
         let fallback_path = if nature_mp4.is_file() {
             Some(nature_mp4)
@@ -117,8 +129,8 @@ fn main() -> anyhow::Result<()> {
             HealthPolicy::default(),
         );
 
-        let mut manager = WallpaperManager::init()
-            .context("failed to initialize desktop wallpaper manager")?;
+        let mut manager =
+            WallpaperManager::init().context("failed to initialize desktop wallpaper manager")?;
         let diag = &manager.host().diagnostics;
         info!(
             selected_host = format_args!("0x{:X}", diag.selected_host_hwnd),
@@ -147,7 +159,10 @@ fn main() -> anyhow::Result<()> {
         info!("Commands: pause [DISPLAYn] | resume [DISPLAYn] | assign DISPLAYn <video path> | unassign DISPLAYn | profile <eco|balanced|performance> | status | quit");
 
         if let Some(dur) = duration_limit {
-            info!(duration_secs = dur.as_secs(), "Daemon running for scheduled duration");
+            info!(
+                duration_secs = dur.as_secs(),
+                "Daemon running for scheduled duration"
+            );
         } else {
             info!("Daemon running. Press Ctrl+C to terminate cleanly");
         }
@@ -236,11 +251,9 @@ fn main() -> anyhow::Result<()> {
                 last_poll = now;
                 sync_known_devices(&mut known_monitors);
                 let probe = tracker.probe();
-                runtime.runtime.observe_foreground(
-                    &known_monitors,
-                    &probe.observations,
-                    now,
-                );
+                runtime
+                    .runtime
+                    .observe_foreground(&known_monitors, &probe.observations, now);
             }
 
             // Refresh the topology independently of notifications. This also recovers from
@@ -281,7 +294,8 @@ fn main() -> anyhow::Result<()> {
             if now.saturating_duration_since(last_telemetry) >= Duration::from_secs(2) {
                 last_telemetry = now;
                 for telem in manager.collect_telemetry() {
-                    let reasons: Vec<&str> = runtime.runtime
+                    let reasons: Vec<&str> = runtime
+                        .runtime
                         .suspension()
                         .active_reasons_for(&telem.device_name)
                         .into_iter()
@@ -364,7 +378,10 @@ fn sync_monitors(
 ) {
     match enumerate_monitor_details() {
         Ok(monitors) if !monitors.is_empty() => {
-            *known = monitors.iter().map(|m| m.info.device_name.clone()).collect();
+            *known = monitors
+                .iter()
+                .map(|m| m.info.device_name.clone())
+                .collect();
             let report = runtime.sync_topology(
                 monitors.into_iter().map(|m| m.into_descriptor()).collect(),
                 manager,
@@ -422,17 +439,25 @@ fn handle_control(
     match cmd {
         ControlCommand::Pause { device } => match device {
             Some(name) => match resolve(&name) {
-                Ok(device) => { runtime.runtime.set_user_paused(Some(&device), true); }
+                Ok(device) => {
+                    runtime.runtime.set_user_paused(Some(&device), true);
+                }
                 Err(e) => warn!("{e}"),
             },
-            None => { runtime.runtime.set_user_paused(None, true); }
+            None => {
+                runtime.runtime.set_user_paused(None, true);
+            }
         },
         ControlCommand::Resume { device } => match device {
             Some(name) => match resolve(&name) {
-                Ok(device) => { runtime.runtime.set_user_paused(Some(&device), false); }
+                Ok(device) => {
+                    runtime.runtime.set_user_paused(Some(&device), false);
+                }
                 Err(e) => warn!("{e}"),
             },
-            None => { runtime.runtime.set_user_paused(None, false); }
+            None => {
+                runtime.runtime.set_user_paused(None, false);
+            }
         },
         ControlCommand::SetProfile(profile) => runtime.runtime.set_profile(profile),
         ControlCommand::Assign { device, path } => match resolve(&device) {
@@ -441,14 +466,11 @@ fn handle_control(
                 if !path.is_file() {
                     warn!(path = %path.display(), "Assignment rejected: file does not exist");
                 } else {
-                    match runtime.assign_user(
-                        &device,
-                        Assignment::new(path),
-                        manager,
-                        now,
-                    ) {
+                    match runtime.assign_user(&device, Assignment::new(path), manager, now) {
                         Ok(()) => info!(%device, "Persistent wallpaper assignment applied"),
-                        Err(e) => warn!(%device, %e, "Assignment applied in memory but persistence failed"),
+                        Err(e) => {
+                            warn!(%device, %e, "Assignment applied in memory but persistence failed")
+                        }
                     }
                 }
             }
@@ -457,7 +479,9 @@ fn handle_control(
         ControlCommand::Unassign { device } => match resolve(&device) {
             Ok(device) => match runtime.unassign_user(&device, manager, now) {
                 Ok(()) => info!(%device, "User assignment removed; default policy restored"),
-                Err(e) => warn!(%device, %e, "Unassignment applied in memory but persistence failed"),
+                Err(e) => {
+                    warn!(%device, %e, "Unassignment applied in memory but persistence failed")
+                }
             },
             Err(e) => warn!("{e}"),
         },
