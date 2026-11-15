@@ -22,6 +22,9 @@ use wallpaper_windows::{
     SystemEventListener, WallpaperManager,
 };
 
+#[cfg(windows)]
+mod ipc;
+
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 #[cfg(windows)]
@@ -161,6 +164,8 @@ fn main() -> anyhow::Result<()> {
         let mut next_listener_attempt = Instant::now() + LISTENER_RETRY;
         let mut tracker = FullscreenTracker::new();
         let control_rx = spawn_control_reader();
+        let ipc_rx = ipc::start();
+        info!(pipe = ipc::PIPE_NAME, "Named-pipe IPC server started");
         info!("Commands: pause [DISPLAYn] | resume [DISPLAYn] | assign DISPLAYn <video path> | unassign DISPLAYn | profile <eco|balanced|performance> | status | quit");
 
         if let Some(dur) = duration_limit {
@@ -200,6 +205,18 @@ fn main() -> anyhow::Result<()> {
                     now,
                     registration_report.as_ref(),
                 );
+            }
+
+            while let Ok(pending) = ipc_rx.try_recv() {
+                let response = dispatch_ipc(
+                    pending.request,
+                    &library,
+                    &mut runtime,
+                    &mut manager,
+                    &known_monitors,
+                    now,
+                );
+                let _ = pending.reply.send(response);
             }
 
             let mut listener_died = false;
@@ -546,4 +563,150 @@ fn handle_control(
             RUNNING.store(false, Ordering::SeqCst);
         }
     }
+}
+
+
+#[cfg(windows)]
+fn dispatch_ipc(
+    request: wallpaper_protocol::RequestEnvelope,
+    library: &WallpaperLibrary,
+    runtime: &mut RuntimeSupervisor,
+    manager: &mut WallpaperManager,
+    known: &[String],
+    now: Instant,
+) -> wallpaper_protocol::ResponseEnvelope {
+    use wallpaper_protocol::{Command, ErrorCode, PlayerStatusInfo, Response, ResponseEnvelope};
+
+    let request_id = request.request_id;
+    if let Err(error) = request.validate() {
+        return ResponseEnvelope::error(request_id, ErrorCode::ProtocolMismatch, error.to_string());
+    }
+
+    let failure = |code, message: String| ResponseEnvelope::error(request_id, code, message);
+    let accepted = || ResponseEnvelope::new(request_id, Response::Accepted);
+
+    let result = match request.command {
+        Command::Ping => Response::Pong,
+        Command::ListWallpapers => match library.list() {
+            Ok(items) => Response::WallpaperList(items),
+            Err(error) => return failure(ErrorCode::Internal, error.to_string()),
+        },
+        Command::ApplyWallpaper { wallpaper_id, monitor } => {
+            let wallpaper = match library.get(wallpaper_id) {
+                Ok(Some(wallpaper)) => wallpaper,
+                Ok(None) => return failure(ErrorCode::NotFound, format!("wallpaper {wallpaper_id} was not found")),
+                Err(error) => return failure(ErrorCode::Internal, error.to_string()),
+            };
+            if wallpaper.kind != wallpaper_core::WallpaperKind::Video {
+                return failure(ErrorCode::Unsupported, "only video wallpapers are currently playable".into());
+            }
+            let targets: Vec<String> = match monitor {
+                Some(name) => match resolve_device(&name, known) {
+                    Some(device) => vec![device],
+                    None => return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'")),
+                },
+                None => known.to_vec(),
+            };
+            if targets.is_empty() {
+                return failure(ErrorCode::NotFound, "no connected monitors are available".into());
+            }
+            let assignment = Assignment {
+                video_path: PathBuf::from(&wallpaper.metadata.source),
+                config: wallpaper.config.clone(),
+            };
+            for device in targets {
+                if let Err(error) = runtime.assign_user(&device, assignment.clone(), manager, now) {
+                    return failure(ErrorCode::RuntimeFailure, format!("could not assign wallpaper to {device}: {error}"));
+                }
+            }
+            Response::Accepted
+        }
+        Command::Pause { monitor } | Command::Resume { monitor } => {
+            let paused = matches!(request.command, Command::Pause { .. });
+            match monitor {
+                Some(name) => match resolve_device(&name, known) {
+                    Some(device) => { runtime.runtime.set_user_paused(Some(&device), paused); }
+                    None => return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'")),
+                },
+                None => { runtime.runtime.set_user_paused(None, paused); }
+            }
+            Response::Accepted
+        }
+        Command::SetVolume { monitor, volume } => {
+            if volume > 100 {
+                return failure(ErrorCode::InvalidRequest, "volume must be between 0 and 100".into());
+            }
+            let targets: Vec<String> = match monitor {
+                Some(name) => match resolve_device(&name, known) {
+                    Some(device) => vec![device],
+                    None => return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'")),
+                },
+                None => known.to_vec(),
+            };
+            for device in targets {
+                let player = match manager.player_mut(&device) {
+                    Some(player) => player,
+                    None => continue,
+                };
+                if let Err(error) = player.set_volume(volume) {
+                    return failure(ErrorCode::RuntimeFailure, format!("volume update failed on {device}: {error}"));
+                }
+            }
+            Response::Accepted
+        }
+        Command::SetMute { monitor, muted } => {
+            let targets: Vec<String> = match monitor {
+                Some(name) => match resolve_device(&name, known) {
+                    Some(device) => vec![device],
+                    None => return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'")),
+                },
+                None => known.to_vec(),
+            };
+            for device in targets {
+                let player = match manager.player_mut(&device) {
+                    Some(player) => player,
+                    None => continue,
+                };
+                if let Err(error) = player.set_mute(muted) {
+                    return failure(ErrorCode::RuntimeFailure, format!("mute update failed on {device}: {error}"));
+                }
+            }
+            Response::Accepted
+        }
+        Command::GetStatus { monitor } => {
+            let selected: Option<String> = match monitor {
+                Some(name) => match resolve_device(&name, known) {
+                    Some(device) => Some(device),
+                    None => return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'")),
+                },
+                None => None,
+            };
+            let states = runtime.runtime.status(known);
+            let players = manager.player_statuses();
+            let mut items = Vec::new();
+            for (device, decoder, state, memory_bytes) in players {
+                if selected.as_ref().is_some_and(|selected| selected != &device) {
+                    continue;
+                }
+                let status = states.iter().find(|status| status.device == device);
+                items.push(PlayerStatusInfo {
+                    monitor: device,
+                    state,
+                    active_decoder: decoder,
+                    memory_bytes,
+                    suspended: status.map(|s| s.suspended).unwrap_or(false),
+                    suspension_reasons: status
+                        .map(|s| s.reasons.iter().map(|reason| reason.as_str().to_string()).collect())
+                        .unwrap_or_default(),
+                });
+            }
+            Response::PlayerStatus(items)
+        }
+        Command::Stop { .. } => {
+            return failure(ErrorCode::Unsupported, "Stop is not exposed until its runtime semantics are defined".into());
+        }
+    };
+
+    let _ = accepted;
+    ResponseEnvelope::new(request_id, result)
 }
