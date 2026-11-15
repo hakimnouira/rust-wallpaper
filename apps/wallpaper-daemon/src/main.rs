@@ -78,12 +78,17 @@ fn main() -> anyhow::Result<()> {
                 windows::Win32::System::Console::SetConsoleCtrlHandler(Some(ctrl_handler), true);
         }
 
-        let local_data = std::env::var_os("LOCALAPPDATA")
-            .context("LOCALAPPDATA is not set; cannot determine application data directory")?;
-        let app_data_dir = PathBuf::from(local_data).join("RustWallpaper");
-        std::fs::create_dir_all(&app_data_dir)
-            .context("failed to create Rust Wallpaper application data directory")?;
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .context("LOCALAPPDATA is not set; cannot locate the Rust Wallpaper data directory")?;
+        let app_data_dir = PathBuf::from(local_app_data).join("RustWallpaper");
+        std::fs::create_dir_all(&app_data_dir).with_context(|| {
+            format!(
+                "failed to create application data directory '{}'",
+                app_data_dir.display()
+            )
+        })?;
         let db_path = app_data_dir.join("library.db");
+        info!(database = %db_path.display(), "Using persistent application database");
         if !db_path.exists() && PathBuf::from("library.db").is_file() {
             std::fs::copy("library.db", &db_path)
                 .context("failed to migrate legacy working-directory library database")?;
