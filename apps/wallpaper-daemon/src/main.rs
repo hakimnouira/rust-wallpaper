@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
 
     let (duration_limit, requested_profile) = parse_cli_args();
     info!("Rust Wallpaper daemon starting");
-    info!(?profile, "RuntimeSupervisor orchestration active");
+    info!(?requested_profile, "RuntimeSupervisor orchestration active");
 
     #[cfg(windows)]
     {
@@ -78,7 +78,16 @@ fn main() -> anyhow::Result<()> {
                 windows::Win32::System::Console::SetConsoleCtrlHandler(Some(ctrl_handler), true);
         }
 
-        let db_path = PathBuf::from("library.db");
+        let local_data = std::env::var_os("LOCALAPPDATA")
+            .context("LOCALAPPDATA is not set; cannot determine application data directory")?;
+        let app_data_dir = PathBuf::from(local_data).join("RustWallpaper");
+        std::fs::create_dir_all(&app_data_dir)
+            .context("failed to create Rust Wallpaper application data directory")?;
+        let db_path = app_data_dir.join("library.db");
+        if !db_path.exists() && PathBuf::from("library.db").is_file() {
+            std::fs::copy("library.db", &db_path)
+                .context("failed to migrate legacy working-directory library database")?;
+        }
         let library = WallpaperLibrary::open(&db_path)
             .context("failed to open or create SQLite wallpaper library")?;
         let saved_profile = library
