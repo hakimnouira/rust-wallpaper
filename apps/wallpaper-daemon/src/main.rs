@@ -580,11 +580,7 @@ fn dispatch_ipc(
 
     let request_id = request.request_id;
     if let Err(error) = request.validate() {
-        return ResponseEnvelope::error(
-            request_id,
-            ErrorCode::ProtocolMismatch,
-            error.to_string(),
-        );
+        return ResponseEnvelope::error(request_id, ErrorCode::ProtocolMismatch, error.to_string());
     }
 
     let failure = |code, message: String| ResponseEnvelope::error(request_id, code, message);
@@ -640,10 +636,7 @@ fn dispatch_ipc(
                 Some(name) => match resolve_device(&name, known) {
                     Some(device) => vec![device],
                     None => {
-                        return failure(
-                            ErrorCode::NotFound,
-                            format!("unknown monitor '{name}'"),
-                        )
+                        return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'"))
                     }
                 },
                 None => known.to_vec(),
@@ -659,9 +652,7 @@ fn dispatch_ipc(
                 config: wallpaper.config.clone(),
             };
             for device in targets {
-                if let Err(error) =
-                    runtime.assign_user(&device, assignment.clone(), manager, now)
-                {
+                if let Err(error) = runtime.assign_user(&device, assignment.clone(), manager, now) {
                     return failure(
                         ErrorCode::RuntimeFailure,
                         format!("could not assign wallpaper to {device}: {error}"),
