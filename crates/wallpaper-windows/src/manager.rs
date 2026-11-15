@@ -980,7 +980,6 @@ impl WallpaperManager {
     }
 }
 
-
 impl wallpaper_core::monitors::WallpaperHost for WallpaperManager {
     fn start_wallpaper(
         &mut self,
