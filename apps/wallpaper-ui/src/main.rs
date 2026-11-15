@@ -10,7 +10,7 @@ mod desktop {
     use std::time::{Duration, Instant};
     use tokio::runtime::Builder;
     use tokio::time::timeout;
-    use wallpaper_core::{Wallpaper, WallpaperId};
+    use wallpaper_core::{PerformanceProfile, Wallpaper, WallpaperId};
     use wallpaper_protocol::client::IpcClient;
     use wallpaper_protocol::{Command, MonitorInfo, PlayerStatusInfo, RequestEnvelope, Response};
 
@@ -39,6 +39,7 @@ mod desktop {
         import_path: String,
         import_title: String,
         search: String,
+        profile: PerformanceProfile,
         notice: String,
     }
 
@@ -53,6 +54,7 @@ mod desktop {
                 import_path: String::new(),
                 import_title: String::new(),
                 search: String::new(),
+                profile: PerformanceProfile::Balanced,
                 notice: "Connect to the wallpaper daemon to get started.".into(),
             }
         }
@@ -299,6 +301,23 @@ mod desktop {
             if let Some(error) = &snapshot.last_error {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
+            ui.separator();
+            ui.label("Performance profile");
+            ui.horizontal(|ui| {
+                for (profile, label) in [
+                    (PerformanceProfile::Eco, "Eco"),
+                    (PerformanceProfile::Balanced, "Balanced"),
+                    (PerformanceProfile::Performance, "Performance"),
+                ] {
+                    if ui.selectable_label(self.profile == profile, label).clicked() {
+                        self.profile = profile;
+                        self.send(
+                            Command::SetProfile { profile },
+                            "Performance profile updated…",
+                        );
+                    }
+                }
+            });
             ui.separator();
             ui.label("Current implementation");
             ui.label(
