@@ -8,7 +8,7 @@ pub mod client;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use uuid::Uuid;
-use wallpaper_core::{PlaybackState, Wallpaper, WallpaperId};
+use wallpaper_core::{PerformanceProfile, PlaybackState, Wallpaper, WallpaperId};
 
 /// Increment when an incompatible wire-contract change is made.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -55,6 +55,9 @@ pub enum Command {
     },
     RemoveWallpaper {
         wallpaper_id: WallpaperId,
+    },
+    SetProfile {
+        profile: PerformanceProfile,
     },
     ApplyWallpaper {
         wallpaper_id: WallpaperId,
