@@ -764,6 +764,7 @@ mod windows_integration_tests {
     use super::platform::*;
     use super::*;
     use std::time::Duration;
+    use wallpaper_core::registration::{EventSource, RegistrationState};
     use windows::core::w;
     use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -802,6 +803,20 @@ mod windows_integration_tests {
             WM_POWERBROADCAST,
             PBT_POWERSETTINGCHANGE,
             &msg as *const DisplayStateMessage as isize,
+        );
+    }
+
+    #[test]
+    fn registration_report_marks_window_backed_sources_active() {
+        let listener = SystemEventListener::start().unwrap();
+        let report = listener.registration_report();
+        assert_eq!(
+            report.state(EventSource::SuspendResume),
+            &RegistrationState::Active
+        );
+        assert_eq!(
+            report.state(EventSource::DisplayTopology),
+            &RegistrationState::Active
         );
     }
 
