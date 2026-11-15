@@ -247,7 +247,7 @@ mod desktop {
                     (monitor.height as f32 * scale).max(24.0),
                 );
                 let monitor_rect = egui::Rect::from_min_size(position, size);
-                let selected = self.selected_monitor.as_deref() == Some(&monitor.device_name);
+                let selected = self.selected_monitor.as_deref() == Some(monitor.device_name.as_str());
                 let fill = if selected {
                     egui::Color32::from_rgb(54, 105, 154)
                 } else if monitor.is_primary {
