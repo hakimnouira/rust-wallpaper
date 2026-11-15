@@ -27,14 +27,14 @@
 //! exact repeats. Consumers must still treat events idempotently.
 
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
+use wallpaper_core::registration::{RegistrationReport, RegistrationTracker};
 use wallpaper_core::runtime::RuntimeEvent;
 
 #[cfg(windows)]
 use std::sync::atomic::{AtomicIsize, Ordering};
 #[cfg(windows)]
 use std::sync::mpsc::Sender;
-#[cfg(windows)]
-use std::sync::Arc;
 #[cfg(windows)]
 use tracing::{debug, error, info};
 
@@ -88,6 +88,7 @@ pub struct SystemEventListener {
     hwnd_val: Arc<AtomicIsize>,
     #[cfg(not(windows))]
     _keepalive: std::sync::mpsc::Sender<SystemPlatformEvent>,
+    registration_report: Arc<Mutex<RegistrationReport>>,
 }
 
 impl SystemEventListener {
@@ -100,12 +101,14 @@ impl SystemEventListener {
         {
             let hwnd_val = Arc::new(AtomicIsize::new(0));
             let hwnd_clone = Arc::clone(&hwnd_val);
+            let registration_report = Arc::new(Mutex::new(RegistrationReport::default()));
+            let report_clone = Arc::clone(&registration_report);
             let (init_tx, init_rx) = channel();
 
             let handle = std::thread::Builder::new()
                 .name("sys-event-listener".to_string())
                 .spawn(move || {
-                    platform::run_notification_thread(tx, hwnd_clone, init_tx);
+                    platform::run_notification_thread(tx, hwnd_clone, init_tx, report_clone);
                 })
                 .map_err(|e| format!("Failed to spawn notification thread: {}", e))?;
 
@@ -114,6 +117,7 @@ impl SystemEventListener {
                     rx,
                     thread_handle: Some(handle),
                     hwnd_val,
+                    registration_report,
                 }),
                 Ok(Err(e)) => {
                     let _ = handle.join();
@@ -131,8 +135,20 @@ impl SystemEventListener {
 
         #[cfg(not(windows))]
         {
-            Ok(Self { rx, _keepalive: tx })
+            Ok(Self {
+                rx,
+                _keepalive: tx,
+                registration_report: Arc::new(Mutex::new(RegistrationReport::default())),
+            })
         }
+    }
+
+    /// Snapshot of the actual Win32 notification coverage and any pending registration retries.
+    pub fn registration_report(&self) -> RegistrationReport {
+        self.registration_report
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Polls without blocking, distinguishing "nothing yet" from "listener died".
