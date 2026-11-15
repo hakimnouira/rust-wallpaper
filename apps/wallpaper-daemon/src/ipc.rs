@@ -51,7 +51,7 @@ async fn listener_loop(tx: SyncSender<PendingRequest>) {
         options.first_pipe_instance(first_instance);
         options.max_instances(16);
         options.reject_remote_clients(true);
-        let mut server = match options.create(PIPE_NAME) {
+        let server = match options.create(PIPE_NAME) {
             Ok(server) => server,
             Err(error) => {
                 tracing::warn!(%error, "Could not create IPC named pipe; retrying");
