@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - agent/runtime-completion
+      - work/application-platform
   pull_request:
     branches:
       - main
