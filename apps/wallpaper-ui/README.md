@@ -9,6 +9,8 @@ The native Windows control panel for Rust Wallpaper.
 - Select a monitor and assign a wallpaper.
 - Pause or resume individual displays or all displays.
 - Display monitor geometry, player state and daemon connection health.
+- Visualize monitor topology and select a target display by clicking its screen.
+- Adjust volume and mute independently for each monitor.
 
 The UI is a client only. It does not create Win32 wallpaper windows, start MPV, or access the SQLite database directly. All operations go through `wallpaper-protocol` and the daemon.
 
