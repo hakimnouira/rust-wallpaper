@@ -227,6 +227,24 @@ mod tests {
     }
 
     #[test]
+    fn library_mutation_commands_round_trip() {
+        let import = RequestEnvelope::new(Command::ImportWallpaper {
+            path: r"C:\\Wallpapers\\demo.mp4".into(),
+            title: Some("Demo".into()),
+        });
+        let encoded = serde_json::to_vec(&import).unwrap();
+        let decoded: RequestEnvelope = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, import);
+
+        let remove = RequestEnvelope::new(Command::RemoveWallpaper {
+            wallpaper_id: WallpaperId::new(),
+        });
+        let encoded = serde_json::to_vec(&remove).unwrap();
+        let decoded: RequestEnvelope = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, remove);
+    }
+
+    #[test]
     fn version_mismatch_is_reported() {
         let mut request = RequestEnvelope::new(Command::Ping);
         request.protocol_version = PROTOCOL_VERSION + 1;
