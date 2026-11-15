@@ -293,25 +293,23 @@ fn main() -> anyhow::Result<()> {
 
             if now.saturating_duration_since(last_telemetry) >= Duration::from_secs(2) {
                 last_telemetry = now;
-                for telem in manager.collect_telemetry() {
+                // Keep the daemon loop non-blocking: detailed MPV telemetry performs several
+                // synchronous IPC requests. The fast status snapshot uses cached process data.
+                for (device, decoder, state, memory_bytes) in manager.player_statuses() {
                     let reasons: Vec<&str> = runtime
                         .runtime
                         .suspension()
-                        .active_reasons_for(&telem.device_name)
+                        .active_reasons_for(&device)
                         .into_iter()
                         .map(|r| r.as_str())
                         .collect();
                     info!(
-                        device = %telem.device_name,
-                        active_decoder = %telem.active_decoder,
-                        state = ?telem.state,
+                        device = %device,
+                        active_decoder = %decoder,
+                        state = ?state,
                         suspension_reasons = ?reasons,
-                        memory_mb = telem.memory_working_set_bytes / (1024 * 1024),
-                        uptime_s = telem.uptime_secs,
-                        gpu_context = ?telem.gpu_context,
-                        resolution = format_args!("{}x{}", telem.video_width.unwrap_or(0), telem.video_height.unwrap_or(0)),
-                        fps = telem.video_fps.unwrap_or(0.0),
-                        "Player telemetry"
+                        memory_mb = memory_bytes / (1024 * 1024),
+                        "Player status"
                     );
                 }
             }
