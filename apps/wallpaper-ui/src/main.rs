@@ -309,7 +309,10 @@ mod desktop {
                     (PerformanceProfile::Balanced, "Balanced"),
                     (PerformanceProfile::Performance, "Performance"),
                 ] {
-                    if ui.selectable_label(snapshot.profile == profile, label).clicked() {
+                    if ui
+                        .selectable_label(snapshot.profile == profile, label)
+                        .clicked()
+                    {
                         self.send(
                             Command::SetProfile { profile },
                             "Performance profile updated…",
