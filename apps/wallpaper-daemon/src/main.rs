@@ -75,7 +75,17 @@ fn main() -> anyhow::Result<()> {
                 windows::Win32::System::Console::SetConsoleCtrlHandler(Some(ctrl_handler), true);
         }
 
-        let db_path = PathBuf::from("library.db");
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .context("LOCALAPPDATA is not set; cannot locate the Rust Wallpaper data directory")?;
+        let app_data_dir = PathBuf::from(local_app_data).join("RustWallpaper");
+        std::fs::create_dir_all(&app_data_dir).with_context(|| {
+            format!(
+                "failed to create application data directory '{}'",
+                app_data_dir.display()
+            )
+        })?;
+        let db_path = app_data_dir.join("library.db");
+        info!(database = %db_path.display(), "Using persistent application database");
         let library = WallpaperLibrary::open(&db_path)
             .context("failed to open or create SQLite wallpaper library")?;
 
