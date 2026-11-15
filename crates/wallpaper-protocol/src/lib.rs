@@ -157,7 +157,7 @@ pub fn read_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, ProtocolError> {
         match reader.read(&mut byte)? {
             0 if frame.is_empty() => return Err(ProtocolError::UnexpectedEof),
             0 => return Err(ProtocolError::UnexpectedEof),
-            _ if byte[0] == b'\\n' => return Ok(frame),
+            _ if byte[0] == b'\n' => return Ok(frame),
             _ => {
                 if frame.len() == MAX_FRAME_BYTES {
                     return Err(ProtocolError::FrameTooLarge);
@@ -182,7 +182,7 @@ pub fn write_response<W: Write>(
         return Err(ProtocolError::FrameTooLarge);
     }
     writer.write_all(&encoded)?;
-    writer.write_all(b"\\n")?;
+    writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
 }
@@ -213,7 +213,7 @@ mod tests {
 
     #[test]
     fn bounded_frame_reader_accepts_one_line() {
-        let mut input = Cursor::new(b"{\\\"ok\\\":true}\\nnext".to_vec());
+        let mut input = Cursor::new(b"{\"ok\":true}\nnext".to_vec());
         assert_eq!(read_frame(&mut input).unwrap(), br#"{"ok":true}"#);
     }
 
@@ -232,7 +232,7 @@ mod tests {
         let response = ResponseEnvelope::new(request_id, Response::Pong);
         let mut output = Vec::new();
         write_response(&mut output, &response).unwrap();
-        assert_eq!(output.last(), Some(&b'\\n'));
+        assert_eq!(output.last(), Some(&b'\n'));
         let decoded: ResponseEnvelope =
             serde_json::from_slice(&output[..output.len() - 1]).unwrap();
         assert_eq!(decoded, response);
