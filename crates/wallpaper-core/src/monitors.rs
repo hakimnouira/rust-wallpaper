@@ -224,7 +224,10 @@ impl SqliteAssignmentStore {
             "volume",
             "hwdec",
         ];
-        if required.iter().all(|column| legacy_columns.iter().any(|c| c == column)) {
+        if required
+            .iter()
+            .all(|column| legacy_columns.iter().any(|c| c == column))
+        {
             conn.execute(
                 "INSERT OR IGNORE INTO runtime_monitor_assignments
                     (monitor_id, video_path, loop_playback, mute, volume, hwdec)
@@ -1210,7 +1213,9 @@ mod tests {
         let library = crate::WallpaperLibrary::open(&path).unwrap();
 
         let mut store = SqliteAssignmentStore::open(&path).unwrap();
-        store.upsert(&MonitorId::new("hw:shared"), &a("shared.mp4")).unwrap();
+        store
+            .upsert(&MonitorId::new("hw:shared"), &a("shared.mp4"))
+            .unwrap();
         let rows = store.load_all().unwrap();
 
         assert_eq!(rows.len(), 1);
