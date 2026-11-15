@@ -673,10 +673,7 @@ fn dispatch_ipc(
                         runtime.runtime.set_user_paused(Some(&device), paused);
                     }
                     None => {
-                        return failure(
-                            ErrorCode::NotFound,
-                            format!("unknown monitor '{name}'"),
-                        )
+                        return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'"))
                     }
                 },
                 None => {
