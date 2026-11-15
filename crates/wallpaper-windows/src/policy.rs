@@ -1,74 +1,49 @@
-//! Playback supervisor managing debounced policy evaluations, system power/session events,
-//! and process crash recovery with exponential backoff.
+//! Runtime playback policy: re-exports the platform-independent decision engine from
+//! `wallpaper-core`, adapts [`WallpaperManager`] to it, and hosts process-crash backoff.
+//!
+//! The decision logic itself (suspension reasons, debouncing, reconciliation) lives in
+//! [`wallpaper_core::runtime`] so it is unit-testable on any host. This module deliberately
+//! contains no MPV or Win32 details: policy decisions stay separate from player mechanics.
 
-use std::collections::HashMap;
+use crate::manager::WallpaperManager;
 use std::time::{Duration, Instant};
-use tracing::info;
-use wallpaper_core::{PerformanceProfile, PlaybackPolicy, SuspensionFlags, SuspensionReason};
+use wallpaper_core::PlaybackState;
 
-/// Per-player runtime suspension manager tracking multiple independent suspension reasons.
-#[derive(Debug, Clone, Default)]
-pub struct PlayerSuspensionManager {
-    monitors: HashMap<String, SuspensionFlags>,
-    global_flags: SuspensionFlags,
-}
+pub use wallpaper_core::runtime::{
+    ActualPlayback, ControlCommand, ForegroundObservation, MonitorStatus, PendingWork,
+    PlaybackSink, PlayerCommand, PlayerSuspensionManager, RuntimeEvent, StateDebouncer,
+};
 
-impl PlayerSuspensionManager {
-    pub fn new() -> Self {
-        Self {
-            monitors: HashMap::new(),
-            global_flags: SuspensionFlags::new(),
-        }
+/// The playback supervisor: authoritative runtime state machine owning the
+/// [`PlayerSuspensionManager`], debouncers and the reconciler.
+pub use wallpaper_core::runtime::RuntimeState as PlaybackSupervisor;
+
+/// Lets the reconciler drive the real manager. Carries out commands and reports state;
+/// it decides nothing. Uses only the manager's per-monitor API, never `pause_all` /
+/// `resume_all`, so one monitor's reasons can never override another's.
+impl PlaybackSink for WallpaperManager {
+    fn player_states(&self) -> Vec<(String, ActualPlayback)> {
+        self.player_statuses()
+            .into_iter()
+            .map(|(device, _decoder, state, _memory)| {
+                let actual = match state {
+                    PlaybackState::Playing => ActualPlayback::Playing,
+                    PlaybackState::Paused => ActualPlayback::Paused,
+                    PlaybackState::Starting | PlaybackState::Stopped | PlaybackState::Failed => {
+                        ActualPlayback::Unavailable
+                    }
+                };
+                (device, actual)
+            })
+            .collect()
     }
 
-    /// Adds a global suspension reason affecting all monitors.
-    pub fn add_global(&mut self, reason: SuspensionReason) {
-        self.global_flags.add(reason);
+    fn pause_player(&mut self, device: &str) {
+        self.pause_monitor(device);
     }
 
-    /// Removes a global suspension reason.
-    pub fn remove_global(&mut self, reason: SuspensionReason) {
-        self.global_flags.remove(reason);
-    }
-
-    /// Adds a per-monitor suspension reason (e.g. UserPaused on DISPLAY1).
-    pub fn add_monitor(&mut self, device: &str, reason: SuspensionReason) {
-        self.monitors
-            .entry(device.to_string())
-            .or_default()
-            .add(reason);
-    }
-
-    /// Removes a per-monitor suspension reason.
-    pub fn remove_monitor(&mut self, device: &str, reason: SuspensionReason) {
-        if let Some(flags) = self.monitors.get_mut(device) {
-            flags.remove(reason);
-        }
-    }
-
-    /// Checks if a monitor should be suspended.
-    /// Returns true if either global suspension flags or monitor-specific flags are active.
-    pub fn should_suspend(&self, device: &str) -> bool {
-        if self.global_flags.is_suspended() {
-            return true;
-        }
-        if let Some(flags) = self.monitors.get(device) {
-            return flags.is_suspended();
-        }
-        false
-    }
-
-    /// Returns all active reasons for a monitor (combines global and per-monitor).
-    pub fn active_reasons_for(&self, device: &str) -> Vec<SuspensionReason> {
-        let mut reasons = self.global_flags.active_reasons();
-        if let Some(flags) = self.monitors.get(device) {
-            for r in flags.active_reasons() {
-                if !reasons.contains(&r) {
-                    reasons.push(r);
-                }
-            }
-        }
-        reasons
+    fn resume_player(&mut self, device: &str) {
+        self.resume_monitor(device);
     }
 }
 
@@ -145,107 +120,6 @@ impl ProcessBackoff {
     }
 }
 
-/// Debouncer to prevent rapid oscillation of pause / resume states
-/// (e.g. while launching or alt-tabbing between applications).
-#[derive(Debug, Clone)]
-pub struct StateDebouncer {
-    target_state: bool,
-    current_state: bool,
-    last_change_intent: Instant,
-    debounce_duration: Duration,
-}
-
-impl StateDebouncer {
-    pub fn new(initial_state: bool, debounce_duration: Duration) -> Self {
-        Self {
-            target_state: initial_state,
-            current_state: initial_state,
-            last_change_intent: Instant::now(),
-            debounce_duration,
-        }
-    }
-
-    pub fn set_debounce_duration(&mut self, dur: Duration) {
-        self.debounce_duration = dur;
-    }
-
-    /// Submits a requested state (e.g. `should_pause`).
-    /// Returns `Some(new_state)` if the state change has stabilized for `debounce_duration`,
-    /// or `None` if debounce is in progress or state hasn't changed.
-    pub fn update(&mut self, requested_state: bool) -> Option<bool> {
-        if requested_state != self.target_state {
-            self.target_state = requested_state;
-            self.last_change_intent = Instant::now();
-        }
-
-        if self.target_state != self.current_state {
-            if self.last_change_intent.elapsed() >= self.debounce_duration {
-                self.current_state = self.target_state;
-                return Some(self.current_state);
-            }
-        }
-
-        None
-    }
-
-    pub fn current_state(&self) -> bool {
-        self.current_state
-    }
-}
-
-/// Central supervisor coordinating playback policies, debouncing, session state, and recovery.
-pub struct PlaybackSupervisor {
-    pub policy: PlaybackPolicy,
-    pub debouncer: StateDebouncer,
-    pub suspension: PlayerSuspensionManager,
-    pub session_locked: bool,
-    pub display_off: bool,
-    pub active_pause_reason: Option<&'static str>,
-}
-
-impl PlaybackSupervisor {
-    pub fn new(policy: PlaybackPolicy) -> Self {
-        let debouncer = StateDebouncer::new(false, Duration::from_millis(policy.debounce_millis));
-        Self {
-            policy,
-            debouncer,
-            suspension: PlayerSuspensionManager::new(),
-            session_locked: false,
-            display_off: false,
-            active_pause_reason: None,
-        }
-    }
-
-    pub fn set_profile(&mut self, profile: PerformanceProfile) {
-        self.policy = PlaybackPolicy::for_profile(profile);
-        self.debouncer
-            .set_debounce_duration(Duration::from_millis(self.policy.debounce_millis));
-        info!(?profile, "Switched runtime performance profile");
-    }
-
-    /// Evaluates current state against policy and updates the debouncer.
-    ///
-    /// Returns `Some(true)` if playback should transition to paused,
-    /// `Some(false)` if playback should transition to active/playing,
-    /// or `None` if no transition is needed.
-    pub fn evaluate_and_debounce(&mut self, is_fullscreen: bool, is_game: bool) -> Option<bool> {
-        let (raw_should_pause, reason) = self.policy.evaluate(
-            is_fullscreen,
-            is_game,
-            self.session_locked,
-            self.display_off,
-        );
-
-        if raw_should_pause {
-            self.active_pause_reason = reason;
-        } else if self.debouncer.target_state {
-            self.active_pause_reason = None;
-        }
-
-        self.debouncer.update(raw_should_pause)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,41 +156,33 @@ mod tests {
 
     #[test]
     fn test_player_suspension_manager_coexistence() {
+        use wallpaper_core::SuspensionReason;
         let mut mgr = PlayerSuspensionManager::new();
         assert!(!mgr.should_suspend(r"\\.\DISPLAY1"));
-        assert!(!mgr.should_suspend(r"\\.\DISPLAY2"));
 
-        // Global lock event
         mgr.add_global(SuspensionReason::SessionLocked);
-        assert!(mgr.should_suspend(r"\\.\DISPLAY1"));
-        assert!(mgr.should_suspend(r"\\.\DISPLAY2"));
-
-        // User manually pauses DISPLAY1 while locked
         mgr.add_monitor(r"\\.\DISPLAY1", SuspensionReason::UserPaused);
-        assert!(mgr.should_suspend(r"\\.\DISPLAY1"));
-
-        // Session unlocks
         mgr.remove_global(SuspensionReason::SessionLocked);
-        // DISPLAY1 must remain suspended because of UserPaused!
+
+        // DISPLAY1 must remain suspended because of UserPaused; DISPLAY2 resumes.
         assert!(mgr.should_suspend(r"\\.\DISPLAY1"));
-        // DISPLAY2 resumes!
         assert!(!mgr.should_suspend(r"\\.\DISPLAY2"));
 
-        // User resumes DISPLAY1
         mgr.remove_monitor(r"\\.\DISPLAY1", SuspensionReason::UserPaused);
         assert!(!mgr.should_suspend(r"\\.\DISPLAY1"));
     }
 
     #[test]
     fn test_state_debouncer_filtering() {
+        let t0 = Instant::now();
         let mut debouncer = StateDebouncer::new(false, Duration::from_millis(50));
 
-        // Rapid flickering should not trigger transition immediately
-        assert_eq!(debouncer.update(true), None);
-        assert_eq!(debouncer.current_state(), false);
-
-        std::thread::sleep(Duration::from_millis(60));
-        assert_eq!(debouncer.update(true), Some(true));
-        assert_eq!(debouncer.current_state(), true);
+        assert_eq!(debouncer.update_at(true, t0), None);
+        assert!(!debouncer.current_state());
+        assert_eq!(
+            debouncer.update_at(true, t0 + Duration::from_millis(60)),
+            Some(true)
+        );
+        assert!(debouncer.current_state());
     }
 }

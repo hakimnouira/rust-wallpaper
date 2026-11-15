@@ -1,89 +1,191 @@
 //! Windows system event notification listener.
 //!
 //! Listens for:
-//! 1. Session lock and unlock events (`WTSRegisterSessionNotification` / `WM_WTSSESSION_CHANGE`)
-//! 2. Display power states (`RegisterPowerSettingNotification` with `GUID_CONSOLE_DISPLAY_STATE`)
-//! 3. Display topology and resolution changes (`WM_DISPLAYCHANGE`)
-//! 4. Windows Explorer restart events (`RegisterWindowMessageW("TaskbarCreated")`)
+//! 1. Session lock and unlock (`WTSRegisterSessionNotification` / `WM_WTSSESSION_CHANGE`)
+//! 2. Display power state (`RegisterPowerSettingNotification` with `GUID_CONSOLE_DISPLAY_STATE`)
+//! 3. System suspend / resume (`WM_POWERBROADCAST`: `PBT_APMSUSPEND`, `PBT_APMRESUME*`)
+//! 4. Display topology and resolution changes (`WM_DISPLAYCHANGE`)
+//! 5. Windows Explorer restarts (the registered `TaskbarCreated` broadcast)
 //!
-//! Runs on a dedicated background thread with a Win32 message-only window (`HWND_MESSAGE`),
-//! forwarding typed notifications over an unbounded channel to decouple platform message handling
-//! from the wallpaper engine loop.
+//! # Threading
+//!
+//! The listener owns a dedicated thread with a hidden window and its own message loop. It
+//! only pushes small values into a channel: it never touches players and never waits on MPV
+//! IPC, so a slow player can never delay (or lose) a system notification.
+//!
+//! # Why a hidden *top-level* window and not `HWND_MESSAGE`
+//!
+//! `WM_DISPLAYCHANGE` and `TaskbarCreated` are *broadcast* messages. Message-only windows do
+//! not receive broadcasts, so with a message-only window topology changes and Explorer
+//! restarts would silently never arrive. The window here is an invisible, non-activating tool
+//! window: it receives broadcasts but is never shown, never in the taskbar, never focused.
+//!
+//! # Duplicate suppression
+//!
+//! Windows re-delivers state (e.g. `PBT_APMRESUMEAUTOMATIC` and `PBT_APMRESUMESUSPEND` on the
+//! same wake). The listener remembers the last value emitted per state-like event and drops
+//! exact repeats. Consumers must still treat events idempotently.
 
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::{Arc, Mutex};
+use wallpaper_core::registration::RegistrationReport;
+#[cfg(windows)]
+use wallpaper_core::registration::{EventSource, RegistrationTracker, RetryDecision, RetryPolicy};
+use wallpaper_core::runtime::RuntimeEvent;
+
+#[cfg(windows)]
 use std::sync::atomic::{AtomicIsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
-use tracing::{debug, error, info};
+#[cfg(windows)]
+use std::sync::mpsc::Sender;
+#[cfg(windows)]
+use tracing::{debug, error, info, warn};
 
 /// Events emitted by the Windows system notification listener.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemPlatformEvent {
-    /// Workstation has been locked.
     SessionLocked,
-    /// Workstation has been unlocked.
     SessionUnlocked,
-    /// Monitor display powered off or entering low-power standby.
     DisplayPowerOff,
-    /// Monitor display powered on or active.
     DisplayPowerOn,
-    /// Display resolution, topology, or orientation changed.
+    /// System is about to suspend (sleep / hibernate).
+    SystemSuspend,
+    /// System resumed from suspend.
+    SystemResume,
     DisplayTopologyChanged,
-    /// Windows Explorer process restarted (taskbar recreated).
     ExplorerRestarted,
 }
 
-/// Handle to the system event listener. Drops stop the listener thread and clean up Win32 registrations.
+impl From<SystemPlatformEvent> for RuntimeEvent {
+    fn from(event: SystemPlatformEvent) -> Self {
+        match event {
+            SystemPlatformEvent::SessionLocked => RuntimeEvent::SessionLocked,
+            SystemPlatformEvent::SessionUnlocked => RuntimeEvent::SessionUnlocked,
+            SystemPlatformEvent::DisplayPowerOff => RuntimeEvent::DisplayPowerOff,
+            SystemPlatformEvent::DisplayPowerOn => RuntimeEvent::DisplayPowerOn,
+            SystemPlatformEvent::SystemSuspend => RuntimeEvent::SystemSuspend,
+            SystemPlatformEvent::SystemResume => RuntimeEvent::SystemResume,
+            SystemPlatformEvent::DisplayTopologyChanged => RuntimeEvent::DisplayTopologyChanged,
+            SystemPlatformEvent::ExplorerRestarted => RuntimeEvent::ExplorerRestarted,
+        }
+    }
+}
+
+/// Result of polling the listener.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerPoll {
+    Event(SystemPlatformEvent),
+    /// Nothing pending; the listener is healthy.
+    Empty,
+    /// The listener thread has exited (panic or failure). The owner should restart it.
+    Disconnected,
+}
+
+/// Handle to the system event listener. Dropping it stops the thread and removes every Win32
+/// registration (session notification, power-setting notification, window, window class).
 pub struct SystemEventListener {
     rx: Receiver<SystemPlatformEvent>,
     #[cfg(windows)]
     thread_handle: Option<std::thread::JoinHandle<()>>,
     #[cfg(windows)]
     hwnd_val: Arc<AtomicIsize>,
+    #[cfg(not(windows))]
+    _keepalive: std::sync::mpsc::Sender<SystemPlatformEvent>,
+    registration_report: Arc<Mutex<RegistrationReport>>,
 }
 
 impl SystemEventListener {
     /// Creates and starts the background Windows system event listener.
     pub fn start() -> Result<Self, String> {
+        #[allow(unused_variables)]
         let (tx, rx) = channel();
 
         #[cfg(windows)]
         {
             let hwnd_val = Arc::new(AtomicIsize::new(0));
             let hwnd_clone = Arc::clone(&hwnd_val);
-
+            let registration_report = Arc::new(Mutex::new(RegistrationReport::default()));
+            let report_clone = Arc::clone(&registration_report);
             let (init_tx, init_rx) = channel();
 
             let handle = std::thread::Builder::new()
                 .name("sys-event-listener".to_string())
                 .spawn(move || {
-                    platform::run_notification_thread(tx, hwnd_clone, init_tx);
+                    platform::run_notification_thread(tx, hwnd_clone, init_tx, report_clone);
                 })
                 .map_err(|e| format!("Failed to spawn notification thread: {}", e))?;
 
-            // Await initialization of message window
             match init_rx.recv() {
                 Ok(Ok(())) => Ok(Self {
                     rx,
                     thread_handle: Some(handle),
                     hwnd_val,
+                    registration_report,
                 }),
-                Ok(Err(e)) => Err(e),
-                Err(e) => Err(format!(
-                    "Notification thread initialization channel closed: {}",
-                    e
-                )),
+                Ok(Err(e)) => {
+                    let _ = handle.join();
+                    Err(e)
+                }
+                Err(e) => {
+                    let _ = handle.join();
+                    Err(format!(
+                        "Notification thread initialization channel closed: {}",
+                        e
+                    ))
+                }
             }
         }
 
         #[cfg(not(windows))]
         {
-            Ok(Self { rx })
+            Ok(Self {
+                rx,
+                _keepalive: tx,
+                registration_report: Arc::new(Mutex::new(RegistrationReport::default())),
+            })
+        }
+    }
+
+    /// Snapshot of the actual Win32 notification coverage and any pending registration retries.
+    pub fn registration_report(&self) -> RegistrationReport {
+        self.registration_report
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Polls without blocking, distinguishing "nothing yet" from "listener died".
+    pub fn poll(&self) -> ListenerPoll {
+        match self.rx.try_recv() {
+            Ok(event) => ListenerPoll::Event(event),
+            Err(TryRecvError::Empty) => ListenerPoll::Empty,
+            Err(TryRecvError::Disconnected) => ListenerPoll::Disconnected,
         }
     }
 
     /// Try to receive a pending system event without blocking.
     pub fn try_recv(&self) -> Option<SystemPlatformEvent> {
-        self.rx.try_recv().ok()
+        match self.poll() {
+            ListenerPoll::Event(event) => Some(event),
+            _ => None,
+        }
+    }
+
+    /// Drains every pending event in arrival order. Returns `(events, still_alive)`.
+    pub fn drain(&self) -> (Vec<SystemPlatformEvent>, bool) {
+        let mut events = Vec::new();
+        loop {
+            match self.poll() {
+                ListenerPoll::Event(event) => events.push(event),
+                ListenerPoll::Empty => return (events, true),
+                ListenerPoll::Disconnected => return (events, false),
+            }
+        }
+    }
+
+    /// Raw handle of the hidden window, for tests that inject window messages.
+    #[cfg(all(windows, test))]
+    fn window_handle_for_test(&self) -> isize {
+        self.hwnd_val.load(Ordering::SeqCst)
     }
 }
 
@@ -95,12 +197,12 @@ impl Drop for SystemEventListener {
 
         let val = self.hwnd_val.load(Ordering::SeqCst);
         if val != 0 {
+            // PostMessage is safe from any thread; the listener thread destroys its own window.
             unsafe {
                 let hwnd = HWND(val as *mut core::ffi::c_void);
                 let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
             }
         }
-
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
         }
@@ -110,9 +212,10 @@ impl Drop for SystemEventListener {
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::time::Instant;
     use windows::core::{w, PCWSTR};
-    use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::System::Power::{
         RegisterPowerSettingNotification, UnregisterPowerSettingNotification, HPOWERNOTIFY,
@@ -122,36 +225,230 @@ mod platform {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-        GetWindowLongPtrW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
-        SetWindowLongPtrW, GWLP_USERDATA, MSG, REGISTER_NOTIFICATION_FLAGS, WM_CLOSE, WM_DESTROY,
-        WM_DISPLAYCHANGE, WM_POWERBROADCAST, WNDCLASSEXW,
+        GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+        SetTimer, SetWindowLongPtrW, UnregisterClassW, GWLP_USERDATA, HMENU, MSG,
+        REGISTER_NOTIFICATION_FLAGS, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_POWERBROADCAST,
+        WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
-    // Windows Message Constants
-    const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
-    const WTS_SESSION_LOCK: usize = 0x7;
-    const WTS_SESSION_UNLOCK: usize = 0x8;
-    const PBT_POWERSETTINGCHANGE: usize = 0x8013;
+    // Values verified against the `windows` crate's generated Win32 metadata.
+    pub(super) const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+    pub(super) const WTS_SESSION_LOCK: usize = 0x7;
+    pub(super) const WTS_SESSION_UNLOCK: usize = 0x8;
+    pub(super) const PBT_APMSUSPEND: usize = 0x0004;
+    pub(super) const PBT_APMRESUMECRITICAL: usize = 0x0006;
+    pub(super) const PBT_APMRESUMESUSPEND: usize = 0x0007;
+    pub(super) const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+    pub(super) const PBT_POWERSETTINGCHANGE: usize = 0x8013;
 
-    // GUID_CONSOLE_DISPLAY_STATE: {0017f640-c327-4330-834c-223f23c5b20d}
-    const GUID_CONSOLE_DISPLAY_STATE: windows::core::GUID =
-        windows::core::GUID::from_u128(0x0017f640_c327_4330_834c_223f23c5b20d);
+    /// `GUID_CONSOLE_DISPLAY_STATE` = {6fe69556-704a-47a0-8f24-c28d936fda47}.
+    ///
+    /// NOTE: earlier revisions used {0017f640-c327-4330-834c-223f23c5b20d}, which is not a
+    /// Windows power-setting GUID. Registering for an unknown GUID succeeds but never fires,
+    /// so display power events were never delivered.
+    pub(super) const GUID_CONSOLE_DISPLAY_STATE: windows::core::GUID =
+        windows::core::GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
 
+    /// Layout of `POWERBROADCAST_SETTING` (`data` is a variable-length tail).
     #[repr(C)]
-    struct POWERBROADCAST_SETTING {
-        power_setting: windows::core::GUID,
-        data_length: u32,
-        data: [u8; 1],
+    pub(super) struct PowerBroadcastSetting {
+        pub power_setting: windows::core::GUID,
+        pub data_length: u32,
+        pub data: [u8; 1],
     }
+
+    const REGISTRATION_TIMER_ID: usize = 0x5257;
+    const REGISTRATION_TIMER_MS: u32 = 250;
 
     struct ListenerState {
         tx: Sender<SystemPlatformEvent>,
         taskbar_created_msg: u32,
         power_notify_handle: Option<HPOWERNOTIFY>,
+        wts_registered: bool,
+        registration: RegistrationTracker,
+        registration_report: Arc<Mutex<RegistrationReport>>,
+        last_locked: Option<bool>,
+        last_display_on: Option<bool>,
+        last_suspended: Option<bool>,
+    }
+
+    impl ListenerState {
+        fn emit(&self, event: SystemPlatformEvent) {
+            if self.tx.send(event).is_err() {
+                debug!(?event, "Event receiver dropped; discarding event");
+            }
+        }
+
+        fn set_locked(&mut self, locked: bool) {
+            if self.last_locked == Some(locked) {
+                debug!(locked, "Duplicate session lock state suppressed");
+                return;
+            }
+            self.last_locked = Some(locked);
+            self.emit(if locked {
+                SystemPlatformEvent::SessionLocked
+            } else {
+                SystemPlatformEvent::SessionUnlocked
+            });
+        }
+
+        fn set_display_on(&mut self, on: bool) {
+            if self.last_display_on == Some(on) {
+                debug!(on, "Duplicate display power state suppressed");
+                return;
+            }
+            self.last_display_on = Some(on);
+            self.emit(if on {
+                SystemPlatformEvent::DisplayPowerOn
+            } else {
+                SystemPlatformEvent::DisplayPowerOff
+            });
+        }
+
+        fn set_suspended(&mut self, suspended: bool) {
+            if self.last_suspended == Some(suspended) {
+                debug!(suspended, "Duplicate system suspend state suppressed");
+                return;
+            }
+            self.last_suspended = Some(suspended);
+            self.emit(if suspended {
+                SystemPlatformEvent::SystemSuspend
+            } else {
+                SystemPlatformEvent::SystemResume
+            });
+        }
     }
 
     const NOTIFY_WINDOW_CLASS: PCWSTR = w!("RustWallpaperNotificationWindow");
-    static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+    /// Live listeners sharing the window class: registered by the first, unregistered by the last.
+    static CLASS_REFS: Mutex<usize> = Mutex::new(0);
+    const ERROR_CLASS_ALREADY_EXISTS: i32 = 1410;
+
+    unsafe fn acquire_class(hinstance: HINSTANCE) -> Result<(), String> {
+        let mut refs = CLASS_REFS.lock().unwrap_or_else(|p| p.into_inner());
+        if *refs == 0 {
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(notify_wndproc),
+                hInstance: hinstance,
+                lpszClassName: NOTIFY_WINDOW_CLASS,
+                ..Default::default()
+            };
+            if RegisterClassExW(&wc) == 0 {
+                let err = windows::core::Error::from_win32();
+                if (err.code().0 & 0xFFFF) != ERROR_CLASS_ALREADY_EXISTS {
+                    return Err(format!("RegisterClassExW failed: {}", err));
+                }
+            }
+        }
+        *refs += 1;
+        Ok(())
+    }
+
+    unsafe fn release_class(hinstance: HINSTANCE) {
+        let mut refs = CLASS_REFS.lock().unwrap_or_else(|p| p.into_inner());
+        *refs = refs.saturating_sub(1);
+        if *refs == 0 {
+            if let Err(e) = UnregisterClassW(NOTIFY_WINDOW_CLASS, hinstance) {
+                debug!(%e, "UnregisterClassW failed");
+            }
+        }
+    }
+
+    impl ListenerState {
+        fn publish_registration_report(&self) {
+            *self
+                .registration_report
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                self.registration.report().clone();
+        }
+
+        fn registration_failed(&mut self, source: EventSource, error: String, now: Instant) {
+            match self.registration.record_failure(source, error.clone(), now) {
+                RetryDecision::RetryAfter(delay) => {
+                    warn!(
+                        source = source.as_str(),
+                        ?delay,
+                        error = %error,
+                        "Event-source registration failed; retry scheduled"
+                    );
+                }
+                RetryDecision::GiveUp => {
+                    error!(
+                        source = source.as_str(),
+                        error = %error,
+                        "Event-source registration retry budget exhausted"
+                    );
+                }
+            }
+            self.publish_registration_report();
+        }
+    }
+
+    unsafe fn attempt_registration(
+        hwnd: HWND,
+        state: &mut ListenerState,
+        source: EventSource,
+        now: Instant,
+    ) {
+        let result: Result<(), String> = match source {
+            EventSource::SessionNotifications => {
+                match WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
+                    Ok(()) => {
+                        state.wts_registered = true;
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            EventSource::DisplayPower => {
+                match RegisterPowerSettingNotification(
+                    HANDLE(hwnd.0),
+                    &GUID_CONSOLE_DISPLAY_STATE,
+                    REGISTER_NOTIFICATION_FLAGS(0),
+                ) {
+                    Ok(handle) => {
+                        state.power_notify_handle = Some(handle);
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            EventSource::ExplorerRestart => {
+                let message = RegisterWindowMessageW(w!("TaskbarCreated"));
+                if message == 0 {
+                    Err(windows::core::Error::from_win32().to_string())
+                } else {
+                    state.taskbar_created_msg = message;
+                    Ok(())
+                }
+            }
+            // These sources are provided by the live top-level notification window itself.
+            EventSource::SuspendResume | EventSource::DisplayTopology => Ok(()),
+        };
+
+        match result {
+            Ok(()) => {
+                state.registration.mark_active(source);
+                state.publish_registration_report();
+                info!(source = source.as_str(), "Event source registered");
+            }
+            Err(error) => state.registration_failed(source, error, now),
+        }
+    }
+
+    unsafe fn retry_due_registrations(hwnd: HWND, state: &mut ListenerState) {
+        let now = Instant::now();
+        for source in state.registration.due(now) {
+            attempt_registration(hwnd, state, source, now);
+        }
+        if !state.registration.has_pending_retries() {
+            let _ = KillTimer(hwnd, REGISTRATION_TIMER_ID);
+        }
+        state.publish_registration_report();
+    }
 
     unsafe extern "system" fn notify_wndproc(
         hwnd: HWND,
@@ -163,12 +460,16 @@ mod platform {
         if ptr.is_null() {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
-
         let state = &mut *ptr;
 
-        if msg == state.taskbar_created_msg && state.taskbar_created_msg != 0 {
-            info!("Received TaskbarCreated message: Windows Explorer restarted");
-            let _ = state.tx.send(SystemPlatformEvent::ExplorerRestarted);
+        if msg == WM_TIMER && wparam.0 == REGISTRATION_TIMER_ID {
+            retry_due_registrations(hwnd, state);
+            return LRESULT(0);
+        }
+
+        if state.taskbar_created_msg != 0 && msg == state.taskbar_created_msg {
+            info!("Received TaskbarCreated: Windows Explorer restarted");
+            state.emit(SystemPlatformEvent::ExplorerRestarted);
             return LRESULT(0);
         }
 
@@ -176,45 +477,55 @@ mod platform {
             WM_WTSSESSION_CHANGE => {
                 match wparam.0 {
                     WTS_SESSION_LOCK => {
-                        info!("Received WTS_SESSION_LOCK: Workstation locked");
-                        let _ = state.tx.send(SystemPlatformEvent::SessionLocked);
+                        info!("Received WTS_SESSION_LOCK: workstation locked");
+                        state.set_locked(true);
                     }
                     WTS_SESSION_UNLOCK => {
-                        info!("Received WTS_SESSION_UNLOCK: Workstation unlocked");
-                        let _ = state.tx.send(SystemPlatformEvent::SessionUnlocked);
+                        info!("Received WTS_SESSION_UNLOCK: workstation unlocked");
+                        state.set_locked(false);
                     }
                     _ => {}
                 }
                 LRESULT(0)
             }
             WM_POWERBROADCAST => {
-                if wparam.0 == PBT_POWERSETTINGCHANGE && lparam.0 != 0 {
-                    let setting = &*(lparam.0 as *const POWERBROADCAST_SETTING);
-                    if setting.power_setting == GUID_CONSOLE_DISPLAY_STATE
-                        && setting.data_length >= 4
-                    {
-                        let display_state = *(setting.data.as_ptr() as *const u32);
-                        match display_state {
-                            0 => {
-                                info!("Display power state changed: OFF");
-                                let _ = state.tx.send(SystemPlatformEvent::DisplayPowerOff);
+                match wparam.0 {
+                    PBT_APMSUSPEND => {
+                        info!("Received PBT_APMSUSPEND: system suspending");
+                        state.set_suspended(true);
+                    }
+                    PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND | PBT_APMRESUMECRITICAL => {
+                        info!(code = wparam.0, "Received resume notification");
+                        state.set_suspended(false);
+                    }
+                    PBT_POWERSETTINGCHANGE if lparam.0 != 0 => {
+                        let setting = &*(lparam.0 as *const PowerBroadcastSetting);
+                        if setting.power_setting == GUID_CONSOLE_DISPLAY_STATE
+                            && setting.data_length >= 4
+                        {
+                            let value =
+                                std::ptr::read_unaligned(setting.data.as_ptr() as *const u32);
+                            match value {
+                                0 => {
+                                    info!("Display power state changed: OFF");
+                                    state.set_display_on(false);
+                                }
+                                1 => {
+                                    info!("Display power state changed: ON");
+                                    state.set_display_on(true);
+                                }
+                                // 2 = dimmed: the display still shows the desktop.
+                                _ => debug!(value, "Display power state: DIMMED/other"),
                             }
-                            1 => {
-                                info!("Display power state changed: ON");
-                                let _ = state.tx.send(SystemPlatformEvent::DisplayPowerOn);
-                            }
-                            2 => {
-                                debug!("Display power state changed: DIMMED");
-                            }
-                            _ => {}
                         }
                     }
+                    _ => {}
                 }
-                LRESULT(1)
+                LRESULT(1) // TRUE: grant the request
             }
             WM_DISPLAYCHANGE => {
-                info!("Received WM_DISPLAYCHANGE: Display geometry or topology changed");
-                let _ = state.tx.send(SystemPlatformEvent::DisplayTopologyChanged);
+                info!("Received WM_DISPLAYCHANGE: display geometry or topology changed");
+                state.emit(SystemPlatformEvent::DisplayTopologyChanged);
                 LRESULT(0)
             }
             WM_CLOSE => {
@@ -222,10 +533,14 @@ mod platform {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                let _ = KillTimer(hwnd, REGISTRATION_TIMER_ID);
                 if let Some(hpower) = state.power_notify_handle.take() {
                     let _ = UnregisterPowerSettingNotification(hpower);
                 }
-                let _ = WTSUnRegisterSessionNotification(hwnd);
+                if state.wts_registered {
+                    state.wts_registered = false;
+                    let _ = WTSUnRegisterSessionNotification(hwnd);
+                }
                 PostQuitMessage(0);
                 LRESULT(0)
             }
@@ -237,66 +552,39 @@ mod platform {
         tx: Sender<SystemPlatformEvent>,
         hwnd_holder: Arc<AtomicIsize>,
         init_tx: Sender<Result<(), String>>,
+        registration_report: Arc<Mutex<RegistrationReport>>,
     ) {
         unsafe {
-            let hinstance = match GetModuleHandleW(PCWSTR::null()) {
-                Ok(h) => h,
+            let hinstance: HINSTANCE = match GetModuleHandleW(PCWSTR::null()) {
+                Ok(h) => h.into(),
                 Err(e) => {
                     let _ = init_tx.send(Err(format!("GetModuleHandleW failed: {}", e)));
                     return;
                 }
             };
 
-            if !CLASS_REGISTERED.load(Ordering::Acquire) {
-                let wc = WNDCLASSEXW {
-                    cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-                    style: windows::Win32::UI::WindowsAndMessaging::WNDCLASS_STYLES(0),
-                    lpfnWndProc: Some(notify_wndproc),
-                    cbClsExtra: 0,
-                    cbWndExtra: 0,
-                    hInstance: hinstance.into(),
-                    hIcon: windows::Win32::UI::WindowsAndMessaging::HICON::default(),
-                    hCursor: windows::Win32::UI::WindowsAndMessaging::HCURSOR::default(),
-                    hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH::default(),
-                    lpszMenuName: PCWSTR::null(),
-                    lpszClassName: NOTIFY_WINDOW_CLASS,
-                    hIconSm: windows::Win32::UI::WindowsAndMessaging::HICON::default(),
-                };
-
-                let atom = RegisterClassExW(&wc);
-                if atom == 0 {
-                    let err = windows::core::Error::from_win32();
-                    if err.code().0 != (0x80070582u32 as i32) && err.code().0 != 1410 {
-                        let _ = init_tx.send(Err(format!("RegisterClassExW failed: {}", err)));
-                        return;
-                    }
-                }
-                CLASS_REGISTERED.store(true, Ordering::Release);
+            if let Err(e) = acquire_class(hinstance) {
+                let _ = init_tx.send(Err(e));
+                return;
             }
 
-            // Register TaskbarCreated message for Explorer recovery
-            let taskbar_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
-
-            // Create hidden message-only window
-            // HWND_MESSAGE is ((HWND)-3)
-            let hwnd_message = HWND(-3isize as *mut core::ffi::c_void);
-
             let hwnd = match CreateWindowExW(
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_EX_STYLE(0),
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 NOTIFY_WINDOW_CLASS,
                 w!("WallpaperPlatformNotifier"),
-                windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(0),
+                WS_POPUP,
                 0,
                 0,
                 0,
                 0,
-                hwnd_message,
-                windows::Win32::UI::WindowsAndMessaging::HMENU::default(),
+                HWND::default(),
+                HMENU::default(),
                 hinstance,
                 None,
             ) {
                 Ok(h) => h,
                 Err(e) => {
+                    release_class(hinstance);
                     let _ = init_tx.send(Err(format!(
                         "CreateWindowExW for notification window failed: {}",
                         e
@@ -305,36 +593,86 @@ mod platform {
                 }
             };
 
-            hwnd_holder.store(hwnd.0 as isize, Ordering::SeqCst);
+            let mut registration = RegistrationTracker::new(RetryPolicy::default());
+            // These two event sources are delivered by the live top-level window itself.
+            registration.mark_active(EventSource::SuspendResume);
+            registration.mark_active(EventSource::DisplayTopology);
 
-            // Register for Session Lock/Unlock notifications
-            if let Err(e) = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
-                error!(%e, "WTSRegisterSessionNotification failed");
+            let mut wts_registered = false;
+            match WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
+                Ok(()) => {
+                    wts_registered = true;
+                    registration.mark_active(EventSource::SessionNotifications);
+                }
+                Err(e) => {
+                    let decision = registration.record_failure(
+                        EventSource::SessionNotifications,
+                        e.to_string(),
+                        Instant::now(),
+                    );
+                    warn!(%e, ?decision, "WTS registration unavailable; retrying");
+                }
             }
 
-            // Register for Console Display Power notifications
-            let power_notify = match RegisterPowerSettingNotification(
+            let mut power_notify_handle = None;
+            match RegisterPowerSettingNotification(
                 HANDLE(hwnd.0),
                 &GUID_CONSOLE_DISPLAY_STATE,
-                REGISTER_NOTIFICATION_FLAGS(0), // DEVICE_NOTIFY_WINDOW_HANDLE
+                REGISTER_NOTIFICATION_FLAGS(0),
             ) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    error!(%e, "RegisterPowerSettingNotification failed");
-                    None
+                Ok(handle) => {
+                    power_notify_handle = Some(handle);
+                    registration.mark_active(EventSource::DisplayPower);
                 }
-            };
+                Err(e) => {
+                    let decision = registration.record_failure(
+                        EventSource::DisplayPower,
+                        e.to_string(),
+                        Instant::now(),
+                    );
+                    warn!(%e, ?decision, "Display-power registration unavailable; retrying");
+                }
+            }
+
+            let mut taskbar_created_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
+            if taskbar_created_msg != 0 {
+                registration.mark_active(EventSource::ExplorerRestart);
+            } else {
+                let error = windows::core::Error::from_win32().to_string();
+                let decision = registration.record_failure(
+                    EventSource::ExplorerRestart,
+                    error.clone(),
+                    Instant::now(),
+                );
+                warn!(%error, ?decision, "TaskbarCreated registration unavailable; retrying");
+            }
 
             let state = Box::new(ListenerState {
                 tx,
-                taskbar_created_msg: taskbar_msg,
-                power_notify_handle: power_notify,
+                taskbar_created_msg,
+                power_notify_handle,
+                wts_registered,
+                registration,
+                registration_report,
+                last_locked: None,
+                last_display_on: None,
+                last_suspended: None,
             });
+            state.publish_registration_report();
+            let retry_pending = state.registration.has_pending_retries();
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
-            let state_ptr = Box::into_raw(state);
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+            if retry_pending {
+                let timer = SetTimer(hwnd, REGISTRATION_TIMER_ID, REGISTRATION_TIMER_MS, None);
+                if timer == 0 {
+                    error!(
+                        error = %windows::core::Error::from_win32(),
+                        "Could not start event-registration retry timer"
+                    );
+                }
+            }
 
-            // Notify parent thread of success
+            hwnd_holder.store(hwnd.0 as isize, Ordering::SeqCst);
             let _ = init_tx.send(Ok(()));
 
             debug!("Notification message loop starting");
@@ -344,11 +682,12 @@ mod platform {
             }
             debug!("Notification message loop exited");
 
-            // Clean up state
+            hwnd_holder.store(0, Ordering::SeqCst);
             let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut ListenerState;
             if !ptr.is_null() {
-                let _ = Box::from_raw(ptr);
+                drop(Box::from_raw(ptr));
             }
+            release_class(hinstance);
         }
     }
 }
@@ -358,14 +697,252 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_system_event_listener_lifecycle() {
-        let listener = SystemEventListener::start();
-        assert!(listener.is_ok(), "Failed to start SystemEventListener");
+    fn platform_event_maps_to_runtime_event() {
+        let pairs = [
+            (
+                SystemPlatformEvent::SessionLocked,
+                RuntimeEvent::SessionLocked,
+            ),
+            (
+                SystemPlatformEvent::SessionUnlocked,
+                RuntimeEvent::SessionUnlocked,
+            ),
+            (
+                SystemPlatformEvent::DisplayPowerOff,
+                RuntimeEvent::DisplayPowerOff,
+            ),
+            (
+                SystemPlatformEvent::DisplayPowerOn,
+                RuntimeEvent::DisplayPowerOn,
+            ),
+            (
+                SystemPlatformEvent::SystemSuspend,
+                RuntimeEvent::SystemSuspend,
+            ),
+            (
+                SystemPlatformEvent::SystemResume,
+                RuntimeEvent::SystemResume,
+            ),
+            (
+                SystemPlatformEvent::DisplayTopologyChanged,
+                RuntimeEvent::DisplayTopologyChanged,
+            ),
+            (
+                SystemPlatformEvent::ExplorerRestarted,
+                RuntimeEvent::ExplorerRestarted,
+            ),
+        ];
+        for (platform, runtime) in pairs {
+            assert_eq!(RuntimeEvent::from(platform), runtime);
+        }
+    }
 
-        let listener = listener.unwrap();
-        // Initially queue should be empty
-        assert_eq!(listener.try_recv(), None);
-        // Clean drop
+    #[test]
+    fn test_system_event_listener_lifecycle() {
+        let listener = SystemEventListener::start().expect("listener starts");
+        let (_, alive) = listener.drain();
+        assert!(
+            alive,
+            "listener thread must be alive while the handle exists"
+        );
         drop(listener);
+    }
+
+    #[test]
+    fn listener_can_be_restarted_after_drop() {
+        // Exercises window-class refcounting: register, unregister, register again.
+        for _ in 0..3 {
+            drop(SystemEventListener::start().expect("listener starts"));
+        }
+    }
+}
+
+/// Tests that inject real window messages into the listener's window procedure.
+/// They run only on a Windows target (real Windows, or Wine).
+#[cfg(all(windows, test))]
+mod windows_integration_tests {
+    use super::platform::*;
+    use super::*;
+    use std::time::Duration;
+    use wallpaper_core::registration::{EventSource, RegistrationState};
+    use windows::core::w;
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, RegisterWindowMessageW, SendMessageW, WM_DISPLAYCHANGE, WM_POWERBROADCAST,
+    };
+
+    fn send(l: &SystemEventListener, msg: u32, wparam: usize, lparam: isize) {
+        let hwnd = HWND(l.window_handle_for_test() as *mut core::ffi::c_void);
+        // Synchronous: returns once the listener thread has handled the message.
+        unsafe {
+            SendMessageW(hwnd, msg, WPARAM(wparam), LPARAM(lparam));
+        }
+    }
+
+    fn drain(l: &SystemEventListener) -> Vec<SystemPlatformEvent> {
+        let (events, alive) = l.drain();
+        assert!(alive, "listener thread must still be alive");
+        events
+    }
+
+    #[repr(C)]
+    struct DisplayStateMessage {
+        guid: windows::core::GUID,
+        len: u32,
+        value: u32,
+    }
+
+    fn send_power_setting(l: &SystemEventListener, guid: windows::core::GUID, value: u32) {
+        let msg = DisplayStateMessage {
+            guid,
+            len: 4,
+            value,
+        };
+        send(
+            l,
+            WM_POWERBROADCAST,
+            PBT_POWERSETTINGCHANGE,
+            &msg as *const DisplayStateMessage as isize,
+        );
+    }
+
+    #[test]
+    fn registration_report_marks_window_backed_sources_active() {
+        let listener = SystemEventListener::start().unwrap();
+        let report = listener.registration_report();
+        assert_eq!(
+            report.state(EventSource::SuspendResume),
+            &RegistrationState::Active
+        );
+        assert_eq!(
+            report.state(EventSource::DisplayTopology),
+            &RegistrationState::Active
+        );
+    }
+
+    #[test]
+    fn session_lock_and_unlock_are_reported_once() {
+        let l = SystemEventListener::start().unwrap();
+        send(&l, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, 0);
+        send(&l, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, 0);
+        send(&l, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK, 0);
+        send(&l, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK, 0);
+        assert_eq!(
+            drain(&l),
+            vec![
+                SystemPlatformEvent::SessionLocked,
+                SystemPlatformEvent::SessionUnlocked
+            ]
+        );
+    }
+
+    #[test]
+    fn suspend_and_every_resume_flavour_are_reported() {
+        let l = SystemEventListener::start().unwrap();
+        send(&l, WM_POWERBROADCAST, PBT_APMSUSPEND, 0);
+        send(&l, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
+        send(&l, WM_POWERBROADCAST, PBT_APMRESUMESUSPEND, 0); // same wake: duplicate
+        assert_eq!(
+            drain(&l),
+            vec![
+                SystemPlatformEvent::SystemSuspend,
+                SystemPlatformEvent::SystemResume
+            ]
+        );
+        send(&l, WM_POWERBROADCAST, PBT_APMSUSPEND, 0);
+        send(&l, WM_POWERBROADCAST, PBT_APMRESUMECRITICAL, 0);
+        assert_eq!(
+            drain(&l),
+            vec![
+                SystemPlatformEvent::SystemSuspend,
+                SystemPlatformEvent::SystemResume
+            ]
+        );
+    }
+
+    #[test]
+    fn display_power_states_are_decoded() {
+        let l = SystemEventListener::start().unwrap();
+        send_power_setting(&l, GUID_CONSOLE_DISPLAY_STATE, 0);
+        send_power_setting(&l, GUID_CONSOLE_DISPLAY_STATE, 0); // duplicate
+        send_power_setting(&l, GUID_CONSOLE_DISPLAY_STATE, 2); // dimmed: no event
+        send_power_setting(&l, GUID_CONSOLE_DISPLAY_STATE, 1);
+        assert_eq!(
+            drain(&l),
+            vec![
+                SystemPlatformEvent::DisplayPowerOff,
+                SystemPlatformEvent::DisplayPowerOn
+            ]
+        );
+    }
+
+    #[test]
+    fn foreign_power_setting_guid_is_ignored() {
+        let l = SystemEventListener::start().unwrap();
+        let other = windows::core::GUID::from_u128(0x12345678_1234_1234_1234_123456789abc);
+        send_power_setting(&l, other, 0);
+        assert!(drain(&l).is_empty());
+    }
+
+    #[test]
+    fn display_change_and_taskbar_created_are_reported() {
+        let l = SystemEventListener::start().unwrap();
+        send(&l, WM_DISPLAYCHANGE, 32, 0);
+        let taskbar = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+        assert_ne!(taskbar, 0);
+        send(&l, taskbar, 0, 0);
+        assert_eq!(
+            drain(&l),
+            vec![
+                SystemPlatformEvent::DisplayTopologyChanged,
+                SystemPlatformEvent::ExplorerRestarted
+            ]
+        );
+    }
+
+    #[test]
+    fn listener_window_is_enumerable_so_it_receives_broadcasts() {
+        // Message-only windows are NOT returned by EnumWindows and get no broadcasts.
+        struct Search {
+            target: isize,
+            found: bool,
+        }
+        unsafe extern "system" fn cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+            let search = &mut *(lparam.0 as *mut Search);
+            if hwnd.0 as isize == search.target {
+                search.found = true;
+                return BOOL(0);
+            }
+            BOOL(1)
+        }
+        let l = SystemEventListener::start().unwrap();
+        let mut search = Search {
+            target: l.window_handle_for_test(),
+            found: false,
+        };
+        unsafe {
+            let _ = EnumWindows(Some(cb), LPARAM(&mut search as *mut Search as isize));
+        }
+        assert!(
+            search.found,
+            "listener window must be a real top-level window"
+        );
+    }
+
+    #[test]
+    fn shutdown_completes_promptly_even_after_a_burst() {
+        let l = SystemEventListener::start().unwrap();
+        for _ in 0..50 {
+            send(&l, WM_DISPLAYCHANGE, 0, 0);
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(l);
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "drop must join the listener thread"
+        );
     }
 }

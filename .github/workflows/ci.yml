@@ -1,0 +1,35 @@
+name: Rust workspace CI
+
+on:
+  push:
+    branches:
+      - main
+      - agent/runtime-completion
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          targets: x86_64-pc-windows-gnu
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run platform-independent core tests
+        run: cargo test -p wallpaper-core
+      - name: Install MinGW for bundled SQLite
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Cross-check Windows target
+        env:
+          CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
+        run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu

@@ -17,8 +17,9 @@
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::path::PathBuf;
+#[cfg(not(windows))]
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
@@ -84,20 +85,333 @@ pub struct MpvLaunchConfig {
     pub config: PlaybackConfig,
 }
 
+#[cfg(windows)]
+pub struct MpvProcess {
+    process_handle: windows::Win32::Foundation::HANDLE,
+    thread_handle: windows::Win32::Foundation::HANDLE,
+    job_handle: windows::Win32::Foundation::HANDLE,
+    pid: u32,
+}
+
+#[cfg(windows)]
+impl MpvProcess {
+    pub fn spawn(cmd_line: &str) -> Result<Self, MpvError> {
+        use windows::core::PWSTR;
+        use windows::Win32::Foundation::{CloseHandle, GetLastError};
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows::Win32::System::Threading::{
+            CreateProcessW, ResumeThread, TerminateProcess, CREATE_SUSPENDED, PROCESS_INFORMATION,
+            STARTF_USESHOWWINDOW, STARTUPINFOW,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+        // 1. Create Job Object with KILL_ON_JOB_CLOSE so child never orphans
+        let job = unsafe {
+            let job = CreateJobObjectW(None, None)
+                .map_err(|e| MpvError::WindowsApi(format!("CreateJobObject failed: {e}")))?;
+
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+            if let Err(e) = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            ) {
+                let _ = CloseHandle(job);
+                return Err(MpvError::WindowsApi(format!(
+                    "SetInformationJobObject failed: {e}"
+                )));
+            }
+            job
+        };
+
+        // Determine current thread's desktop name so MPV lands on the exact same desktop
+        let mut desk_name = "default\0".to_string();
+        unsafe {
+            use windows::Win32::System::StationsAndDesktops::{
+                GetThreadDesktop, GetUserObjectInformationW, UOI_NAME,
+            };
+            use windows::Win32::System::Threading::GetCurrentThreadId;
+
+            let hdesk = GetThreadDesktop(GetCurrentThreadId());
+            if let Ok(hdesk) = hdesk {
+                let mut buf = [0u16; 256];
+                let mut len = 0u32;
+                let handle = windows::Win32::Foundation::HANDLE(hdesk.0 as *mut core::ffi::c_void);
+                if GetUserObjectInformationW(
+                    handle,
+                    UOI_NAME,
+                    Some(buf.as_mut_ptr() as *mut _),
+                    (buf.len() * 2) as u32,
+                    Some(&mut len),
+                )
+                .is_ok()
+                {
+                    let name =
+                        String::from_utf16_lossy(&buf[..(len as usize / 2).saturating_sub(1)]);
+                    if !name.is_empty() {
+                        desk_name = format!("{}\0", name);
+                    }
+                }
+            }
+        }
+
+        let mut desktop_wide: Vec<u16> = desk_name.encode_utf16().collect();
+        let mut cmd_wide: Vec<u16> = cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
+
+        let mut si = STARTUPINFOW::default();
+        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        si.lpDesktop = PWSTR(desktop_wide.as_mut_ptr());
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE.0 as u16;
+
+        let mut pi = PROCESS_INFORMATION::default();
+
+        // 2. Create process in SUSPENDED state
+        let create_res = unsafe {
+            CreateProcessW(
+                None,
+                PWSTR(cmd_wide.as_mut_ptr()),
+                None,
+                None,
+                false,
+                CREATE_SUSPENDED,
+                None,
+                None,
+                &si,
+                &mut pi,
+            )
+        };
+
+        if let Err(e) = create_res {
+            unsafe {
+                let _ = CloseHandle(job);
+            }
+            return Err(MpvError::SpawnFailed(std::io::Error::other(e.to_string())));
+        }
+
+        // 3. Assign to Job Object before resuming execution
+        let assign_res = unsafe { AssignProcessToJobObject(job, pi.hProcess) };
+        if let Err(e) = assign_res {
+            unsafe {
+                let _ = TerminateProcess(pi.hProcess, 1);
+                let _ = CloseHandle(pi.hThread);
+                let _ = CloseHandle(pi.hProcess);
+                let _ = CloseHandle(job);
+            }
+            return Err(MpvError::WindowsApi(format!(
+                "AssignProcessToJobObject failed: {e}"
+            )));
+        }
+
+        // 4. Resume primary thread
+        let resume_res = unsafe { ResumeThread(pi.hThread) };
+        if resume_res == 0xFFFFFFFF {
+            let err = unsafe { GetLastError() };
+            unsafe {
+                let _ = TerminateProcess(pi.hProcess, 1);
+                let _ = CloseHandle(pi.hThread);
+                let _ = CloseHandle(pi.hProcess);
+                let _ = CloseHandle(job);
+            }
+            return Err(MpvError::WindowsApi(format!(
+                "ResumeThread failed: {err:?}"
+            )));
+        }
+
+        Ok(Self {
+            process_handle: pi.hProcess,
+            thread_handle: pi.hThread,
+            job_handle: job,
+            pid: pi.dwProcessId,
+        })
+    }
+
+    pub fn id(&self) -> u32 {
+        self.pid
+    }
+
+    pub fn try_wait(&self) -> Result<Option<u32>, std::io::Error> {
+        use windows::Win32::Foundation::{GetLastError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+        unsafe {
+            let wait = WaitForSingleObject(self.process_handle, 0);
+            match wait {
+                WAIT_OBJECT_0 => {
+                    let mut code = 0u32;
+                    GetExitCodeProcess(self.process_handle, &mut code).map_err(|e| {
+                        std::io::Error::other(format!("GetExitCodeProcess failed: {e}"))
+                    })?;
+                    Ok(Some(code))
+                }
+                WAIT_TIMEOUT => Ok(None),
+                WAIT_FAILED => {
+                    let err = GetLastError();
+                    Err(std::io::Error::other(format!(
+                        "WaitForSingleObject WAIT_FAILED: {err:?}"
+                    )))
+                }
+                other => Err(std::io::Error::other(format!(
+                    "WaitForSingleObject unexpected result: {other:?}"
+                ))),
+            }
+        }
+    }
+
+    pub fn kill(&mut self) -> Result<(), std::io::Error> {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+        unsafe {
+            if !self.process_handle.is_invalid() && !self.process_handle.0.is_null() {
+                if WaitForSingleObject(self.process_handle, 0) == WAIT_OBJECT_0 {
+                    return Ok(());
+                }
+                if let Err(e) = TerminateProcess(self.process_handle, 1) {
+                    if WaitForSingleObject(self.process_handle, 0) != WAIT_OBJECT_0 {
+                        return Err(std::io::Error::other(format!(
+                            "TerminateProcess failed: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn wait(&mut self) -> Result<u32, std::io::Error> {
+        use windows::Win32::Foundation::{GetLastError, WAIT_FAILED, WAIT_OBJECT_0};
+        use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+        unsafe {
+            let wait = WaitForSingleObject(self.process_handle, 0xFFFFFFFF);
+            match wait {
+                WAIT_OBJECT_0 => {
+                    let mut code = 0u32;
+                    GetExitCodeProcess(self.process_handle, &mut code).map_err(|e| {
+                        std::io::Error::other(format!("GetExitCodeProcess failed: {e}"))
+                    })?;
+                    Ok(code)
+                }
+                WAIT_FAILED => {
+                    let err = GetLastError();
+                    Err(std::io::Error::other(format!(
+                        "WaitForSingleObject WAIT_FAILED: {err:?}"
+                    )))
+                }
+                other => Err(std::io::Error::other(format!(
+                    "WaitForSingleObject unexpected result: {other:?}"
+                ))),
+            }
+        }
+    }
+
+    pub fn wait_timeout(&mut self, timeout: Duration) -> Result<Option<u32>, std::io::Error> {
+        use windows::Win32::Foundation::{GetLastError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+        let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
+        unsafe {
+            let wait = WaitForSingleObject(self.process_handle, millis);
+            match wait {
+                WAIT_OBJECT_0 => {
+                    let mut code = 0u32;
+                    GetExitCodeProcess(self.process_handle, &mut code).map_err(|e| {
+                        std::io::Error::other(format!("GetExitCodeProcess failed: {e}"))
+                    })?;
+                    Ok(Some(code))
+                }
+                WAIT_TIMEOUT => Ok(None),
+                WAIT_FAILED => {
+                    let err = GetLastError();
+                    Err(std::io::Error::other(format!(
+                        "WaitForSingleObject WAIT_FAILED: {err:?}"
+                    )))
+                }
+                other => Err(std::io::Error::other(format!(
+                    "WaitForSingleObject unexpected result: {other:?}"
+                ))),
+            }
+        }
+    }
+
+    pub fn raw_handle(&self) -> windows::Win32::Foundation::HANDLE {
+        self.process_handle
+    }
+}
+
+#[cfg(windows)]
+impl Drop for MpvProcess {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.job_handle.is_invalid() && !self.job_handle.0.is_null() {
+                let _ = windows::Win32::Foundation::CloseHandle(self.job_handle);
+                self.job_handle = windows::Win32::Foundation::HANDLE::default();
+            }
+            if !self.thread_handle.is_invalid() && !self.thread_handle.0.is_null() {
+                let _ = windows::Win32::Foundation::CloseHandle(self.thread_handle);
+                self.thread_handle = windows::Win32::Foundation::HANDLE::default();
+            }
+            if !self.process_handle.is_invalid() && !self.process_handle.0.is_null() {
+                let _ = windows::Win32::Foundation::CloseHandle(self.process_handle);
+                self.process_handle = windows::Win32::Foundation::HANDLE::default();
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub struct MpvProcess(Child);
+
+#[cfg(not(windows))]
+impl MpvProcess {
+    pub fn id(&self) -> u32 {
+        self.0.id()
+    }
+    pub fn try_wait(&mut self) -> Result<Option<u32>, std::io::Error> {
+        self.0
+            .try_wait()
+            .map(|opt| opt.map(|s| s.code().unwrap_or(0) as u32))
+    }
+    pub fn kill(&mut self) -> Result<(), std::io::Error> {
+        self.0.kill()
+    }
+    pub fn wait(&mut self) -> Result<u32, std::io::Error> {
+        self.0.wait().map(|s| s.code().unwrap_or(0) as u32)
+    }
+    pub fn wait_timeout(&mut self, timeout: Duration) -> Result<Option<u32>, std::io::Error> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(Some(status.code().unwrap_or(0) as u32));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(None)
+    }
+}
+
 /// Supervised MPV player instance controlling an embedded video stream.
 pub struct MpvPlayer {
-    child: Child,
+    child: MpvProcess,
     pipe_path: String,
     pipe_writer: Arc<Mutex<Option<File>>>,
-    pending_responses: Arc<Mutex<HashMap<u64, Sender<Value>>>>,
+    pending_responses: Arc<Mutex<HashMap<u64, Sender<Result<Value, MpvError>>>>>,
     reader_running: Arc<AtomicBool>,
     active_decoder: String,
     state: PlaybackState,
     volume: u32,
     muted: bool,
     started_at: Instant,
-    #[cfg(windows)]
-    job_handle: Option<windows::Win32::Foundation::HANDLE>,
+    #[doc(hidden)]
+    mock_stop_failure: bool,
 }
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -105,6 +419,13 @@ static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 impl MpvPlayer {
     /// Launches an MPV instance embedded in `wid` and establishes IPC control.
     pub fn launch(launch_cfg: MpvLaunchConfig) -> Result<Self, MpvError> {
+        if !launch_cfg.video_path.exists() {
+            return Err(MpvError::Player(format!(
+                "Video file not found at path: {}",
+                launch_cfg.video_path.display()
+            )));
+        }
+
         let mpv_bin = find_mpv_executable()?;
         let pipe_id = Uuid::new_v4();
         let pipe_name = format!("rust-wallpaper-mpv-{}", pipe_id);
@@ -125,46 +446,68 @@ impl MpvPlayer {
             "no"
         };
 
-        let mut cmd = Command::new(&mpv_bin);
+        crate::desktop_host::ensure_interactive_desktop();
+
         let log_path = std::env::temp_dir().join(format!("mpv-{}.log", pipe_id));
-        cmd.arg(format!("--wid={}", launch_cfg.wid))
-            .arg(format!("--input-ipc-server={}", pipe_path))
-            .arg(format!("--log-file={}", log_path.display()))
-            .arg("--msg-level=all=trace")
-            .arg(format!("--hwdec={}", hwdec_arg))
-            .arg("--hwdec-codecs=all")
-            .arg("--hwdec-software-fallback=yes")
-            .arg(format!("--loop-file={}", loop_arg))
-            .arg(format!("--volume={}", launch_cfg.config.volume))
-            .arg("--idle=yes")
-            .arg("--force-window=yes")
-            .arg("--no-border")
-            .arg("--no-osc")
-            .arg("--no-osd-bar")
-            .arg("--input-default-bindings=no")
-            .arg("--input-vo-keyboard=no")
-            .arg("--cursor-autohide=no");
+
+        let mut cmd_args = vec![
+            format!("\"{}\"", mpv_bin.display()),
+            format!("--wid={}", launch_cfg.wid as usize),
+            format!("--input-ipc-server={}", pipe_path),
+            format!("--log-file={}", log_path.display()),
+            "--msg-level=all=trace".to_string(),
+            format!("--hwdec={}", hwdec_arg),
+            "--hwdec-codecs=all".to_string(),
+            "--hwdec-software-fallback=yes".to_string(),
+            format!("--loop-file={}", loop_arg),
+            format!("--volume={}", launch_cfg.config.volume),
+            "--idle=yes".to_string(),
+            "--force-window=yes".to_string(),
+            "--vo=gpu".to_string(),
+            "--gpu-context=d3d11".to_string(),
+            "--no-border".to_string(),
+            "--no-osc".to_string(),
+            "--no-osd-bar".to_string(),
+            "--input-default-bindings=no".to_string(),
+            "--input-vo-keyboard=no".to_string(),
+            "--cursor-autohide=no".to_string(),
+        ];
 
         if launch_cfg.config.mute {
-            cmd.arg("--mute=yes");
+            cmd_args.push("--mute=yes".to_string());
         }
 
-        cmd.arg("--").arg(&launch_cfg.video_path);
+        cmd_args.push("--".to_string());
+        cmd_args.push(format!("\"{}\"", launch_cfg.video_path.display()));
 
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        let child = cmd.spawn().map_err(MpvError::SpawnFailed)?;
+        let cmd_line = cmd_args.join(" ");
 
         #[cfg(windows)]
-        let job_handle = Self::attach_job_object(&child)?;
+        let child = MpvProcess::spawn(&cmd_line)?;
+
+        #[cfg(not(windows))]
+        let mut child = {
+            let mut cmd = Command::new(&mpv_bin);
+            for arg in &cmd_args[1..] {
+                cmd.arg(arg);
+            }
+            MpvProcess(cmd.spawn().map_err(MpvError::SpawnFailed)?)
+        };
 
         // Connect to Named Pipe with retry timeout
         let connect_deadline = Instant::now() + Duration::from_millis(2500);
         let mut pipe_file = None;
 
         while Instant::now() < connect_deadline {
+            if let Ok(Some(status)) = child.try_wait() {
+                let mut child = child;
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MpvError::Player(format!(
+                    "MPV child process exited unexpectedly with status {status:?}"
+                )));
+            }
+
             #[cfg(windows)]
             {
                 use windows::Win32::UI::WindowsAndMessaging::{
@@ -190,52 +533,142 @@ impl MpvPlayer {
             }
         }
 
-        let pending_responses = Arc::new(Mutex::new(HashMap::<u64, Sender<Value>>::new()));
-        let reader_running = Arc::new(AtomicBool::new(false));
-        let pipe_writer = Arc::new(Mutex::new(None));
+        // If pipe cannot be connected, clean up child and return error
+        let file = match pipe_file {
+            Some(f) => f,
+            None => {
+                let mut child = child;
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MpvError::IpcConnectionFailed(format!(
+                    "Timed out waiting to connect to MPV IPC pipe '{pipe_path}'"
+                )));
+            }
+        };
 
-        if let Some(file) = pipe_file {
-            if let Ok(writer_clone) = file.try_clone() {
-                *pipe_writer.lock().unwrap() = Some(writer_clone);
-                let reader = BufReader::new(file);
-                let pending_clone = Arc::clone(&pending_responses);
-                let running_clone = Arc::clone(&reader_running);
-                running_clone.store(true, Ordering::SeqCst);
+        // If cloning pipe handle fails, clean up child and return error
+        let writer_clone = match file.try_clone() {
+            Ok(w) => w,
+            Err(e) => {
+                let mut child = child;
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(MpvError::IpcIoError(e));
+            }
+        };
 
-                // Dedicated background reader thread
-                std::thread::Builder::new()
-                    .name("mpv-ipc-reader".into())
-                    .spawn(move || {
-                        let mut r = reader;
-                        let mut line = String::new();
-                        while running_clone.load(Ordering::SeqCst) {
-                            line.clear();
-                            match r.read_line(&mut line) {
-                                Ok(0) => break, // EOF
-                                Ok(_) => {
-                                    let trimmed = line.trim();
-                                    if trimmed.is_empty() {
+        let pending_responses: Arc<Mutex<HashMap<u64, Sender<Result<Value, MpvError>>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let reader_running = Arc::new(AtomicBool::new(true));
+        let pipe_writer = Arc::new(Mutex::new(Some(writer_clone)));
+
+        #[cfg(windows)]
+        use std::os::windows::io::AsRawHandle;
+        #[cfg(windows)]
+        let raw_handle = file.as_raw_handle() as isize;
+
+        let mut reader_file = file;
+        let pending_clone = Arc::clone(&pending_responses);
+        let running_clone = Arc::clone(&reader_running);
+
+        // Dedicated background reader thread with non-blocking peek and stream accumulator
+        // Handles fragmented/partial JSON lines safely without blocking in ReadFile on shutdown.
+        let reader_spawn = std::thread::Builder::new()
+            .name("mpv-ipc-reader".into())
+            .spawn(move || {
+                #[cfg(windows)]
+                extern "system" {
+                    fn PeekNamedPipe(
+                        hNamedPipe: windows::Win32::Foundation::HANDLE,
+                        lpBuffer: *mut core::ffi::c_void,
+                        nBufferSize: u32,
+                        lpBytesRead: *mut u32,
+                        lpTotalBytesAvail: *mut u32,
+                        lpBytesLeftThisMessage: *mut u32,
+                    ) -> windows::Win32::Foundation::BOOL;
+                }
+                #[cfg(windows)]
+                let pipe_handle =
+                    windows::Win32::Foundation::HANDLE(raw_handle as *mut core::ffi::c_void);
+
+                let mut accumulator = String::with_capacity(4096);
+                let mut buf = [0u8; 4096];
+
+                while running_clone.load(Ordering::SeqCst) {
+                    #[cfg(windows)]
+                    {
+                        let mut bytes_avail = 0u32;
+                        let ok = unsafe {
+                            PeekNamedPipe(
+                                pipe_handle,
+                                std::ptr::null_mut(),
+                                0,
+                                std::ptr::null_mut(),
+                                &mut bytes_avail,
+                                std::ptr::null_mut(),
+                            )
+                            .as_bool()
+                        };
+                        if ok {
+                            if bytes_avail == 0 {
+                                std::thread::sleep(Duration::from_millis(5));
+                                continue;
+                            }
+                        } else {
+                            break; // Pipe broken or closed by MPV
+                        }
+
+                        let to_read = (bytes_avail as usize).min(buf.len());
+                        match reader_file.read(&mut buf[..to_read]) {
+                            Ok(0) => break, // EOF
+                            Ok(n) => {
+                                accumulator.push_str(&String::from_utf8_lossy(&buf[..n]));
+                                while let Some(pos) = accumulator.find('\n') {
+                                    let line: String = accumulator[..pos].trim().to_string();
+                                    accumulator.drain(..=pos);
+                                    if line.is_empty() {
                                         continue;
                                     }
-                                    if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
+                                    if let Ok(parsed) = serde_json::from_str::<Value>(&line) {
                                         if let Some(req_id) =
                                             parsed.get("request_id").and_then(|v| v.as_u64())
                                         {
                                             let mut map = pending_clone.lock().unwrap();
                                             if let Some(tx) = map.remove(&req_id) {
-                                                let _ = tx.send(parsed);
+                                                let _ = tx.send(Ok(parsed));
                                             }
                                         }
                                         // Asynchronous events (without request_id) pass through harmlessly
                                     }
                                 }
-                                Err(_) => break, // Pipe broken
                             }
+                            Err(_) => break, // Pipe broken
                         }
-                        running_clone.store(false, Ordering::SeqCst);
-                    })
-                    .map_err(|e| MpvError::Player(format!("Failed to spawn reader thread: {e}")))?;
-            }
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+                running_clone.store(false, Ordering::SeqCst);
+
+                // Drain and complete all pending requests with error upon pipe disconnect
+                let mut map = pending_clone.lock().unwrap();
+                for (_id, tx) in map.drain() {
+                    let _ = tx.send(Err(MpvError::IpcConnectionFailed(
+                        "IPC pipe disconnected while request was pending".into(),
+                    )));
+                }
+            });
+
+        // If reader thread fails to start, clean up child and return error
+        if let Err(e) = reader_spawn {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(MpvError::Player(format!(
+                "Failed to spawn reader thread: {e}"
+            )));
         }
 
         let mut player = Self {
@@ -249,70 +682,49 @@ impl MpvPlayer {
             volume: launch_cfg.config.volume,
             muted: launch_cfg.config.mute,
             started_at: Instant::now(),
-            #[cfg(windows)]
-            job_handle,
+            mock_stop_failure: false,
         };
 
-        // Query active decoder through IPC
-        if player.reader_running.load(Ordering::SeqCst) {
-            std::thread::sleep(Duration::from_millis(250));
-            match player.query_active_decoder() {
-                Ok(decoder) => {
-                    info!(
-                        active_decoder = %decoder,
-                        requested = ?launch_cfg.config.hardware_acceleration,
-                        "Hardware decoding telemetry verified"
-                    );
-                    player.active_decoder = decoder;
-                }
-                Err(err) => {
-                    warn!(%err, "Failed initial query for active decoder");
+        // Query active decoder through IPC with bounded polling
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let mut detected = "software".to_string();
+        while Instant::now() < deadline {
+            #[cfg(windows)]
+            {
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+                };
+                let mut msg = MSG::default();
+                unsafe {
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
                 }
             }
-            player.state = PlaybackState::Playing;
-        } else {
-            warn!(
-                "Could not connect to MPV IPC pipe within timeout; player running without live IPC"
-            );
+
+            if let Ok(decoder) = player.query_active_decoder() {
+                if !decoder.is_empty() && decoder != "no" {
+                    detected = decoder;
+                    if detected != "software"
+                        || launch_cfg.config.hardware_acceleration
+                            == wallpaper_core::HardwareAcceleration::Disabled
+                    {
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
+        info!(
+            active_decoder = %detected,
+            requested = ?launch_cfg.config.hardware_acceleration,
+            "Hardware decoding telemetry verified"
+        );
+        player.active_decoder = detected;
+        player.state = PlaybackState::Playing;
 
         Ok(player)
-    }
-
-    #[cfg(windows)]
-    fn attach_job_object(
-        child: &Child,
-    ) -> Result<Option<windows::Win32::Foundation::HANDLE>, MpvError> {
-        use std::os::windows::io::AsRawHandle;
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        };
-
-        unsafe {
-            let job = CreateJobObjectW(None, None)
-                .map_err(|e| MpvError::WindowsApi(format!("CreateJobObject failed: {e}")))?;
-
-            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &info as *const _ as *const _,
-                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            )
-            .map_err(|e| MpvError::WindowsApi(format!("SetInformationJobObject failed: {e}")))?;
-
-            let proc_handle = HANDLE(child.as_raw_handle() as *mut core::ffi::c_void);
-            AssignProcessToJobObject(job, proc_handle).map_err(|e| {
-                MpvError::WindowsApi(format!("AssignProcessToJobObject failed: {e}"))
-            })?;
-
-            Ok(Some(job))
-        }
     }
 
     pub fn pipe_path(&self) -> &str {
@@ -322,26 +734,54 @@ impl MpvPlayer {
     /// Sends a JSON command to the MPV IPC pipe.
     pub fn send_command(&mut self, command: &[Value]) -> Result<Option<Value>, MpvError> {
         let req_id = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let payload = json!({
+            "command": command,
+            "request_id": req_id
+        });
+
+        // 1. Serialize message before inserting into pending map
+        let mut msg = serde_json::to_string(&payload)?;
+        msg.push('\n');
+
         let (tx, rx) = channel();
+
+        // 2. RAII guard ensures pending_responses entry is always removed on early error
+        struct PendingGuard<'a> {
+            pending: &'a Arc<Mutex<HashMap<u64, Sender<Result<Value, MpvError>>>>>,
+            req_id: u64,
+            completed: bool,
+        }
+        impl<'a> Drop for PendingGuard<'a> {
+            fn drop(&mut self) {
+                if !self.completed {
+                    if let Ok(mut map) = self.pending.lock() {
+                        map.remove(&self.req_id);
+                    }
+                }
+            }
+        }
 
         {
             let mut pending = self.pending_responses.lock().unwrap();
             pending.insert(req_id, tx);
         }
 
-        let payload = json!({
-            "command": command,
-            "request_id": req_id
-        });
+        let mut guard = PendingGuard {
+            pending: &self.pending_responses,
+            req_id,
+            completed: false,
+        };
 
-        let mut msg = serde_json::to_string(&payload)?;
-        msg.push('\n');
-
+        // 3. Write and flush message to pipe
         {
             let mut writer_guard = self.pipe_writer.lock().unwrap();
             if let Some(writer) = writer_guard.as_mut() {
-                writer.write_all(msg.as_bytes())?;
-                writer.flush()?;
+                if let Err(e) = writer.write_all(msg.as_bytes()) {
+                    return Err(MpvError::IpcIoError(e));
+                }
+                if let Err(e) = writer.flush() {
+                    return Err(MpvError::IpcIoError(e));
+                }
             } else {
                 return Err(MpvError::IpcConnectionFailed(
                     "IPC pipe writer not connected".into(),
@@ -349,8 +789,45 @@ impl MpvPlayer {
             }
         }
 
-        match rx.recv_timeout(Duration::from_millis(1500)) {
-            Ok(parsed) => {
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        let mut parsed_result = None;
+
+        while Instant::now() < deadline {
+            #[cfg(windows)]
+            {
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+                };
+                let mut msg = MSG::default();
+                unsafe {
+                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+            }
+
+            match rx.try_recv() {
+                Ok(Ok(parsed)) => {
+                    parsed_result = Some(parsed);
+                    break;
+                }
+                Ok(Err(e)) => return Err(e),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(MpvError::IpcConnectionFailed(
+                        "IPC response channel disconnected".into(),
+                    ));
+                }
+            }
+        }
+
+        guard.completed = true;
+
+        match parsed_result {
+            Some(parsed) => {
                 if let Some(err) = parsed.get("error").and_then(|e| e.as_str()) {
                     if err != "success" && err != "property unavailable" {
                         debug!(
@@ -362,7 +839,7 @@ impl MpvPlayer {
                 }
                 Ok(parsed.get("data").cloned())
             }
-            Err(_) => {
+            None => {
                 let mut pending = self.pending_responses.lock().unwrap();
                 pending.remove(&req_id);
                 Err(MpvError::IpcConnectionFailed(format!(
@@ -379,6 +856,29 @@ impl MpvPlayer {
             Some(Value::String(s)) => Ok(s),
             _ => Ok("software".to_string()),
         }
+    }
+
+    /// Queries the currently active playback time position in seconds.
+    pub fn query_time_pos(&mut self) -> Result<f64, MpvError> {
+        let resp = self.send_command(&[json!("get_property"), json!("time-pos")])?;
+        match resp {
+            Some(Value::Number(num)) => num
+                .as_f64()
+                .ok_or_else(|| MpvError::Player("Invalid numeric value for time-pos".to_string())),
+            Some(Value::Null) | None => Err(MpvError::Player(
+                "time-pos property unavailable".to_string(),
+            )),
+            _ => Err(MpvError::Player("Unexpected type for time-pos".to_string())),
+        }
+    }
+
+    /// Checks if a genuine hardware decoder is currently active (e.g. `d3d11va`, `dxva2`).
+    /// Returns false if hardware acceleration fell back to software or is unavailable.
+    pub fn is_hardware_decoding_active(&self) -> bool {
+        !self.active_decoder.is_empty()
+            && self.active_decoder != "no"
+            && self.active_decoder != "software"
+            && self.active_decoder != "unknown"
     }
 
     /// Pauses playback.
@@ -416,37 +916,98 @@ impl MpvPlayer {
 
     /// Stops playback and terminates MPV.
     pub fn stop(&mut self) -> Result<(), MpvError> {
-        info!("Stopping video player process");
-        self.reader_running.store(false, Ordering::SeqCst);
-        let _ = self.send_command(&[json!("quit")]);
-        *self.pipe_writer.lock().unwrap() = None;
-
-        let wait_deadline = Instant::now() + Duration::from_millis(150);
-        while Instant::now() < wait_deadline {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        if self.mock_stop_failure {
+            return Err(MpvError::Player(
+                "Injected mock shutdown failure for testing".to_string(),
+            ));
         }
 
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.state = PlaybackState::Stopped;
-        Ok(())
+        if self.state == PlaybackState::Stopped {
+            // Repeated stop calls are safe: verify process is actually dead
+            match self.child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => {
+                    // Process still alive despite stopped flag, fall through to force-kill
+                }
+                Err(e) => {
+                    return Err(MpvError::Player(format!(
+                        "Failed to query child status: {e}"
+                    )));
+                }
+            }
+        }
+        info!("Stopping video player process");
+
+        // Send fire-and-forget quit command to MPV without waiting for reply
+        if let Ok(mut writer_guard) = self.pipe_writer.lock() {
+            if let Some(writer) = writer_guard.as_mut() {
+                let quit_msg = "{\"command\":[\"quit\"]}\n";
+                let _ = writer.write_all(quit_msg.as_bytes());
+                let _ = writer.flush();
+            }
+        }
+        self.reader_running.store(false, Ordering::SeqCst);
+        *self.pipe_writer.lock().unwrap() = None;
+
+        // Drain pending requests with error so waiting callers do not hang
+        {
+            let mut pending = self.pending_responses.lock().unwrap();
+            for (_id, tx) in pending.drain() {
+                let _ = tx.send(Err(MpvError::Player(
+                    "Player stopped while request was pending".into(),
+                )));
+            }
+        }
+
+        // 1. Bounded wait for graceful exit
+        let wait_deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < wait_deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    self.state = PlaybackState::Stopped;
+                    return Ok(());
+                }
+                Ok(None) => {
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+                Err(e) => {
+                    return Err(MpvError::Player(format!(
+                        "Error querying child exit state: {e}"
+                    )));
+                }
+            }
+        }
+
+        // 2. Graceful quit timed out, terminate child process
+        self.child
+            .kill()
+            .map_err(|e| MpvError::Player(format!("Failed to kill MPV process: {e}")))?;
+
+        // 3. Bounded wait after kill (up to 1000ms) to verify termination
+        match self.child.wait_timeout(Duration::from_millis(1000)) {
+            Ok(Some(_)) => {
+                self.state = PlaybackState::Stopped;
+                Ok(())
+            }
+            Ok(None) => Err(MpvError::Player(
+                "MPV process did not terminate within bounded kill timeout".into(),
+            )),
+            Err(e) => Err(MpvError::Player(format!(
+                "Error waiting for MPV process exit: {e}"
+            ))),
+        }
     }
 
     /// Queries working set memory bytes of the MPV child process.
     pub fn get_memory_bytes(&self) -> u64 {
         #[cfg(windows)]
         {
-            use std::os::windows::io::AsRawHandle;
-            use windows::Win32::Foundation::HANDLE;
             use windows::Win32::System::ProcessStatus::{
                 GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
             };
 
             unsafe {
-                let proc_handle = HANDLE(self.child.as_raw_handle() as *mut core::ffi::c_void);
+                let proc_handle = self.child.raw_handle();
                 let mut counters = PROCESS_MEMORY_COUNTERS::default();
                 counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
 
@@ -461,6 +1022,32 @@ impl MpvPlayer {
     /// Returns the PID of the MPV child process.
     pub fn child_id(&self) -> u32 {
         self.child.id()
+    }
+
+    #[doc(hidden)]
+    pub fn insert_mock_pending_request(
+        &self,
+        id: u64,
+        tx: std::sync::mpsc::Sender<Result<Value, MpvError>>,
+    ) {
+        let mut map = self.pending_responses.lock().unwrap();
+        map.insert(id, tx);
+    }
+
+    #[doc(hidden)]
+    pub fn pending_request_count(&self) -> usize {
+        self.pending_responses.lock().unwrap().len()
+    }
+
+    #[doc(hidden)]
+    pub fn disconnect_pipe_writer_for_test(&mut self) {
+        *self.pipe_writer.lock().unwrap() = None;
+    }
+
+    /// For testing: simulate a shutdown/kill failure without relying on OS process errors.
+    #[doc(hidden)]
+    pub fn set_mock_stop_failure(&mut self, fail: bool) {
+        self.mock_stop_failure = fail;
     }
 
     /// Checks if the MPV player child process is still running.
@@ -486,6 +1073,17 @@ impl MpvPlayer {
     /// Returns process uptime in seconds.
     pub fn uptime_secs(&self) -> u64 {
         self.started_at.elapsed().as_secs()
+    }
+
+    /// One-round-trip health probe; bounded to a single IPC request.
+    pub fn probe_video_output(&mut self) -> Result<(bool, bool), MpvError> {
+        let params = self.send_command(&[json!("get_property"), json!("video-params")])?;
+        let dimensions = params.as_ref().and_then(|value| {
+            let width = value.get("w").or_else(|| value.get("dw"))?.as_u64()?;
+            let height = value.get("h").or_else(|| value.get("dh"))?.as_u64()?;
+            Some(width > 0 && height > 0)
+        });
+        Ok((true, dimensions.unwrap_or(false)))
     }
 
     /// Queries video rendering details (width, height, fps, gpu context, estimated-vf-fps).
@@ -536,11 +1134,5 @@ impl MpvPlayer {
 impl Drop for MpvPlayer {
     fn drop(&mut self) {
         let _ = self.stop();
-        #[cfg(windows)]
-        if let Some(h) = self.job_handle.take() {
-            unsafe {
-                let _ = windows::Win32::Foundation::CloseHandle(h);
-            }
-        }
     }
 }
