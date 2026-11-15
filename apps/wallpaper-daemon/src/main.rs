@@ -565,7 +565,6 @@ fn handle_control(
     }
 }
 
-
 #[cfg(windows)]
 fn dispatch_ipc(
     request: wallpaper_protocol::RequestEnvelope,
