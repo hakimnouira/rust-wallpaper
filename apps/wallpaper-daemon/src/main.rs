@@ -728,6 +728,13 @@ fn dispatch_ipc(
             }
             Response::Accepted
         }
+        Command::UnassignWallpaper { monitor } => match resolve_device(&monitor, known) {
+            Some(device) => match runtime.unassign_user(&device, manager, now) {
+                Ok(()) => Response::Accepted,
+                Err(error) => return failure(ErrorCode::RuntimeFailure, error),
+            },
+            None => return failure(ErrorCode::NotFound, format!("unknown monitor '{monitor}'")),
+        },
         command @ (Command::Pause { .. } | Command::Resume { .. }) => {
             let (monitor, paused) = match command {
                 Command::Pause { monitor } => (monitor, true),
