@@ -82,8 +82,8 @@ A dedicated desktop application executable structured as follows:
 
 ### Named Pipe Details
 - **Path**: `\\.\pipe\rust-wallpaper-ipc`
-- **Security**: Current user session access only (`PIPE_ACCESS_DUPLEX`, `PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT`).
-- **Framing**: Line-delimited JSON (`\n`) for stream simplicity, human-inspectable debugging, and zero-allocation streaming.
+- **Security**: Reject remote clients. Local named-pipe access is governed by the process token's default pipe DACL in this first iteration; a strict per-user ACL and impersonation checks are release-hardening work.
+- **Framing**: Line-delimited JSON (`\n`) for stream simplicity, human-inspectable debugging, and bounded, allocation-conscious streaming.
 
 ### Protocol Flow
 
