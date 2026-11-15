@@ -119,29 +119,61 @@ fn main() -> anyhow::Result<()> {
             library.set_setting("performance_profile", profile_name)?;
         }
 
-        // Import the bundled demo assets when present. They are not treated as permanent
-        // assignments: the monitor registry below owns the persisted user choices.
-        let nature_mp4 = PathBuf::from("assets/wallpapers/sample-nature.mp4");
-        let abstract_webm = PathBuf::from("assets/wallpapers/sample-abstract.webm");
+        // Import bundled demo assets only once when not already present in the library.
+        // Use canonical absolute paths to avoid relative-path resolution failures.
+        let nature_mp4 = std::fs::canonicalize("assets/wallpapers/sample-nature.mp4")
+            .ok()
+            .or_else(|| {
+                let p = PathBuf::from("assets/wallpapers/sample-nature.mp4");
+                if p.is_file() {
+                    Some(p)
+                } else {
+                    None
+                }
+            });
+        let abstract_webm = std::fs::canonicalize("assets/wallpapers/sample-abstract.webm")
+            .ok()
+            .or_else(|| {
+                let p = PathBuf::from("assets/wallpapers/sample-abstract.webm");
+                if p.is_file() {
+                    Some(p)
+                } else {
+                    None
+                }
+            });
+
         let demo_config = PlaybackConfig {
             loop_playback: true,
             mute: true,
             volume: 80,
             hardware_acceleration: HardwareAcceleration::Auto,
         };
-        if nature_mp4.is_file() {
-            let _ = library.import_video(
-                &nature_mp4,
-                Some("Nature Test Video (MP4)"),
-                Some(demo_config.clone()),
-            );
+
+        let existing_wallpapers = library.list().unwrap_or_default();
+        let has_nature = existing_wallpapers
+            .iter()
+            .any(|w| w.title() == "Nature Test Video (MP4)");
+        let has_abstract = existing_wallpapers
+            .iter()
+            .any(|w| w.title() == "Abstract Test Video (WebM)");
+
+        if !has_nature {
+            if let Some(ref path) = nature_mp4 {
+                let _ = library.import_video(
+                    path,
+                    Some("Nature Test Video (MP4)"),
+                    Some(demo_config.clone()),
+                );
+            }
         }
-        if abstract_webm.is_file() {
-            let _ = library.import_video(
-                &abstract_webm,
-                Some("Abstract Test Video (WebM)"),
-                Some(demo_config.clone()),
-            );
+        if !has_abstract {
+            if let Some(ref path) = abstract_webm {
+                let _ = library.import_video(
+                    path,
+                    Some("Abstract Test Video (WebM)"),
+                    Some(demo_config.clone()),
+                );
+            }
         }
         info!(
             count = library.list().unwrap_or_default().len(),
@@ -155,7 +187,7 @@ fn main() -> anyhow::Result<()> {
                     .metadata
                     .thumbnail_path
                     .as_ref()
-                    .map_or(true, |p| !std::path::Path::new(p).exists());
+                    .is_none_or(|p| !std::path::Path::new(p).exists());
                 let state_pending = wp.metadata.is_processing();
                 if thumb_missing || state_pending {
                     pipeline.submit(wp.id, PathBuf::from(&wp.metadata.source));
@@ -163,13 +195,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        let fallback_path = if nature_mp4.is_file() {
-            Some(nature_mp4)
-        } else if abstract_webm.is_file() {
-            Some(abstract_webm)
-        } else {
-            None
-        };
+        let fallback_path = nature_mp4.or(abstract_webm);
         let fallback = fallback_path.map(|path| Assignment {
             video_path: path,
             config: demo_config,
@@ -719,8 +745,12 @@ fn dispatch_ipc(
             if let Some(ref thumb_path_str) = wallpaper.metadata.thumbnail_path {
                 let thumb_path = PathBuf::from(thumb_path_str);
                 if thumb_path.is_file() {
-                    let _ = std::fs::remove_file(thumb_path);
+                    let _ = std::fs::remove_file(&thumb_path);
                 }
+            }
+            let candidate_thumb = pipeline.thumbnail_path(wallpaper_id);
+            if candidate_thumb.is_file() {
+                let _ = std::fs::remove_file(&candidate_thumb);
             }
             match library.delete(wallpaper_id) {
                 Ok(true) => Response::Accepted,

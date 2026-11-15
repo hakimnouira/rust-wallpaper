@@ -6,12 +6,15 @@
 #[cfg(windows)]
 mod desktop {
     use eframe::egui;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::runtime::Builder;
     use tokio::time::timeout;
-    use wallpaper_core::{PerformanceProfile, Wallpaper, WallpaperId};
+    use wallpaper_core::{
+        AspectRatioFilter, CodecFilter, LibraryQuery, PerformanceProfile, ResolutionFilter,
+        SortDirection, SortKey, StatusFilter, Wallpaper, WallpaperId,
+    };
     use wallpaper_protocol::client::IpcClient;
     use wallpaper_protocol::{Command, MonitorInfo, PlayerStatusInfo, RequestEnvelope, Response};
 
@@ -26,11 +29,60 @@ mod desktop {
         last_updated: Option<Instant>,
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
     enum Page {
         Library,
+        Browse,
         Monitors,
         Settings,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    enum BrowseTab {
+        #[default]
+        SteamWorkshop,
+        OnlineWallpapers,
+    }
+
+    enum DownloadMessage {
+        Progress {
+            id: String,
+            status: String,
+        },
+        Complete {
+            id: String,
+            path: std::path::PathBuf,
+            title: String,
+        },
+        Failed {
+            id: String,
+            error: String,
+        },
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    enum ViewMode {
+        #[default]
+        Grid,
+        List,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    enum ThumbnailScale {
+        Small,
+        #[default]
+        Medium,
+        Large,
+    }
+
+    impl ThumbnailScale {
+        fn dimensions(self) -> egui::Vec2 {
+            match self {
+                Self::Small => egui::vec2(140.0, 79.0),
+                Self::Medium => egui::vec2(200.0, 112.0),
+                Self::Large => egui::vec2(280.0, 158.0),
+            }
+        }
     }
 
     fn format_duration(secs: f64) -> String {
@@ -40,6 +92,7 @@ mod desktop {
         format!("{:02}:{:02}", m, s)
     }
 
+    #[allow(dead_code)]
     fn format_file_size(bytes: u64) -> String {
         if bytes >= 1024 * 1024 * 1024 {
             format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
@@ -58,28 +111,63 @@ mod desktop {
         page: Page,
         selected_monitor: Option<String>,
         selected_wallpaper: Option<WallpaperId>,
+        selected_wallpapers: HashSet<WallpaperId>,
         volumes: HashMap<String, u32>,
         import_path: String,
         import_title: String,
-        search: String,
+        query: LibraryQuery,
+        view_mode: ViewMode,
+        thumb_scale: ThumbnailScale,
         notice: String,
-        textures: HashMap<std::path::PathBuf, egui::TextureHandle>,
+        textures: HashMap<std::path::PathBuf, (egui::TextureHandle, u64)>,
+        frame_counter: u64,
+        browse_tab: BrowseTab,
+        workshop_items: Vec<wallpaper_core::WorkshopItem>,
+        workshop_scanned: bool,
+        workshop_filter_video_only: bool,
+        workshop_search: String,
+        custom_steam_path: String,
+        online_items: Vec<wallpaper_core::OnlineWallpaper>,
+        online_search_query: String,
+        online_category: String,
+        online_download_status: HashMap<String, String>,
+        download_tx: mpsc::Sender<DownloadMessage>,
+        download_rx: mpsc::Receiver<DownloadMessage>,
+        pending_apply_source: Option<String>,
     }
 
     impl DesktopApp {
         fn new(snapshot: Arc<Mutex<Snapshot>>, commands: mpsc::Sender<Command>) -> Self {
+            let (download_tx, download_rx) = mpsc::channel();
             Self {
                 snapshot,
                 commands,
                 page: Page::Library,
                 selected_monitor: None,
                 selected_wallpaper: None,
+                selected_wallpapers: HashSet::new(),
                 volumes: HashMap::new(),
                 import_path: String::new(),
                 import_title: String::new(),
-                search: String::new(),
+                query: LibraryQuery::default(),
+                view_mode: ViewMode::Grid,
+                thumb_scale: ThumbnailScale::Medium,
                 notice: "Connect to the wallpaper daemon to get started.".into(),
                 textures: HashMap::new(),
+                frame_counter: 0,
+                browse_tab: BrowseTab::SteamWorkshop,
+                workshop_items: Vec::new(),
+                workshop_scanned: false,
+                workshop_filter_video_only: true,
+                workshop_search: String::new(),
+                custom_steam_path: String::new(),
+                online_items: Vec::new(),
+                online_search_query: String::new(),
+                online_category: "Videos (Free Loops)".to_string(),
+                online_download_status: HashMap::new(),
+                download_tx,
+                download_rx,
+                pending_apply_source: None,
             }
         }
 
@@ -90,13 +178,70 @@ mod desktop {
             }
         }
 
+        fn prune_texture_cache(&mut self) {
+            if self.textures.len() > 120 {
+                let mut entries: Vec<(std::path::PathBuf, u64)> = self
+                    .textures
+                    .iter()
+                    .map(|(p, (_, frame))| (p.clone(), *frame))
+                    .collect();
+                entries.sort_by_key(|(_, frame)| *frame);
+                let to_remove = entries.len().saturating_sub(80);
+                for (path, _) in entries.into_iter().take(to_remove) {
+                    self.textures.remove(&path);
+                }
+            }
+        }
+
+        fn get_or_load_texture(
+            &mut self,
+            ctx: &egui::Context,
+            path: &std::path::Path,
+            decodes_left: &mut usize,
+        ) -> Option<egui::TextureId> {
+            if let Some((handle, frame)) = self.textures.get_mut(path) {
+                *frame = self.frame_counter;
+                return Some(handle.id());
+            }
+
+            if *decodes_left > 0 && path.is_file() {
+                if let Ok(bytes) = std::fs::read(path) {
+                    if let Ok(img) = image::load_from_memory(&bytes) {
+                        let rgba = img.to_rgba8();
+                        let size = [rgba.width() as usize, rgba.height() as usize];
+                        let pixels = rgba.into_raw();
+                        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                        let handle = ctx.load_texture(
+                            path.to_string_lossy(),
+                            color_image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        *decodes_left -= 1;
+                        ctx.request_repaint();
+                        let id = handle.id();
+                        self.textures
+                            .insert(path.to_path_buf(), (handle, self.frame_counter));
+                        return Some(id);
+                    }
+                }
+            }
+
+            None
+        }
+
         fn render_library(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+            self.frame_counter = self.frame_counter.wrapping_add(1);
+            self.prune_texture_cache();
+            let mut decodes_budget: usize = 4;
+
             ui.heading("Wallpaper library");
-            ui.label("Import local videos and assign them to your displays.");
-            ui.add_space(12.0);
+            ui.label("Import local videos, filter, and assign them to your displays.");
+            ui.add_space(8.0);
+
+            // Import Box
             ui.group(|ui| {
-                ui.label("Import a video");
                 ui.horizontal(|ui| {
+                    ui.strong("Import:");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.import_path)
                             .hint_text(r"Full path, e.g. D:\Wallpapers\nature.mp4"),
@@ -109,276 +254,1043 @@ mod desktop {
                             self.import_path = path.display().to_string();
                         }
                     }
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.import_title)
+                            .hint_text("Display name (optional)"),
+                    );
+                    if ui
+                        .add_enabled(
+                            snapshot.connected && !self.import_path.trim().is_empty(),
+                            egui::Button::new("Import video"),
+                        )
+                        .clicked()
+                    {
+                        let path = self.import_path.trim().to_string();
+                        let title = if self.import_title.trim().is_empty() {
+                            None
+                        } else {
+                            Some(self.import_title.trim().to_string())
+                        };
+                        self.send(
+                            Command::ImportWallpaper { path, title },
+                            "Import requested…",
+                        );
+                    }
                 });
+            });
+
+            ui.add_space(6.0);
+
+            // Row 1: Search bar + View Mode + Thumb Scale
+            ui.horizontal(|ui| {
+                ui.label("🔍");
                 ui.add(
-                    egui::TextEdit::singleline(&mut self.import_title)
-                        .hint_text("Optional display name"),
+                    egui::TextEdit::singleline(&mut self.query.search)
+                        .hint_text("Search title, file, codec, resolution…")
+                        .desired_width(260.0),
                 );
+                if !self.query.search.is_empty() && ui.small_button("✖").clicked() {
+                    self.query.search.clear();
+                }
+
+                ui.separator();
+
+                // View Mode
                 if ui
-                    .add_enabled(
-                        snapshot.connected && !self.import_path.trim().is_empty(),
-                        egui::Button::new("Import video"),
-                    )
+                    .selectable_label(self.view_mode == ViewMode::Grid, "⊞ Grid")
                     .clicked()
                 {
-                    let path = self.import_path.trim().to_string();
-                    let title = if self.import_title.trim().is_empty() {
-                        None
-                    } else {
-                        Some(self.import_title.trim().to_string())
-                    };
-                    self.send(
-                        Command::ImportWallpaper { path, title },
-                        "Import requested…",
-                    );
+                    self.view_mode = ViewMode::Grid;
                 }
-            });
-            ui.add_space(12.0);
-            ui.horizontal(|ui| {
-                ui.label("Search");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search)
-                        .hint_text("Filter by name or path"),
-                );
-            });
-            let selected_monitor = self.selected_monitor.clone();
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let filtered: Vec<&Wallpaper> = snapshot
-                    .wallpapers
-                    .iter()
-                    .filter(|wallpaper| {
-                        let query = self.search.to_lowercase();
-                        query.is_empty()
-                            || wallpaper.title().to_lowercase().contains(&query)
-                            || wallpaper.source().to_lowercase().contains(&query)
-                    })
-                    .collect();
-                if filtered.is_empty() {
-                    ui.add_space(18.0);
-                    ui.label(if snapshot.connected {
-                        "Your library is empty. Import an MP4, WebM, MKV or MOV video to begin."
-                    } else {
-                        "Waiting for daemon connection…"
-                    });
+                if ui
+                    .selectable_label(self.view_mode == ViewMode::List, "☰ List")
+                    .clicked()
+                {
+                    self.view_mode = ViewMode::List;
                 }
-                for wallpaper in filtered {
-                    ui.group(|ui| {
-                        ui.horizontal(|ui| {
-                            // Left: Thumbnail preview or placeholder
-                            let thumb_size = egui::vec2(160.0, 90.0);
-                            let has_thumb = wallpaper
-                                .metadata
-                                .thumbnail_path
-                                .as_ref()
-                                .map_or(false, |p| std::path::Path::new(p).is_file());
 
-                            if has_thumb {
-                                let path = std::path::PathBuf::from(
-                                    wallpaper.metadata.thumbnail_path.as_ref().unwrap(),
+                ui.separator();
+
+                // Thumbnail scale
+                if self.view_mode == ViewMode::Grid {
+                    egui::ComboBox::from_id_salt("thumb_scale_combo")
+                        .selected_text(match self.thumb_scale {
+                            ThumbnailScale::Small => "Thumb: Small",
+                            ThumbnailScale::Medium => "Thumb: Medium",
+                            ThumbnailScale::Large => "Thumb: Large",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.thumb_scale,
+                                ThumbnailScale::Small,
+                                "Small (140px)",
+                            );
+                            ui.selectable_value(
+                                &mut self.thumb_scale,
+                                ThumbnailScale::Medium,
+                                "Medium (200px)",
+                            );
+                            ui.selectable_value(
+                                &mut self.thumb_scale,
+                                ThumbnailScale::Large,
+                                "Large (280px)",
+                            );
+                        });
+                }
+            });
+
+            ui.add_space(4.0);
+
+            // Row 2: Sort and Filters
+            ui.horizontal_wrapped(|ui| {
+                // Sort Key
+                egui::ComboBox::from_id_salt("sort_key_combo")
+                    .selected_text(format!("Sort: {}", self.query.sort_key.label()))
+                    .show_ui(ui, |ui| {
+                        for key in SortKey::ALL {
+                            ui.selectable_value(&mut self.query.sort_key, key, key.label());
+                        }
+                    });
+
+                let dir_text = match self.query.sort_direction {
+                    SortDirection::Ascending => "▲ Asc",
+                    SortDirection::Descending => "▼ Desc",
+                };
+                if ui.button(dir_text).clicked() {
+                    self.query.sort_direction = match self.query.sort_direction {
+                        SortDirection::Ascending => SortDirection::Descending,
+                        SortDirection::Descending => SortDirection::Ascending,
+                    };
+                }
+
+                ui.separator();
+
+                // Resolution
+                egui::ComboBox::from_id_salt("res_filter_combo")
+                    .selected_text(self.query.resolution.label())
+                    .show_ui(ui, |ui| {
+                        for item in ResolutionFilter::ALL {
+                            ui.selectable_value(&mut self.query.resolution, item, item.label());
+                        }
+                    });
+
+                // Aspect ratio
+                egui::ComboBox::from_id_salt("aspect_filter_combo")
+                    .selected_text(self.query.aspect_ratio.label())
+                    .show_ui(ui, |ui| {
+                        for item in AspectRatioFilter::ALL {
+                            ui.selectable_value(&mut self.query.aspect_ratio, item, item.label());
+                        }
+                    });
+
+                // Codec
+                egui::ComboBox::from_id_salt("codec_filter_combo")
+                    .selected_text(self.query.codec.label())
+                    .show_ui(ui, |ui| {
+                        for item in CodecFilter::ALL {
+                            ui.selectable_value(&mut self.query.codec, item, item.label());
+                        }
+                    });
+
+                // Status
+                egui::ComboBox::from_id_salt("status_filter_combo")
+                    .selected_text(self.query.status.label())
+                    .show_ui(ui, |ui| {
+                        for item in StatusFilter::ALL {
+                            ui.selectable_value(&mut self.query.status, item, item.label());
+                        }
+                    });
+
+                if self.query.is_filtered() && ui.button("✖ Reset Filters").clicked() {
+                    self.query.reset_filters();
+                }
+            });
+
+            ui.add_space(6.0);
+
+            // Filtered results
+            let filtered: Vec<&Wallpaper> = self.query.apply(&snapshot.wallpapers);
+
+            // Multi-Selection and Bulk Actions Bar
+            ui.horizontal(|ui| {
+                ui.small(format!(
+                    "Showing {} of {} wallpapers",
+                    filtered.len(),
+                    snapshot.wallpapers.len()
+                ));
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !self.selected_wallpapers.is_empty() {
+                        if ui
+                            .add_enabled(
+                                snapshot.connected,
+                                egui::Button::new(
+                                    egui::RichText::new("🗑 Remove Selected")
+                                        .color(egui::Color32::from_rgb(230, 80, 80)),
+                                ),
+                            )
+                            .clicked()
+                        {
+                            let to_remove: Vec<WallpaperId> =
+                                self.selected_wallpapers.iter().copied().collect();
+                            for id in to_remove {
+                                self.send(
+                                    Command::RemoveWallpaper { wallpaper_id: id },
+                                    "Bulk removal requested…",
                                 );
-                                if !self.textures.contains_key(&path) {
-                                    if let Ok(bytes) = std::fs::read(&path) {
-                                        if let Ok(img) = image::load_from_memory(&bytes) {
-                                            let rgba = img.to_rgba8();
-                                            let size =
-                                                [rgba.width() as usize, rgba.height() as usize];
-                                            let pixels = rgba.into_raw();
-                                            let color_image =
-                                                egui::ColorImage::from_rgba_unmultiplied(
-                                                    size, &pixels,
-                                                );
-                                            let handle = ui.ctx().load_texture(
-                                                path.to_string_lossy(),
-                                                color_image,
-                                                egui::TextureOptions::LINEAR,
-                                            );
-                                            self.textures.insert(path.clone(), handle);
+                            }
+                            self.selected_wallpapers.clear();
+                        }
+
+                        if ui.button("Clear Selection").clicked() {
+                            self.selected_wallpapers.clear();
+                        }
+
+                        ui.label(format!("✓ {} selected", self.selected_wallpapers.len()));
+                    } else if !filtered.is_empty() && ui.button("Select All Visible").clicked() {
+                        for wp in &filtered {
+                            self.selected_wallpapers.insert(wp.id);
+                        }
+                    }
+                });
+            });
+
+            ui.separator();
+
+            // Empty & No-Results States
+            if snapshot.wallpapers.is_empty() {
+                ui.add_space(32.0);
+                ui.vertical_centered(|ui| {
+                    ui.heading("📂 Your library is empty");
+                    ui.label("Import an MP4, WebM, MKV or MOV video file to get started.");
+                    ui.add_space(8.0);
+                    if ui.button("Browse files…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Video files", &["mp4", "webm", "mkv", "mov"])
+                            .pick_file()
+                        {
+                            self.import_path = path.display().to_string();
+                        }
+                    }
+                });
+                return;
+            }
+
+            if filtered.is_empty() {
+                ui.add_space(32.0);
+                ui.vertical_centered(|ui| {
+                    ui.heading("🔍 No matching wallpapers");
+                    ui.label("No wallpapers match the active search and filter criteria.");
+                    ui.add_space(8.0);
+                    if ui.button("Reset Filters").clicked() {
+                        self.query.reset_filters();
+                    }
+                });
+                return;
+            }
+
+            // Virtualized Viewport Rendering
+            let selected_monitor = self.selected_monitor.clone();
+            let mut assign_req = None;
+            let mut select_req = None;
+            let mut retry_req = None;
+            let mut remove_req = None;
+            let mut toggle_select_req = None;
+
+            let ctx = ui.ctx().clone();
+
+            match self.view_mode {
+                ViewMode::List => {
+                    let row_height = 56.0;
+                    let total_items = filtered.len();
+
+                    egui::ScrollArea::vertical().show_rows(
+                        ui,
+                        row_height,
+                        total_items,
+                        |ui, row_range| {
+                            for idx in row_range {
+                                let wallpaper = filtered[idx];
+                                let is_selected = self.selected_wallpapers.contains(&wallpaper.id);
+                                let is_current = self.selected_wallpaper == Some(wallpaper.id);
+
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        // Checkbox for multi-selection
+                                        let mut checked = is_selected;
+                                        if ui.checkbox(&mut checked, "").changed() {
+                                            toggle_select_req = Some((wallpaper.id, checked));
                                         }
-                                    }
-                                }
-                                if let Some(tex) = self.textures.get(&path) {
-                                    ui.image((tex.id(), thumb_size));
-                                } else {
-                                    ui.allocate_ui(thumb_size, |ui| {
-                                        ui.centered_and_justified(|ui| {
-                                            ui.label("Loading…");
+
+                                        // Thumbnail small preview
+                                        let thumb_size = egui::vec2(64.0, 36.0);
+                                        let thumb_path = wallpaper
+                                            .metadata
+                                            .thumbnail_path
+                                            .as_ref()
+                                            .map(std::path::PathBuf::from);
+
+                                        let tex_id = thumb_path.as_deref().and_then(|p| {
+                                            self.get_or_load_texture(&ctx, p, &mut decodes_budget)
                                         });
-                                    });
-                                }
-                            } else if wallpaper.metadata.is_processing() {
-                                ui.allocate_ui(thumb_size, |ui| {
-                                    ui.group(|ui| {
-                                        ui.centered_and_justified(|ui| {
-                                            ui.vertical_centered(|ui| {
-                                                ui.spinner();
-                                                ui.small("Extracting…");
+
+                                        if let Some(id) = tex_id {
+                                            ui.image((id, thumb_size));
+                                        } else if wallpaper.metadata.is_processing() {
+                                            ui.allocate_ui(thumb_size, |ui| {
+                                                ui.centered_and_justified(|ui| {
+                                                    ui.spinner();
+                                                });
                                             });
-                                        });
-                                    });
-                                });
-                            } else if wallpaper.metadata.is_failed() {
-                                ui.allocate_ui(thumb_size, |ui| {
-                                    ui.group(|ui| {
-                                        ui.centered_and_justified(|ui| {
-                                            ui.vertical_centered(|ui| {
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(230, 80, 80),
-                                                    "⚠ Error",
-                                                );
-                                                if ui.button("Retry").clicked() {
-                                                    self.send(
-                                                        Command::RetryProcessing {
-                                                            wallpaper_id: wallpaper.id,
-                                                        },
-                                                        "Retrying extraction…",
+                                        } else {
+                                            ui.allocate_ui(thumb_size, |ui| {
+                                                ui.centered_and_justified(|ui| {
+                                                    ui.small("No thumb");
+                                                });
+                                            });
+                                        }
+
+                                        ui.vertical(|ui| {
+                                            ui.horizontal(|ui| {
+                                                ui.strong(wallpaper.title());
+                                                if let Some(ref cat) =
+                                                    wallpaper.metadata.resolution_category
+                                                {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(60, 160, 240),
+                                                        format!("[{}]", cat),
+                                                    );
+                                                }
+                                                if let Some(d) = wallpaper.metadata.duration_secs {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(180, 180, 180),
+                                                        format_duration(d),
                                                     );
                                                 }
                                             });
+                                            ui.small(wallpaper.source());
                                         });
-                                    });
-                                });
-                            } else {
-                                ui.allocate_ui(thumb_size, |ui| {
-                                    ui.group(|ui| {
-                                        ui.centered_and_justified(|ui| {
-                                            ui.label("No preview");
-                                        });
+
+                                        // Actions on the right
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                if ui
+                                                    .add_enabled(
+                                                        snapshot.connected,
+                                                        egui::Button::new("Assign"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    assign_req = Some(wallpaper.id);
+                                                }
+                                                if ui
+                                                    .selectable_label(is_current, "Select")
+                                                    .clicked()
+                                                {
+                                                    select_req = Some(wallpaper.id);
+                                                }
+                                                if wallpaper.metadata.is_failed()
+                                                    && ui.button("Retry").clicked()
+                                                {
+                                                    retry_req = Some(wallpaper.id);
+                                                }
+                                                if ui
+                                                    .add_enabled(
+                                                        snapshot.connected,
+                                                        egui::Button::new("Remove"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    remove_req = Some(wallpaper.id);
+                                                }
+                                            },
+                                        );
                                     });
                                 });
                             }
+                        },
+                    );
+                }
+                ViewMode::Grid => {
+                    let thumb_dim = self.thumb_scale.dimensions();
+                    let card_width = thumb_dim.x + 20.0;
+                    let card_height = thumb_dim.y + 115.0;
+                    let avail_w = ui.available_width().max(card_width);
+                    let spacing = 8.0;
+                    let cols = ((avail_w + spacing) / (card_width + spacing))
+                        .floor()
+                        .max(1.0) as usize;
+                    let total_rows = filtered.len().div_ceil(cols);
 
-                            ui.add_space(8.0);
-
-                            // Center: metadata details & badges
-                            ui.vertical(|ui| {
+                    egui::ScrollArea::vertical().show_rows(
+                        ui,
+                        card_height + spacing,
+                        total_rows,
+                        |ui, row_range| {
+                            for row_idx in row_range {
                                 ui.horizontal(|ui| {
-                                    ui.strong(wallpaper.title());
-                                    if let Some(ref cat) = wallpaper.metadata.resolution_category {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(60, 160, 240),
-                                            format!("[{}]", cat),
-                                        );
-                                    }
-                                    if let Some(d) = wallpaper.metadata.duration_secs {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(180, 180, 180),
-                                            format_duration(d),
-                                        );
+                                    for col_idx in 0..cols {
+                                        let item_idx = row_idx * cols + col_idx;
+                                        if item_idx >= filtered.len() {
+                                            break;
+                                        }
+                                        let wallpaper = filtered[item_idx];
+                                        let is_selected =
+                                            self.selected_wallpapers.contains(&wallpaper.id);
+                                        let is_current =
+                                            self.selected_wallpaper == Some(wallpaper.id);
+
+                                        ui.allocate_ui(egui::vec2(card_width, card_height), |ui| {
+                                            ui.group(|ui| {
+                                                ui.vertical(|ui| {
+                                                    // Top: Selection checkbox + Title
+                                                    ui.horizontal(|ui| {
+                                                        let mut checked = is_selected;
+                                                        if ui.checkbox(&mut checked, "").changed() {
+                                                            toggle_select_req =
+                                                                Some((wallpaper.id, checked));
+                                                        }
+                                                        ui.strong(wallpaper.title());
+                                                    });
+
+                                                    // Thumbnail preview
+                                                    let thumb_path = wallpaper
+                                                        .metadata
+                                                        .thumbnail_path
+                                                        .as_ref()
+                                                        .map(std::path::PathBuf::from);
+
+                                                    let tex_id =
+                                                        thumb_path.as_deref().and_then(|p| {
+                                                            self.get_or_load_texture(
+                                                                &ctx,
+                                                                p,
+                                                                &mut decodes_budget,
+                                                            )
+                                                        });
+
+                                                    if let Some(id) = tex_id {
+                                                        ui.image((id, thumb_dim));
+                                                    } else if wallpaper.metadata.is_processing() {
+                                                        ui.allocate_ui(thumb_dim, |ui| {
+                                                            ui.centered_and_justified(|ui| {
+                                                                ui.vertical_centered(|ui| {
+                                                                    ui.spinner();
+                                                                    ui.small("Extracting…");
+                                                                });
+                                                            });
+                                                        });
+                                                    } else if wallpaper.metadata.is_failed() {
+                                                        ui.allocate_ui(thumb_dim, |ui| {
+                                                            ui.centered_and_justified(|ui| {
+                                                                ui.vertical_centered(|ui| {
+                                                                    ui.colored_label(
+                                                                        egui::Color32::from_rgb(
+                                                                            230, 80, 80,
+                                                                        ),
+                                                                        "⚠ Error",
+                                                                    );
+                                                                });
+                                                            });
+                                                        });
+                                                    } else {
+                                                        ui.allocate_ui(thumb_dim, |ui| {
+                                                            ui.centered_and_justified(|ui| {
+                                                                ui.small("No preview");
+                                                            });
+                                                        });
+                                                    }
+
+                                                    // Badges
+                                                    ui.horizontal_wrapped(|ui| {
+                                                        if let Some(ref cat) =
+                                                            wallpaper.metadata.resolution_category
+                                                        {
+                                                            ui.colored_label(
+                                                                egui::Color32::from_rgb(
+                                                                    60, 160, 240,
+                                                                ),
+                                                                format!("[{}]", cat),
+                                                            );
+                                                        }
+                                                        if let Some(d) =
+                                                            wallpaper.metadata.duration_secs
+                                                        {
+                                                            ui.label(format_duration(d));
+                                                        }
+                                                        if let Some(ref codec) =
+                                                            wallpaper.metadata.codec
+                                                        {
+                                                            ui.label(codec.to_uppercase());
+                                                        }
+                                                    });
+
+                                                    // Action buttons
+                                                    ui.horizontal(|ui| {
+                                                        if ui
+                                                            .add_enabled(
+                                                                snapshot.connected,
+                                                                egui::Button::new("Assign"),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            assign_req = Some(wallpaper.id);
+                                                        }
+                                                        if ui
+                                                            .selectable_label(is_current, "Select")
+                                                            .clicked()
+                                                        {
+                                                            select_req = Some(wallpaper.id);
+                                                        }
+                                                        if wallpaper.metadata.is_failed()
+                                                            && ui.button("Retry").clicked()
+                                                        {
+                                                            retry_req = Some(wallpaper.id);
+                                                        }
+                                                        if ui
+                                                            .add_enabled(
+                                                                snapshot.connected,
+                                                                egui::Button::new("Remove"),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            remove_req = Some(wallpaper.id);
+                                                        }
+                                                    });
+                                                });
+                                            });
+                                        });
+                                        ui.add_space(spacing);
                                     }
                                 });
+                                ui.add_space(spacing);
+                            }
+                        },
+                    );
+                }
+            }
 
-                                ui.small(wallpaper.source());
+            // Apply queued actions
+            if let Some((id, checked)) = toggle_select_req {
+                if checked {
+                    self.selected_wallpapers.insert(id);
+                } else {
+                    self.selected_wallpapers.remove(&id);
+                }
+            }
 
-                                ui.horizontal_wrapped(|ui| {
-                                    if let (Some(w), Some(h)) =
-                                        (wallpaper.metadata.width, wallpaper.metadata.height)
-                                    {
-                                        ui.label(format!("{w} × {h}"));
-                                        ui.label("·");
-                                    }
-                                    if let Some(fps) = wallpaper.metadata.fps {
-                                        ui.label(format!("{:.0} fps", fps));
-                                        ui.label("·");
-                                    }
-                                    if let Some(ref codec) = wallpaper.metadata.codec {
-                                        ui.label(codec.to_uppercase());
-                                        ui.label("·");
-                                    }
-                                    if let Some(size) = wallpaper.metadata.file_size {
-                                        ui.label(format_file_size(size));
-                                        ui.label("·");
-                                    }
-                                    match wallpaper.metadata.processing_state {
-                                        wallpaper_core::ProcessingStatus::Completed => {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(80, 200, 80),
-                                                "Ready",
-                                            );
+            if let Some(id) = assign_req {
+                self.send(
+                    Command::ApplyWallpaper {
+                        wallpaper_id: id,
+                        monitor: selected_monitor,
+                    },
+                    "Wallpaper assignment requested…",
+                );
+            }
+
+            if let Some(id) = select_req {
+                self.selected_wallpaper = Some(id);
+            }
+
+            if let Some(id) = retry_req {
+                self.send(
+                    Command::RetryProcessing { wallpaper_id: id },
+                    "Retrying processing…",
+                );
+            }
+
+            if let Some(id) = remove_req {
+                self.send(
+                    Command::RemoveWallpaper { wallpaper_id: id },
+                    "Removal requested…",
+                );
+            }
+        }
+
+        fn render_browse(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+            // Process any background download completion messages
+            while let Ok(msg) = self.download_rx.try_recv() {
+                match msg {
+                    DownloadMessage::Progress { id, status } => {
+                        self.online_download_status.insert(id, status);
+                    }
+                    DownloadMessage::Complete { id, path, title } => {
+                        self.online_download_status
+                            .insert(id.clone(), "Downloaded! Adding to library…".into());
+                        self.send(
+                            Command::ImportWallpaper {
+                                path: path.to_string_lossy().to_string(),
+                                title: Some(title),
+                            },
+                            "Online wallpaper imported to library",
+                        );
+                    }
+                    DownloadMessage::Failed { id, error } => {
+                        self.online_download_status
+                            .insert(id, format!("Failed: {error}"));
+                    }
+                }
+            }
+
+            // Auto-scan Steam Workshop on first visit
+            if !self.workshop_scanned {
+                let custom = if !self.custom_steam_path.trim().is_empty() {
+                    vec![std::path::PathBuf::from(self.custom_steam_path.trim())]
+                } else {
+                    Vec::new()
+                };
+                self.workshop_items = wallpaper_core::scan_wallpaper_engine_items(&custom);
+                self.workshop_scanned = true;
+            }
+
+            ui.heading("Browse & Workshop");
+            ui.add_space(4.0);
+
+            // Sub-tabs
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(
+                        matches!(self.browse_tab, BrowseTab::SteamWorkshop),
+                        "📂  Steam Workshop (Local)",
+                    )
+                    .clicked()
+                {
+                    self.browse_tab = BrowseTab::SteamWorkshop;
+                }
+                if ui
+                    .selectable_label(
+                        matches!(self.browse_tab, BrowseTab::OnlineWallpapers),
+                        "🌐  Online Wallpapers (Wallhaven & Videos)",
+                    )
+                    .clicked()
+                {
+                    self.browse_tab = BrowseTab::OnlineWallpapers;
+                    if self.online_items.is_empty() {
+                        self.online_items = wallpaper_core::get_curated_video_wallpapers();
+                    }
+                }
+            });
+
+            ui.separator();
+            ui.add_space(6.0);
+
+            match self.browse_tab {
+                BrowseTab::SteamWorkshop => self.render_steam_workshop(ui, snapshot),
+                BrowseTab::OnlineWallpapers => self.render_online_wallpapers(ui, snapshot),
+            }
+        }
+
+        fn render_steam_workshop(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+            ui.horizontal(|ui| {
+                ui.label("🔍 Search:");
+                ui.text_edit_singleline(&mut self.workshop_search);
+                if ui.button("⟳ Refresh / Scan").clicked() {
+                    let custom = if !self.custom_steam_path.trim().is_empty() {
+                        vec![std::path::PathBuf::from(self.custom_steam_path.trim())]
+                    } else {
+                        Vec::new()
+                    };
+                    self.workshop_items = wallpaper_core::scan_wallpaper_engine_items(&custom);
+                    self.workshop_scanned = true;
+                    self.notice = format!("Found {} Steam items", self.workshop_items.len());
+                }
+                ui.checkbox(
+                    &mut self.workshop_filter_video_only,
+                    "Playable videos only (.mp4, .webm)",
+                );
+            });
+
+            ui.horizontal(|ui| {
+                ui.small("Custom Steam / Wallpaper Engine folder (optional):");
+                ui.text_edit_singleline(&mut self.custom_steam_path);
+            });
+
+            ui.add_space(6.0);
+
+            let search_term = self.workshop_search.trim().to_lowercase();
+            let filtered: Vec<wallpaper_core::WorkshopItem> = self
+                .workshop_items
+                .iter()
+                .filter(|item| {
+                    if self.workshop_filter_video_only && !item.is_compatible_video {
+                        return false;
+                    }
+                    if !search_term.is_empty() {
+                        let in_title = item.title.to_lowercase().contains(&search_term);
+                        let in_tags = item
+                            .tags
+                            .iter()
+                            .any(|t| t.to_lowercase().contains(&search_term));
+                        if !in_title && !in_tags {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
+
+            if filtered.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.heading("No Workshop items found");
+                    ui.label(
+                        "Subscribe to video wallpapers in Wallpaper Engine or Steam Workshop, or click 'Refresh / Scan'.",
+                    );
+                });
+                return;
+            }
+
+            ui.label(format!("Showing {} detected items", filtered.len()));
+            ui.add_space(4.0);
+
+            let available_width = ui.available_width();
+            let card_width = 240.0;
+            let cols = ((available_width / (card_width + 16.0)).floor() as usize).max(1);
+
+            let ctx = ui.ctx().clone();
+            let mut decodes_left = 4;
+            let mut import_req: Option<(String, String, bool)> = None;
+            let mut apply_req: Option<WallpaperId> = None;
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for chunk in filtered.chunks(cols) {
+                    ui.horizontal(|ui| {
+                        for item in chunk {
+                            ui.vertical(|ui| {
+                                ui.set_width(card_width);
+                                egui::Frame::group(ui.style())
+                                    .inner_margin(8.0)
+                                    .show(ui, |ui| {
+                                        ui.set_width(card_width - 16.0);
+
+                                        // Preview thumbnail
+                                        let thumb_size = egui::vec2(card_width - 16.0, 110.0);
+                                        let tex = item.preview_path.as_deref().and_then(|p| {
+                                            self.get_or_load_texture(&ctx, p, &mut decodes_left)
+                                        });
+
+                                        if let Some(tex_id) = tex {
+                                            ui.image((tex_id, thumb_size));
+                                        } else {
+                                            ui.allocate_ui(thumb_size, |ui| {
+                                                ui.centered_and_justified(|ui| {
+                                                    ui.small("No preview");
+                                                });
+                                            });
                                         }
-                                        wallpaper_core::ProcessingStatus::Pending => {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(220, 160, 60),
-                                                "Queued",
-                                            );
+
+                                        ui.add_space(4.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&item.title).strong(),
+                                            )
+                                            .truncate(),
+                                        );
+
+                                        ui.horizontal(|ui| {
+                                            if item.is_compatible_video {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(80, 200, 120),
+                                                    "✔ Video",
+                                                );
+                                            } else {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(180, 180, 180),
+                                                    &item.item_type,
+                                                );
+                                            }
+                                            if let Some(size) = item.file_size_bytes {
+                                                ui.small(format_file_size(size));
+                                            }
+                                        });
+
+                                        let in_library_wp = snapshot.wallpapers.iter().find(|w| {
+                                            w.source() == item.file_path.to_string_lossy()
+                                                || std::path::Path::new(w.source())
+                                                    == item.file_path
+                                        });
+
+                                        ui.add_space(4.0);
+                                        if let Some(wp) = in_library_wp {
+                                            ui.horizontal(|ui| {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(100, 180, 255),
+                                                    "✔ In Library",
+                                                );
+                                                if ui.button("▶ Apply").clicked() {
+                                                    apply_req = Some(wp.id);
+                                                }
+                                            });
+                                        } else if item.is_compatible_video {
+                                            ui.horizontal(|ui| {
+                                                if ui.button("⬇ Import").clicked() {
+                                                    import_req = Some((
+                                                        item.file_path
+                                                            .to_string_lossy()
+                                                            .to_string(),
+                                                        item.title.clone(),
+                                                        false,
+                                                    ));
+                                                }
+                                                if ui.button("▶ Apply").clicked() {
+                                                    import_req = Some((
+                                                        item.file_path
+                                                            .to_string_lossy()
+                                                            .to_string(),
+                                                        item.title.clone(),
+                                                        true,
+                                                    ));
+                                                }
+                                            });
+                                        } else {
+                                            ui.small("(Scene / WE proprietary)");
                                         }
-                                        wallpaper_core::ProcessingStatus::Processing => {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(220, 160, 60),
-                                                "Processing",
-                                            );
-                                        }
-                                        wallpaper_core::ProcessingStatus::Failed => {
-                                            let err_msg = wallpaper
-                                                .metadata
-                                                .processing_error
-                                                .as_deref()
-                                                .unwrap_or("Failed");
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(230, 80, 80),
-                                                format!("Failed: {err_msg}"),
-                                            );
-                                        }
-                                    }
-                                });
+                                    });
                             });
-
-                            // Right: actions
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .add_enabled(
-                                            snapshot.connected,
-                                            egui::Button::new("Assign"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.send(
-                                            Command::ApplyWallpaper {
-                                                wallpaper_id: wallpaper.id,
-                                                monitor: selected_monitor.clone(),
-                                            },
-                                            "Wallpaper assignment requested…",
-                                        );
-                                    }
-                                    if ui
-                                        .selectable_label(
-                                            self.selected_wallpaper == Some(wallpaper.id),
-                                            "Select",
-                                        )
-                                        .clicked()
-                                    {
-                                        self.selected_wallpaper = Some(wallpaper.id);
-                                    }
-                                    if wallpaper.metadata.is_failed() {
-                                        if ui.button("Retry").clicked() {
-                                            self.send(
-                                                Command::RetryProcessing {
-                                                    wallpaper_id: wallpaper.id,
-                                                },
-                                                "Retrying processing…",
-                                            );
-                                        }
-                                    }
-                                    if ui
-                                        .add_enabled(
-                                            snapshot.connected,
-                                            egui::Button::new("Remove"),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.send(
-                                            Command::RemoveWallpaper {
-                                                wallpaper_id: wallpaper.id,
-                                            },
-                                            "Removal requested…",
-                                        );
-                                    }
-                                },
-                            );
-                        });
+                        }
                     });
-                    ui.add_space(5.0);
+                    ui.add_space(8.0);
+                }
+            });
+
+            if let Some((path, title, auto_apply)) = import_req {
+                if auto_apply {
+                    self.pending_apply_source = Some(path.clone());
+                }
+                self.send(
+                    Command::ImportWallpaper {
+                        path,
+                        title: Some(title.clone()),
+                    },
+                    &format!("Importing '{title}' to library…"),
+                );
+            }
+
+            if let Some(wp_id) = apply_req {
+                self.send(
+                    Command::ApplyWallpaper {
+                        wallpaper_id: wp_id,
+                        monitor: self.selected_monitor.clone(),
+                    },
+                    "Wallpaper assignment requested…",
+                );
+            }
+        }
+
+        fn render_online_wallpapers(&mut self, ui: &mut egui::Ui, _snapshot: &Snapshot) {
+            ui.horizontal(|ui| {
+                ui.label("🔍 Search:");
+                let text_resp = ui.text_edit_singleline(&mut self.online_search_query);
+                let hit_enter =
+                    text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                egui::ComboBox::from_id_salt("online_cat")
+                    .selected_text(&self.online_category)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.online_category,
+                            "Videos (Free Loops)".into(),
+                            "Videos (Free Loops)",
+                        );
+                        ui.selectable_value(
+                            &mut self.online_category,
+                            "All".into(),
+                            "All (Wallhaven)",
+                        );
+                        ui.selectable_value(&mut self.online_category, "Anime".into(), "Anime");
+                        ui.selectable_value(&mut self.online_category, "General".into(), "General");
+                    });
+
+                let search_clicked = ui.button("Search / Browse").clicked();
+                if search_clicked || hit_enter {
+                    if self.online_category == "Videos (Free Loops)" {
+                        self.online_items = wallpaper_core::get_curated_video_wallpapers();
+                    } else {
+                        let query = self.online_search_query.clone();
+                        let cat = self.online_category.clone();
+                        match wallpaper_core::search_wallhaven(&query, Some(&cat), 1) {
+                            Ok(results) => {
+                                self.online_items = results;
+                                self.notice = format!(
+                                    "Found {} wallpapers from Wallhaven",
+                                    self.online_items.len()
+                                );
+                            }
+                            Err(e) => {
+                                self.notice = format!("Wallhaven search error: {e}");
+                            }
+                        }
+                    }
+                }
+            });
+
+            ui.add_space(6.0);
+
+            if self.online_items.is_empty() {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(40.0);
+                    ui.heading("No online wallpapers loaded");
+                    ui.label("Select a category or type a search query, then click Search.");
+                });
+                return;
+            }
+
+            ui.label(format!("Showing {} wallpapers", self.online_items.len()));
+            ui.add_space(4.0);
+
+            let available_width = ui.available_width();
+            let card_width = 240.0;
+            let cols = ((available_width / (card_width + 16.0)).floor() as usize).max(1);
+            let items = self.online_items.clone();
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for chunk in items.chunks(cols) {
+                    ui.horizontal(|ui| {
+                        for item in chunk {
+                            ui.vertical(|ui| {
+                                ui.set_width(card_width);
+                                egui::Frame::group(ui.style())
+                                    .inner_margin(8.0)
+                                    .show(ui, |ui| {
+                                        ui.set_width(card_width - 16.0);
+
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&item.title).strong(),
+                                            )
+                                            .truncate(),
+                                        );
+
+                                        ui.horizontal(|ui| {
+                                            ui.colored_label(
+                                                if item.is_video {
+                                                    egui::Color32::from_rgb(80, 200, 120)
+                                                } else {
+                                                    egui::Color32::from_rgb(100, 180, 255)
+                                                },
+                                                if item.is_video { "Video Loop" } else { "Image" },
+                                            );
+                                            ui.small(&item.resolution);
+                                        });
+
+                                        ui.small(format!("Source: {}", item.source_platform));
+                                        ui.add_space(4.0);
+
+                                        let status = self.online_download_status.get(&item.id);
+                                        if let Some(status_text) = status {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(255, 200, 80),
+                                                status_text,
+                                            );
+                                        } else {
+                                            ui.horizontal(|ui| {
+                                                if ui.button("⬇ Import").clicked() {
+                                                    let tx = self.download_tx.clone();
+                                                    let it = item.clone();
+                                                    std::thread::spawn(move || {
+                                                        let _ =
+                                                            tx.send(DownloadMessage::Progress {
+                                                                id: it.id.clone(),
+                                                                status: "Downloading…".into(),
+                                                            });
+                                                        let local_app_data =
+                                                            std::env::var_os("LOCALAPPDATA")
+                                                                .unwrap_or_default();
+                                                        let downloads_dir =
+                                                            std::path::PathBuf::from(
+                                                                local_app_data,
+                                                            )
+                                                            .join("RustWallpaper")
+                                                            .join("downloads");
+                                                        let ext =
+                                                            if it.is_video { "mp4" } else { "jpg" };
+                                                        let dest = downloads_dir
+                                                            .join(format!("{}.{}", it.id, ext));
+
+                                                        match wallpaper_core::download_online_file(
+                                                            &it.download_url,
+                                                            &dest,
+                                                        ) {
+                                                            Ok(_) => {
+                                                                let _ = tx.send(
+                                                                    DownloadMessage::Complete {
+                                                                        id: it.id,
+                                                                        path: dest,
+                                                                        title: it.title,
+                                                                    },
+                                                                );
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = tx.send(
+                                                                    DownloadMessage::Failed {
+                                                                        id: it.id,
+                                                                        error: e.to_string(),
+                                                                    },
+                                                                );
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                                if ui.button("▶ Apply").clicked() {
+                                                    let tx = self.download_tx.clone();
+                                                    let it = item.clone();
+                                                    let local_app_data =
+                                                        std::env::var_os("LOCALAPPDATA")
+                                                            .unwrap_or_default();
+                                                    let downloads_dir =
+                                                        std::path::PathBuf::from(local_app_data)
+                                                            .join("RustWallpaper")
+                                                            .join("downloads");
+                                                    let ext =
+                                                        if it.is_video { "mp4" } else { "jpg" };
+                                                    let dest = downloads_dir
+                                                        .join(format!("{}.{}", it.id, ext));
+
+                                                    self.pending_apply_source =
+                                                        Some(dest.to_string_lossy().to_string());
+
+                                                    std::thread::spawn(move || {
+                                                        let _ =
+                                                            tx.send(DownloadMessage::Progress {
+                                                                id: it.id.clone(),
+                                                                status: "Downloading & Applying…"
+                                                                    .into(),
+                                                            });
+
+                                                        match wallpaper_core::download_online_file(
+                                                            &it.download_url,
+                                                            &dest,
+                                                        ) {
+                                                            Ok(_) => {
+                                                                let _ = tx.send(
+                                                                    DownloadMessage::Complete {
+                                                                        id: it.id,
+                                                                        path: dest,
+                                                                        title: it.title,
+                                                                    },
+                                                                );
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = tx.send(
+                                                                    DownloadMessage::Failed {
+                                                                        id: it.id,
+                                                                        error: e.to_string(),
+                                                                    },
+                                                                );
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                            });
+                                        }
+                                    });
+                            });
+                        }
+                    });
+                    ui.add_space(8.0);
                 }
             });
         }
@@ -642,6 +1554,23 @@ mod desktop {
                 .lock()
                 .map(|state| state.clone())
                 .unwrap_or_default();
+
+            // Auto-apply newly imported wallpaper if requested
+            if let Some(src) = self.pending_apply_source.clone() {
+                if let Some(wp) = snapshot.wallpapers.iter().find(|w| {
+                    w.source() == src
+                        || std::path::Path::new(w.source()) == std::path::Path::new(&src)
+                }) {
+                    self.send(
+                        Command::ApplyWallpaper {
+                            wallpaper_id: wp.id,
+                            monitor: self.selected_monitor.clone(),
+                        },
+                        &format!("Applied '{}' as wallpaper", wp.title()),
+                    );
+                    self.pending_apply_source = None;
+                }
+            }
             egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("Rust Wallpaper");
@@ -671,6 +1600,15 @@ mod desktop {
                         .clicked()
                     {
                         self.page = Page::Library;
+                    }
+                    if ui
+                        .selectable_label(
+                            matches!(self.page, Page::Browse),
+                            "🌐  Browse & Workshop",
+                        )
+                        .clicked()
+                    {
+                        self.page = Page::Browse;
                     }
                     if ui
                         .selectable_label(matches!(self.page, Page::Monitors), "▣  Monitors")
@@ -714,6 +1652,7 @@ mod desktop {
                 });
             egui::CentralPanel::default().show(ctx, |ui| match self.page {
                 Page::Library => self.render_library(ui, &snapshot),
+                Page::Browse => self.render_browse(ui, &snapshot),
                 Page::Monitors => self.render_monitors(ui, &snapshot),
                 Page::Settings => self.render_settings(ui, &snapshot),
             });
@@ -859,6 +1798,38 @@ mod desktop {
         tx
     }
 
+    fn configure_fonts(ctx: &egui::Context) {
+        let mut fonts = egui::FontDefinitions::default();
+        let font_candidates = [
+            ("msyh", "C:\\Windows\\Fonts\\msyh.ttc"),
+            ("msyh_ttf", "C:\\Windows\\Fonts\\msyh.ttf"),
+            ("simsun", "C:\\Windows\\Fonts\\simsun.ttc"),
+            ("malgun", "C:\\Windows\\Fonts\\malgun.ttf"),
+            ("segoeui", "C:\\Windows\\Fonts\\segoeui.ttf"),
+        ];
+
+        for (name, path) in font_candidates {
+            if let Ok(font_data) = std::fs::read(path) {
+                fonts
+                    .font_data
+                    .insert(name.to_string(), egui::FontData::from_owned(font_data));
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Proportional)
+                    .or_default()
+                    .push(name.to_string());
+                fonts
+                    .families
+                    .entry(egui::FontFamily::Monospace)
+                    .or_default()
+                    .push(name.to_string());
+                break;
+            }
+        }
+
+        ctx.set_fonts(fonts);
+    }
+
     pub fn run() -> eframe::Result<()> {
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let commands = spawn_worker(snapshot.clone());
@@ -871,7 +1842,10 @@ mod desktop {
         eframe::run_native(
             "Rust Wallpaper",
             options,
-            Box::new(move |_creation_context| Ok(Box::new(DesktopApp::new(snapshot, commands)))),
+            Box::new(move |cc| {
+                configure_fonts(&cc.egui_ctx);
+                Ok(Box::new(DesktopApp::new(snapshot, commands)))
+            }),
         )
     }
 }

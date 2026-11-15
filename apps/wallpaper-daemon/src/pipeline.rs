@@ -69,6 +69,15 @@ impl ExtractionPipeline {
             let source_path = job.source;
             let thumb_path = thumbnail_dir.join(format!("{}.jpg", wallpaper_id));
 
+            // Verify wallpaper still exists before launching expensive extraction
+            match library.get(wallpaper_id) {
+                Ok(Some(_)) => {}
+                _ => {
+                    info!(%wallpaper_id, "Wallpaper was deleted before extraction started; skipping job");
+                    continue;
+                }
+            }
+
             // Set state to Processing
             if let Err(e) =
                 library.set_processing_state(wallpaper_id, ProcessingStatus::Processing, None)
@@ -107,6 +116,13 @@ impl ExtractionPipeline {
                                 "Metadata and thumbnail extraction completed successfully"
                             );
                         }
+                    } else {
+                        // Wallpaper was deleted while extraction was running.
+                        // Prune the newly written thumbnail immediately to prevent orphaned files.
+                        info!(%wallpaper_id, "Wallpaper was deleted during extraction; pruning orphan thumbnail");
+                        if thumb_path.is_file() {
+                            let _ = std::fs::remove_file(&thumb_path);
+                        }
                     }
                 }
                 Err(err_msg) => {
@@ -115,12 +131,18 @@ impl ExtractionPipeline {
                         error = %err_msg,
                         "Metadata or thumbnail extraction failed"
                     );
-                    if let Err(e) = library.set_processing_state(
-                        wallpaper_id,
-                        ProcessingStatus::Failed,
-                        Some(&err_msg),
-                    ) {
-                        error!(%wallpaper_id, %e, "Failed to persist failure state to database");
+                    // If file was deleted, no need to update state
+                    if let Ok(Some(_)) = library.get(wallpaper_id) {
+                        if let Err(e) = library.set_processing_state(
+                            wallpaper_id,
+                            ProcessingStatus::Failed,
+                            Some(&err_msg),
+                        ) {
+                            error!(%wallpaper_id, %e, "Failed to persist failure state to database");
+                        }
+                    }
+                    if thumb_path.is_file() {
+                        let _ = std::fs::remove_file(&thumb_path);
                     }
                 }
             }
@@ -260,6 +282,43 @@ mod tests {
         }
 
         assert!(recovered, "Startup recovery did not complete extraction");
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_concurrent_deletion_during_extraction_prunes_thumbnail() {
+        let video_path = PathBuf::from("assets/wallpapers/sample-nature.mp4");
+        if !video_path.exists() {
+            return;
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!("test_del_{}", uuid::Uuid::new_v4()));
+        let thumb_dir = temp_dir.join("thumbnails");
+        std::fs::create_dir_all(&thumb_dir).unwrap();
+
+        let library = WallpaperLibrary::in_memory().unwrap();
+        let pipeline = ExtractionPipeline::start(library.clone(), thumb_dir.clone());
+
+        let wp = library
+            .import_video(&video_path, Some("To Be Deleted"), None)
+            .unwrap();
+        let expected_thumb = thumb_dir.join(format!("{}.jpg", wp.id));
+
+        // Submit job and immediately delete wallpaper from library
+        pipeline.submit(wp.id, video_path);
+        let _ = library.delete(wp.id);
+
+        // Wait a short duration for worker to process and prune
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(1500) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        // Verify that no orphaned thumbnail remains on disk
+        assert!(
+            !expected_thumb.exists(),
+            "Orphaned thumbnail should have been pruned when wallpaper was deleted"
+        );
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

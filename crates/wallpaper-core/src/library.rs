@@ -279,9 +279,7 @@ impl WallpaperLibrary {
         )?;
 
         let result = stmt
-            .query_row(params![id.to_string()], |row| {
-                Ok(Self::row_to_wallpaper(row)?)
-            })
+            .query_row(params![id.to_string()], Self::row_to_wallpaper)
             .optional()?;
 
         Ok(result)
@@ -299,7 +297,7 @@ impl WallpaperLibrary {
             "#,
         )?;
 
-        let iter = stmt.query_map([], |row| Ok(Self::row_to_wallpaper(row)?))?;
+        let iter = stmt.query_map([], Self::row_to_wallpaper)?;
         let mut wallpapers = Vec::new();
         for item in iter {
             wallpapers.push(item?);
@@ -321,7 +319,7 @@ impl WallpaperLibrary {
             "#,
         )?;
 
-        let iter = stmt.query_map([], |row| Ok(Self::row_to_wallpaper(row)?))?;
+        let iter = stmt.query_map([], Self::row_to_wallpaper)?;
         let mut wallpapers = Vec::new();
         for item in iter {
             wallpapers.push(item?);

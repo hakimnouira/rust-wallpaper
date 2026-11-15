@@ -250,7 +250,7 @@ mod platform {
                 "Wallpaper window attached to desktop host"
             );
 
-            Ok(WallpaperWindow {
+            let win = WallpaperWindow {
                 hwnd,
                 host_hwnd,
                 device_name,
@@ -260,7 +260,9 @@ mod platform {
                 height,
                 is_primary,
                 brush,
-            })
+            };
+
+            Ok(win)
         }
 
         /// Checks if an embedded child window (such as MPV's render surface) has been created inside this window.

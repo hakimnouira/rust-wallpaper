@@ -63,6 +63,7 @@ pub fn find_ffmpeg_executable() -> Option<PathBuf> {
 }
 
 /// Parses stderr output from ffmpeg to extract container and video stream details.
+#[allow(clippy::type_complexity)]
 pub fn parse_ffmpeg_output(
     stderr: &str,
 ) -> (
@@ -107,10 +108,7 @@ pub fn parse_ffmpeg_output(
         {
             if let Some(pos) = trimmed.find("Video: ") {
                 let rest = &trimmed[pos + "Video: ".len()..];
-                let raw_codec = rest
-                    .split(|c: char| c == ' ' || c == ',' || c == '(')
-                    .next()
-                    .unwrap_or("");
+                let raw_codec = rest.split([' ', ',', '(']).next().unwrap_or("");
                 if !raw_codec.is_empty() {
                     codec = Some(raw_codec.to_lowercase());
                 }
@@ -131,10 +129,7 @@ pub fn parse_ffmpeg_output(
 
                     if let Some(dar_pos) = part.find("DAR ") {
                         let dar_str = &part[dar_pos + "DAR ".len()..];
-                        let dar_token = dar_str
-                            .split(|c: char| c == ']' || c == ' ' || c == ',')
-                            .next()
-                            .unwrap_or("");
+                        let dar_token = dar_str.split([']', ' ', ',']).next().unwrap_or("");
                         let dar_parts: Vec<&str> = dar_token.split(':').collect();
                         if dar_parts.len() == 2 {
                             if let (Ok(num), Ok(den)) =
@@ -309,6 +304,9 @@ fn extract_via_ffmpeg(
             .unwrap_or(0)
             == 0
     {
+        if thumbnail_path.exists() {
+            let _ = std::fs::remove_file(thumbnail_path);
+        }
         let err_snippet = if stderr.len() > 200 {
             &stderr[..200]
         } else {

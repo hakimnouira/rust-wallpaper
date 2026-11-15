@@ -1,18 +1,33 @@
 //! Platform-independent domain types for the wallpaper engine.
 
+pub mod filter;
 pub mod health;
 pub mod library;
 pub mod monitors;
+pub mod online;
 pub mod registration;
 pub mod runtime;
 pub mod supervisor;
+pub mod workshop;
 
+pub use filter::{
+    AspectRatioFilter, CodecFilter, LibraryQuery, ResolutionFilter, SortDirection, SortKey,
+    StatusFilter,
+};
 pub use library::{LibraryError, WallpaperLibrary};
+pub use online::{
+    download_online_file, fetch_thumbnail_bytes, get_curated_video_wallpapers, search_wallhaven,
+    OnlineError, OnlineWallpaper,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
+pub use workshop::{
+    find_steam_installations, find_steam_library_folders, parse_workshop_directory,
+    scan_wallpaper_engine_items, WorkshopItem, WALLPAPER_ENGINE_APP_ID,
+};
 
 /// Stable identifier for an imported wallpaper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -54,9 +69,10 @@ pub enum WallpaperKind {
 }
 
 /// Hardware decoding acceleration options.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HardwareAcceleration {
+    #[default]
     Auto,
     D3d11va,
     Dxva2,
@@ -71,12 +87,6 @@ impl HardwareAcceleration {
             Self::Dxva2 => "dxva2",
             Self::Disabled => "no",
         }
-    }
-}
-
-impl Default for HardwareAcceleration {
-    fn default() -> Self {
-        Self::Auto
     }
 }
 
@@ -101,19 +111,14 @@ impl Default for PlaybackConfig {
 }
 
 /// Status of thumbnail generation and video metadata extraction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProcessingStatus {
     Pending,
     Processing,
+    #[default]
     Completed,
     Failed,
-}
-
-impl Default for ProcessingStatus {
-    fn default() -> Self {
-        Self::Completed
-    }
 }
 
 /// Helper function to classify video resolution into standard human-friendly categories.

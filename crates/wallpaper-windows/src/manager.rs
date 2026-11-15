@@ -205,6 +205,7 @@ impl WallpaperManager {
                         monitor.is_primary,
                         bg_color,
                     )?;
+                    win.attach_to_host()?;
                     self.windows.insert(dev.clone(), win);
 
                     // Restore playback from preserved source/configuration if one exists
@@ -288,6 +289,7 @@ impl WallpaperManager {
                         monitor.is_primary,
                         bg_color,
                     )?;
+                    win.attach_to_host()?;
                     self.windows.insert(dev.clone(), win);
 
                     // Restore playback from preserved source/configuration if one exists
@@ -336,6 +338,7 @@ impl WallpaperManager {
                         monitor.is_primary,
                         bg_color,
                     )?;
+                    win.attach_to_host()?;
                     self.windows.insert(dev.clone(), win);
 
                     // Reconnected monitor with preserved source: restore playback
