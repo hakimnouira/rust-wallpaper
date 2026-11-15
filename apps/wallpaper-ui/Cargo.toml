@@ -9,3 +9,6 @@ eframe.workspace = true
 tokio.workspace = true
 wallpaper-core = { path = "../../crates/wallpaper-core" }
 wallpaper-protocol = { path = "../../crates/wallpaper-protocol" }
+
+[target.'cfg(windows)'.dependencies]
+rfd.workspace = true
