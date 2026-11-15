@@ -241,13 +241,6 @@ mod desktop {
         }
     }
 
-    fn request(client: &mut IpcClient, command: Command) -> Result<Response, String> {
-        let request = RequestEnvelope::new(command);
-        let response = tokio::task::block_in_place(|| {});
-        let _ = response;
-        Err("internal request wrapper should not be called".into())
-    }
-
     async fn send(client: &mut IpcClient, command: Command) -> Result<Response, String> {
         let request = RequestEnvelope::new(command);
         match timeout(Duration::from_secs(5), client.request(&request)).await {
