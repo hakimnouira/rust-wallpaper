@@ -48,6 +48,7 @@ impl RequestEnvelope {
 #[serde(tag = "command", content = "payload", rename_all = "snake_case")]
 pub enum Command {
     Ping,
+    ListMonitors,
     ListWallpapers,
     ApplyWallpaper {
         wallpaper_id: WallpaperId,
@@ -73,6 +74,17 @@ pub enum Command {
     GetStatus {
         monitor: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MonitorInfo {
+    pub id: String,
+    pub device_name: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub is_primary: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -121,6 +133,7 @@ impl ResponseEnvelope {
 #[serde(tag = "result", content = "payload", rename_all = "snake_case")]
 pub enum Response {
     Pong,
+    MonitorList(Vec<MonitorInfo>),
     WallpaperList(Vec<Wallpaper>),
     PlaybackChanged {
         wallpaper_id: Option<WallpaperId>,
