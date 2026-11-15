@@ -583,8 +583,6 @@ fn dispatch_ipc(
     }
 
     let failure = |code, message: String| ResponseEnvelope::error(request_id, code, message);
-    let accepted = || ResponseEnvelope::new(request_id, Response::Accepted);
-
     let result = match request.command {
         Command::Ping => Response::Pong,
         Command::ListWallpapers => match library.list() {
@@ -621,8 +619,12 @@ fn dispatch_ipc(
             }
             Response::Accepted
         }
-        Command::Pause { monitor } | Command::Resume { monitor } => {
-            let paused = matches!(request.command, Command::Pause { .. });
+        command @ (Command::Pause { .. } | Command::Resume { .. }) => {
+            let (monitor, paused) = match command {
+                Command::Pause { monitor } => (monitor, true),
+                Command::Resume { monitor } => (monitor, false),
+                _ => unreachable!(),
+            };
             match monitor {
                 Some(name) => match resolve_device(&name, known) {
                     Some(device) => { runtime.runtime.set_user_paused(Some(&device), paused); }
@@ -707,6 +709,5 @@ fn dispatch_ipc(
         }
     };
 
-    let _ = accepted;
     ResponseEnvelope::new(request_id, result)
 }
