@@ -12,6 +12,9 @@ struct ManagedChild(Child);
 
 impl ManagedChild {
     fn id(&self) -> u32 { self.0.id() }
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0.try_wait()
+    }
     fn stop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
@@ -103,9 +106,10 @@ async fn async_main() {
     // Verify file filter and supported extensions in rfd integration
     let supported_exts = ["mp4", "webm", "mkv", "mov"];
     println!(
-        "  -> PASS: rfd::FileDialog configured with filter 'Video files': {:?}",
+        "  -> CONFIGURATION CHECK ONLY: rfd::FileDialog uses filter 'Video files': {:?}",
         supported_exts
     );
+    println!("  -> Manual confirmation still required: open the dialog and select a video.");
 
     // -----------------------------------------------------------------
     // Checklist 4: Importing a video adds it to the library
