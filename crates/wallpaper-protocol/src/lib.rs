@@ -49,6 +49,13 @@ pub enum Command {
     Ping,
     ListMonitors,
     ListWallpapers,
+    ImportWallpaper {
+        path: String,
+        title: Option<String>,
+    },
+    RemoveWallpaper {
+        wallpaper_id: WallpaperId,
+    },
     ApplyWallpaper {
         wallpaper_id: WallpaperId,
         monitor: Option<String>,
