@@ -4,7 +4,7 @@
 //! the daemon's main loop and waits for that loop to produce the response.
 
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::ServerOptions;
 use tokio::sync::oneshot;
 use tokio::time::{timeout, Duration};
@@ -77,30 +77,37 @@ async fn listener_loop(tx: SyncSender<PendingRequest>) {
     }
 }
 
-async fn read_bounded_frame<R: AsyncRead + Unpin>(
+async fn read_bounded_frame<R: AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<Vec<u8>>, ProtocolError> {
     let mut frame = Vec::with_capacity(256);
-    let mut byte = [0u8; 1];
     loop {
-        let count = reader.read(&mut byte).await?;
-        if count == 0 {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
             return if frame.is_empty() {
                 Ok(None)
             } else {
                 Err(ProtocolError::UnexpectedEof)
             };
         }
-        if byte[0] == b'\n' {
+
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            if frame.len() + newline > MAX_FRAME_BYTES {
+                return Err(ProtocolError::FrameTooLarge);
+            }
+            frame.extend_from_slice(&available[..newline]);
+            reader.consume(newline + 1);
             return Ok(Some(frame));
         }
-        if frame.len() == MAX_FRAME_BYTES {
+
+        if frame.len() + available.len() > MAX_FRAME_BYTES {
             return Err(ProtocolError::FrameTooLarge);
         }
-        frame.push(byte[0]);
+        let consumed = available.len();
+        frame.extend_from_slice(available);
+        reader.consume(consumed);
     }
 }
-
 async fn write_envelope<W: AsyncWrite + Unpin>(
     writer: &mut W,
     response: &ResponseEnvelope,
@@ -119,7 +126,8 @@ async fn serve_client(
     stream: tokio::net::windows::named_pipe::NamedPipeServer,
     tx: SyncSender<PendingRequest>,
 ) -> Result<(), ProtocolError> {
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(reader);
     while let Some(frame) = read_bounded_frame(&mut reader).await? {
         let request: RequestEnvelope = match serde_json::from_slice(&frame) {
             Ok(request) => request,
