@@ -199,7 +199,7 @@ impl SqliteAssignmentStore {
 
     fn init(conn: rusqlite::Connection) -> Result<Self, StoreError> {
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS monitor_assignments (
+            "CREATE TABLE IF NOT EXISTS runtime_monitor_assignments (
                 monitor_id    TEXT PRIMARY KEY NOT NULL,
                 video_path    TEXT NOT NULL,
                 loop_playback INTEGER NOT NULL,
@@ -208,6 +208,32 @@ impl SqliteAssignmentStore {
                 hwdec         TEXT NOT NULL
             );",
         )?;
+
+        // Older builds used the generic table name. Migrate only when it has the
+        // runtime-store columns; WallpaperLibrary owns a different table of that name.
+        let legacy_columns: Vec<String> = {
+            let mut statement = conn.prepare("PRAGMA table_info(monitor_assignments)")?;
+            let rows = statement.query_map([], |row| row.get(1))?;
+            rows.collect::<Result<_, _>>()?
+        };
+        let required = [
+            "monitor_id",
+            "video_path",
+            "loop_playback",
+            "mute",
+            "volume",
+            "hwdec",
+        ];
+        if required.iter().all(|column| legacy_columns.iter().any(|c| c == column)) {
+            conn.execute(
+                "INSERT OR IGNORE INTO runtime_monitor_assignments
+                    (monitor_id, video_path, loop_playback, mute, volume, hwdec)
+                 SELECT monitor_id, video_path, loop_playback, mute, volume, hwdec
+                 FROM monitor_assignments",
+                [],
+            )?;
+        }
+
         Ok(Self { conn })
     }
 }
@@ -216,7 +242,7 @@ impl AssignmentStore for SqliteAssignmentStore {
     fn load_all(&self) -> Result<Vec<(MonitorId, Assignment)>, StoreError> {
         let mut stmt = self.conn.prepare(
             "SELECT monitor_id, video_path, loop_playback, mute, volume, hwdec
-             FROM monitor_assignments ORDER BY monitor_id",
+             FROM runtime_monitor_assignments ORDER BY monitor_id",
         )?;
         let rows = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
@@ -240,7 +266,7 @@ impl AssignmentStore for SqliteAssignmentStore {
 
     fn upsert(&mut self, id: &MonitorId, a: &Assignment) -> Result<(), StoreError> {
         self.conn.execute(
-            "INSERT INTO monitor_assignments
+            "INSERT INTO runtime_monitor_assignments
                 (monitor_id, video_path, loop_playback, mute, volume, hwdec)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(monitor_id) DO UPDATE SET
@@ -263,7 +289,7 @@ impl AssignmentStore for SqliteAssignmentStore {
 
     fn delete(&mut self, id: &MonitorId) -> Result<(), StoreError> {
         self.conn.execute(
-            "DELETE FROM monitor_assignments WHERE monitor_id = ?1",
+            "DELETE FROM runtime_monitor_assignments WHERE monitor_id = ?1",
             rusqlite::params![id.as_str()],
         )?;
         Ok(())
@@ -1175,6 +1201,24 @@ mod tests {
         );
         s.delete(&MonitorId::new("hw:abc")).unwrap();
         assert_eq!(s.load_all().unwrap().len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn runtime_store_does_not_collide_with_wallpaper_library_schema() {
+        let path = std::env::temp_dir().join(format!("rw-shared-{}.db", uuid::Uuid::new_v4()));
+        let library = crate::WallpaperLibrary::open(&path).unwrap();
+
+        let mut store = SqliteAssignmentStore::open(&path).unwrap();
+        store.upsert(&MonitorId::new("hw:shared"), &a("shared.mp4")).unwrap();
+        let rows = store.load_all().unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0.as_str(), "hw:shared");
+        assert_eq!(rows[0].1.video_path.to_str(), Some("shared.mp4"));
+
+        drop(store);
+        drop(library);
         let _ = std::fs::remove_file(path);
     }
 
