@@ -575,14 +575,21 @@ fn dispatch_ipc(
     known: &[String],
     now: Instant,
 ) -> wallpaper_protocol::ResponseEnvelope {
-    use wallpaper_protocol::{Command, ErrorCode, MonitorInfo, PlayerStatusInfo, Response, ResponseEnvelope};
+    use wallpaper_protocol::{
+        Command, ErrorCode, MonitorInfo, PlayerStatusInfo, Response, ResponseEnvelope,
+    };
 
     let request_id = request.request_id;
     if let Err(error) = request.validate() {
-        return ResponseEnvelope::error(request_id, ErrorCode::ProtocolMismatch, error.to_string());
+        return ResponseEnvelope::error(
+            request_id,
+            ErrorCode::ProtocolMismatch,
+            error.to_string(),
+        );
     }
 
     let failure = |code, message: String| ResponseEnvelope::error(request_id, code, message);
+
     let result = match request.command {
         Command::Ping => Response::Pong,
         Command::ListWallpapers => match library.list() {
@@ -610,32 +617,56 @@ fn dispatch_ipc(
             }
             Err(error) => return failure(ErrorCode::RuntimeFailure, error.to_string()),
         },
-        Command::ApplyWallpaper { wallpaper_id, monitor } => {
+        Command::ApplyWallpaper {
+            wallpaper_id,
+            monitor,
+        } => {
             let wallpaper = match library.get(wallpaper_id) {
                 Ok(Some(wallpaper)) => wallpaper,
-                Ok(None) => return failure(ErrorCode::NotFound, format!("wallpaper {wallpaper_id} was not found")),
+                Ok(None) => {
+                    return failure(
+                        ErrorCode::NotFound,
+                        format!("wallpaper {wallpaper_id} was not found"),
+                    )
+                }
                 Err(error) => return failure(ErrorCode::Internal, error.to_string()),
             };
             if wallpaper.kind != wallpaper_core::WallpaperKind::Video {
-                return failure(ErrorCode::Unsupported, "only video wallpapers are currently playable".into());
+                return failure(
+                    ErrorCode::Unsupported,
+                    "only video wallpapers are currently playable".into(),
+                );
             }
             let targets: Vec<String> = match monitor {
                 Some(name) => match resolve_device(&name, known) {
                     Some(device) => vec![device],
-                    None => return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'")),
+                    None => {
+                        return failure(
+                            ErrorCode::NotFound,
+                            format!("unknown monitor '{name}'"),
+                        )
+                    }
                 },
                 None => known.to_vec(),
             };
             if targets.is_empty() {
-                return failure(ErrorCode::NotFound, "no connected monitors are available".into());
+                return failure(
+                    ErrorCode::NotFound,
+                    "no connected monitors are available".into(),
+                );
             }
             let assignment = Assignment {
                 video_path: PathBuf::from(&wallpaper.metadata.source),
                 config: wallpaper.config.clone(),
             };
             for device in targets {
-                if let Err(error) = runtime.assign_user(&device, assignment.clone(), manager, now) {
-                    return failure(ErrorCode::RuntimeFailure, format!("could not assign wallpaper to {device}: {error}"));
+                if let Err(error) =
+                    runtime.assign_user(&device, assignment.clone(), manager, now)
+                {
+                    return failure(
+                        ErrorCode::RuntimeFailure,
+                        format!("could not assign wallpaper to {device}: {error}"),
+                    );
                 }
             }
             Response::Accepted
@@ -648,21 +679,38 @@ fn dispatch_ipc(
             };
             match monitor {
                 Some(name) => match resolve_device(&name, known) {
-                    Some(device) => { runtime.runtime.set_user_paused(Some(&device), paused); }
-                    None => return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'")),
+                    Some(device) => {
+                        runtime.runtime.set_user_paused(Some(&device), paused);
+                    }
+                    None => {
+                        return failure(
+                            ErrorCode::NotFound,
+                            format!("unknown monitor '{name}'"),
+                        )
+                    }
                 },
-                None => { runtime.runtime.set_user_paused(None, paused); }
+                None => {
+                    runtime.runtime.set_user_paused(None, paused);
+                }
             }
             Response::Accepted
         }
         Command::SetVolume { monitor, volume } => {
             if volume > 100 {
-                return failure(ErrorCode::InvalidRequest, "volume must be between 0 and 100".into());
+                return failure(
+                    ErrorCode::InvalidRequest,
+                    "volume must be between 0 and 100".into(),
+                );
             }
             let targets: Vec<String> = match monitor {
                 Some(name) => match resolve_device(&name, known) {
                     Some(device) => vec![device],
-                    None => return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'")),
+                    None => {
+                        return failure(
+                            ErrorCode::NotFound,
+                            format!("unknown monitor '{name}'"),
+                        )
+                    }
                 },
                 None => known.to_vec(),
             };
@@ -672,7 +720,10 @@ fn dispatch_ipc(
                     None => continue,
                 };
                 if let Err(error) = player.set_volume(volume) {
-                    return failure(ErrorCode::RuntimeFailure, format!("volume update failed on {device}: {error}"));
+                    return failure(
+                        ErrorCode::RuntimeFailure,
+                        format!("volume update failed on {device}: {error}"),
+                    );
                 }
             }
             Response::Accepted
@@ -681,7 +732,12 @@ fn dispatch_ipc(
             let targets: Vec<String> = match monitor {
                 Some(name) => match resolve_device(&name, known) {
                     Some(device) => vec![device],
-                    None => return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'")),
+                    None => {
+                        return failure(
+                            ErrorCode::NotFound,
+                            format!("unknown monitor '{name}'"),
+                        )
+                    }
                 },
                 None => known.to_vec(),
             };
@@ -691,7 +747,10 @@ fn dispatch_ipc(
                     None => continue,
                 };
                 if let Err(error) = player.set_mute(muted) {
-                    return failure(ErrorCode::RuntimeFailure, format!("mute update failed on {device}: {error}"));
+                    return failure(
+                        ErrorCode::RuntimeFailure,
+                        format!("mute update failed on {device}: {error}"),
+                    );
                 }
             }
             Response::Accepted
@@ -700,7 +759,12 @@ fn dispatch_ipc(
             let selected: Option<String> = match monitor {
                 Some(name) => match resolve_device(&name, known) {
                     Some(device) => Some(device),
-                    None => return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'")),
+                    None => {
+                        return failure(
+                            ErrorCode::NotFound,
+                            format!("unknown monitor '{name}'"),
+                        )
+                    }
                 },
                 None => None,
             };
@@ -708,7 +772,10 @@ fn dispatch_ipc(
             let players = manager.player_statuses();
             let mut items = Vec::new();
             for (device, decoder, state, memory_bytes) in players {
-                if selected.as_ref().is_some_and(|selected| selected != &device) {
+                if selected
+                    .as_ref()
+                    .is_some_and(|selected| selected != &device)
+                {
                     continue;
                 }
                 let status = states.iter().find(|status| status.device == device);
@@ -719,14 +786,22 @@ fn dispatch_ipc(
                     memory_bytes,
                     suspended: status.map(|s| s.suspended).unwrap_or(false),
                     suspension_reasons: status
-                        .map(|s| s.reasons.iter().map(|reason| reason.as_str().to_string()).collect())
+                        .map(|s| {
+                            s.reasons
+                                .iter()
+                                .map(|reason| reason.as_str().to_string())
+                                .collect()
+                        })
                         .unwrap_or_default(),
                 });
             }
             Response::PlayerStatus(items)
         }
         Command::Stop { .. } => {
-            return failure(ErrorCode::Unsupported, "Stop is not exposed until its runtime semantics are defined".into());
+            return failure(
+                ErrorCode::Unsupported,
+                "Stop is not exposed until its runtime semantics are defined".into(),
+            );
         }
     };
 
