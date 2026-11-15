@@ -1,0 +1,29 @@
+name: Rust workspace CI
+
+on:
+  push:
+    branches:
+      - main
+      - agent/runtime-completion
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          targets: x86_64-pc-windows-gnu
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run platform-independent tests
+        run: cargo test --workspace
+      - name: Cross-check Windows target
+        run: cargo check --workspace --target x86_64-pc-windows-gnu
