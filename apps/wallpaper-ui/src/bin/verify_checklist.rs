@@ -8,17 +8,35 @@ use wallpaper_core::{PerformanceProfile, PlaybackState};
 use wallpaper_protocol::client::IpcClient;
 use wallpaper_protocol::{Command, ErrorCode, RequestEnvelope, Response};
 
-fn spawn_daemon() -> Child {
+struct ManagedChild(Child);
+
+impl ManagedChild {
+    fn id(&self) -> u32 { self.0.id() }
+    fn stop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+impl Drop for ManagedChild {
+    fn drop(&mut self) { self.stop(); }
+}
+struct TempFile(PathBuf);
+impl Drop for TempFile {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+}
+
+fn spawn_daemon() -> ManagedChild {
     let mut exe = PathBuf::from("target/debug/wallpaper-daemon.exe");
     if !exe.is_file() {
         exe = PathBuf::from("target/debug/wallpaper-daemon");
     }
     println!("[TEST] Spawning daemon: {}", exe.display());
-    ProcessCommand::new(&exe)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let child = ProcessCommand::new(&exe)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
-        .expect("failed to spawn wallpaper-daemon")
+        .expect("failed to spawn wallpaper-daemon");
+    ManagedChild(child)
 }
 
 fn main() {
@@ -43,11 +61,13 @@ async fn async_main() {
         ui_exe = PathBuf::from("target/debug/wallpaper-ui");
     }
     assert!(ui_exe.is_file(), "wallpaper-ui binary must exist");
-    let mut ui_child = ProcessCommand::new(&ui_exe)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn wallpaper-ui");
+    let mut ui_child = ManagedChild(
+        ProcessCommand::new(&ui_exe)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn wallpaper-ui"),
+    );
     sleep(Duration::from_millis(1500)).await;
     match ui_child.try_wait() {
         Ok(None) => println!(
@@ -57,8 +77,7 @@ async fn async_main() {
         Ok(Some(status)) => panic!("wallpaper-ui exited prematurely with: {status:?}"),
         Err(e) => panic!("failed to probe wallpaper-ui: {e}"),
     }
-    let _ = ui_child.kill();
-    let _ = ui_child.wait();
+    ui_child.stop();
 
     // -----------------------------------------------------------------
     // Checklist 2: Daemon connection succeeds
@@ -96,8 +115,12 @@ async fn async_main() {
     assert!(base_sample.is_file(), "sample video must exist");
 
     // Create a distinct test video file so it is not identical to the daemon's fallback wallpaper
-    let temp_video = PathBuf::from("assets/wallpapers/sample-custom-test.mp4");
+    let temp_video = std::env::temp_dir().join(format!(
+        "rust-wallpaper-checklist-{}.mp4",
+        std::process::id()
+    ));
     std::fs::copy(&base_sample, &temp_video).expect("copy sample video to custom test video");
+    let _temp_video_guard = TempFile(temp_video.clone());
 
     let import_title = "Checklist Custom Test Video";
     let import_req = RequestEnvelope::new(Command::ImportWallpaper {
@@ -183,9 +206,10 @@ async fn async_main() {
                 .expect("player must exist");
             assert_eq!(p.state, PlaybackState::Playing);
             println!(
-                "  -> PASS: Player on {} is Playing with decoder '{}'",
+                "  -> STATE VERIFIED: player on {} reports Playing with decoder '{}'",
                 p.monitor, p.active_decoder
             );
+            println!("  -> Manual confirmation still required: inspect actual desktop output.");
         }
         other => panic!("expected PlayerStatus, got: {other:?}"),
     }
@@ -361,16 +385,14 @@ async fn async_main() {
         .await
         .expect("RemoveWallpaper request failed");
     assert_eq!(remove_unassigned_resp.result, Response::Accepted);
-    let _ = std::fs::remove_file(&temp_video);
     println!("  -> PASS: Removing previously unassigned wallpaper succeeded");
 
     // -----------------------------------------------------------------
     // Checklist 12: UI reconnects after restarting the daemon
     // -----------------------------------------------------------------
-    println!("\n[CHECKLIST 12/13] UI reconnects after restarting the daemon");
+    println!("\n[CHECKLIST 12/13] IPC client reconnects after restarting the daemon");
     println!("  -> Terminating active daemon PID: {}", daemon_child.id());
-    let _ = daemon_child.kill();
-    let _ = daemon_child.wait();
+    daemon_child.stop();
 
     // Verify pipe is disconnected
     let ping_err = client.request(&RequestEnvelope::new(Command::Ping)).await;
@@ -392,27 +414,27 @@ async fn async_main() {
         .expect("Ping on reconnected client failed");
     assert_eq!(ping_reconn.result, Response::Pong);
     println!(
-        "  -> PASS: Reconnection succeeded with fresh daemon PID: {}",
+        "  -> PASS: A fresh IPC client reconnected to daemon PID: {}",
         restarted_daemon.id()
     );
+    println!("  -> This does not exercise the UI background worker; verify UI reconnection manually.");
 
     // -----------------------------------------------------------------
     // Checklist 13: Wallpaper survives Explorer restarting
     // -----------------------------------------------------------------
     println!("\n[CHECKLIST 13/13] Wallpaper survives Explorer restarting");
-    println!("  -> Verified through WallpaperManager::force_recover_explorer() and RuntimeSupervisor topology sync");
-    println!("  -> Integration tests `test_explorer_recovery_all_players_succeed` prove full HWND reattachment.");
-    println!("  -> PASS: Explorer recovery orchestration active and verified");
+    println!("  -> NOT EXERCISED by this binary: no Explorer process is restarted.");
+    println!("  -> Existing unit/integration tests cover recovery orchestration.");
+    println!("  -> Manual confirmation required: restart Explorer while wallpaper is playing and inspect reattachment.");
 
     // Clean teardown
     println!(
         "\n[CLEANUP] Stopping test daemon PID: {}",
         restarted_daemon.id()
     );
-    let _ = restarted_daemon.kill();
-    let _ = restarted_daemon.wait();
+    restarted_daemon.stop();
 
     println!("\n========================================================");
-    println!("     ALL 13/13 CHECKLIST FEATURES FULLY VERIFIED!       ");
+    println!("     AUTOMATED CHECKS COMPLETE — MANUAL QA REMAINS       ");
     println!("========================================================");
 }
