@@ -324,7 +324,7 @@ mod desktop {
             ui.label("This UI communicates only through the versioned named-pipe protocol.");
             ui.separator();
             ui.label("Not yet available");
-            ui.label("WebView2 wallpapers, interactive scenes, startup settings, profiles and updater are future milestones.");
+            ui.label("WebView2 wallpapers, interactive scenes, startup settings and updater are future milestones.");
         }
     }
 
@@ -506,6 +506,11 @@ mod desktop {
                                         Ok(Response::PlayerStatus(items)) => {
                                             if let Ok(mut state) = snapshot.lock() {
                                                 state.players = items;
+                                            }
+                                        }
+                                        Ok(Response::Profile(profile)) => {
+                                            if let Ok(mut state) = snapshot.lock() {
+                                                state.profile = profile;
                                             }
                                         }
                                         Ok(_) => {}
