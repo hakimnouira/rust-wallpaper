@@ -207,9 +207,9 @@ mod desktop {
             });
             egui::SidePanel::left("navigation").resizable(false).default_width(170.0).show(ctx, |ui| {
                 ui.add_space(12.0);
-                if ui.selectable_label(matches!(self.page, Page::Library), "▦  Library").clicked() { self.page = Page::Library; }
-                if ui.selectable_label(matches!(self.page, Page::Monitors), "▣  Monitors").clicked() { self.page = Page::Monitors; }
-                if ui.selectable_label(matches!(self.page, Page::Settings), "⚙  Settings").clicked() { self.page = Page::Settings; }
+                if ui.selectable_label(matches!(&self.page, Page::Library), "▦  Library").clicked() { self.page = Page::Library; }
+                if ui.selectable_label(matches!(&self.page, Page::Monitors), "▣  Monitors").clicked() { self.page = Page::Monitors; }
+                if ui.selectable_label(matches!(&self.page, Page::Settings), "⚙  Settings").clicked() { self.page = Page::Settings; }
                 ui.add_space(20.0);
                 ui.separator();
                 ui.label("Assignment target");
@@ -226,7 +226,7 @@ mod desktop {
                 });
             });
             egui::CentralPanel::default().show(ctx, |ui| {
-                match self.page {
+                match &self.page {
                     Page::Library => self.render_library(ui, &snapshot),
                     Page::Monitors => self.render_monitors(ui, &snapshot),
                     Page::Settings => self.render_settings(ui, &snapshot),
