@@ -72,10 +72,20 @@ mod desktop {
             ui.add_space(12.0);
             ui.group(|ui| {
                 ui.label("Import a video");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.import_path)
-                        .hint_text(r"Full path, e.g. D:\Wallpapers\nature.mp4"),
-                );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.import_path)
+                            .hint_text(r"Full path, e.g. D:\Wallpapers\nature.mp4"),
+                    );
+                    if ui.button("Browse…").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Video files", &["mp4", "webm", "mkv", "mov"])
+                            .pick_file()
+                        {
+                            self.import_path = path.display().to_string();
+                        }
+                    }
+                });
                 ui.add(
                     egui::TextEdit::singleline(&mut self.import_title)
                         .hint_text("Optional display name"),
