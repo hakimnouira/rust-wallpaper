@@ -59,6 +59,7 @@ pub enum Command {
     SetProfile {
         profile: PerformanceProfile,
     },
+    GetProfile,
     ApplyWallpaper {
         wallpaper_id: WallpaperId,
         monitor: Option<String>,
@@ -156,6 +157,7 @@ pub enum Response {
         state: PlaybackState,
     },
     PlayerStatus(Vec<PlayerStatusInfo>),
+    Profile(PerformanceProfile),
     Accepted,
     Error {
         code: ErrorCode,
