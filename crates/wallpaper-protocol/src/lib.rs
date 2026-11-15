@@ -211,7 +211,7 @@ mod tests {
     #[test]
     fn bounded_frame_reader_accepts_one_line() {
         let mut input = Cursor::new(b"{\"ok\":true}\nnext".to_vec());
-        assert_eq!(read_frame(&mut input).unwrap(), br#"{"ok":true}"#);
+        assert_eq!(read_frame(&mut input).unwrap(), b"{\\"ok\\":true}".to_vec());
     }
 
     #[test]
