@@ -38,7 +38,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 #[cfg(windows)]
 use std::sync::mpsc::Sender;
 #[cfg(windows)]
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Events emitted by the Windows system notification listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
