@@ -693,10 +693,7 @@ fn dispatch_ipc(
                 Some(name) => match resolve_device(&name, known) {
                     Some(device) => vec![device],
                     None => {
-                        return failure(
-                            ErrorCode::NotFound,
-                            format!("unknown monitor '{name}'"),
-                        )
+                        return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'"))
                     }
                 },
                 None => known.to_vec(),
@@ -720,10 +717,7 @@ fn dispatch_ipc(
                 Some(name) => match resolve_device(&name, known) {
                     Some(device) => vec![device],
                     None => {
-                        return failure(
-                            ErrorCode::NotFound,
-                            format!("unknown monitor '{name}'"),
-                        )
+                        return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'"))
                     }
                 },
                 None => known.to_vec(),
@@ -747,10 +741,7 @@ fn dispatch_ipc(
                 Some(name) => match resolve_device(&name, known) {
                     Some(device) => Some(device),
                     None => {
-                        return failure(
-                            ErrorCode::NotFound,
-                            format!("unknown monitor '{name}'"),
-                        )
+                        return failure(ErrorCode::NotFound, format!("unknown monitor '{name}'"))
                     }
                 },
                 None => None,
