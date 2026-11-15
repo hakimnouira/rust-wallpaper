@@ -28,7 +28,9 @@
 
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
-use wallpaper_core::registration::{RegistrationReport, RegistrationTracker};
+use wallpaper_core::registration::RegistrationReport;
+#[cfg(windows)]
+use wallpaper_core::registration::{EventSource, RegistrationTracker, RetryDecision, RetryPolicy};
 use wallpaper_core::runtime::RuntimeEvent;
 
 #[cfg(windows)]
@@ -211,6 +213,7 @@ impl Drop for SystemEventListener {
 mod platform {
     use super::*;
     use std::sync::Mutex;
+    use std::time::Instant;
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -223,8 +226,9 @@ mod platform {
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
         GetWindowLongPtrW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
-        SetWindowLongPtrW, UnregisterClassW, GWLP_USERDATA, HMENU, MSG,
+        SetTimer, KillTimer, SetWindowLongPtrW, UnregisterClassW, GWLP_USERDATA, HMENU, MSG,
         REGISTER_NOTIFICATION_FLAGS, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_POWERBROADCAST,
+        WM_TIMER,
         WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
@@ -254,11 +258,16 @@ mod platform {
         pub data: [u8; 1],
     }
 
+    const REGISTRATION_TIMER_ID: usize = 0x5257;
+    const REGISTRATION_TIMER_MS: u32 = 250;
+
     struct ListenerState {
         tx: Sender<SystemPlatformEvent>,
         taskbar_created_msg: u32,
         power_notify_handle: Option<HPOWERNOTIFY>,
         wts_registered: bool,
+        registration: RegistrationTracker,
+        registration_report: Arc<Mutex<RegistrationReport>>,
         last_locked: Option<bool>,
         last_display_on: Option<bool>,
         last_suspended: Option<bool>,
