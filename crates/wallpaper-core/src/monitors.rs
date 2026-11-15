@@ -500,7 +500,9 @@ pub trait WallpaperHost: PlaybackSink {
     fn start_wallpaper(&mut self, device: &str, assignment: &Assignment) -> Result<(), StartError>;
     /// Stops and forgets the wallpaper when a monitor has no effective assignment.
     /// The default keeps lightweight test hosts source-compatible.
-    fn stop_wallpaper(&mut self, _device: &str) -> Result<(), String> { Ok(()) }
+    fn stop_wallpaper(&mut self, _device: &str) -> Result<(), String> {
+        Ok(())
+    }
     fn player_reports(&mut self) -> Vec<PlayerReport>;
 }
 
@@ -760,8 +762,12 @@ impl MonitorLifecycle {
             self.start_retry.remove(device);
             if self.applied.contains_key(device) {
                 match host.stop_wallpaper(device) {
-                    Ok(()) => { self.applied.remove(device); }
-                    Err(error) => warn!(device = %device, %error, "Could not stop wallpaper after assignment was cleared"),
+                    Ok(()) => {
+                        self.applied.remove(device);
+                    }
+                    Err(error) => {
+                        warn!(device = %device, %error, "Could not stop wallpaper after assignment was cleared")
+                    }
                 }
             }
             return;
