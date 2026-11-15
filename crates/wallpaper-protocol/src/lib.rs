@@ -257,6 +257,13 @@ mod tests {
         let encoded = serde_json::to_vec(&profile).unwrap();
         let decoded: RequestEnvelope = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, profile);
+
+        let unassign = RequestEnvelope::new(Command::UnassignWallpaper {
+            monitor: r"\\.\DISPLAY1".into(),
+        });
+        let encoded = serde_json::to_vec(&unassign).unwrap();
+        let decoded: RequestEnvelope = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, unassign);
     }
 
     #[test]
