@@ -777,6 +777,10 @@ fn dispatch_ipc(
             }
             Response::Accepted
         }
+        Command::SetProfile { profile } => {
+            runtime.runtime.set_profile(profile);
+            Response::Accepted
+        }
         Command::GetStatus { monitor } => {
             let selected: Option<String> = match monitor {
                 Some(name) => match resolve_device(&name, known) {
