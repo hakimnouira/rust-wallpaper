@@ -1,67 +1,67 @@
 # Rust Wallpaper
 
-A Windows-first live wallpaper engine written in Rust, inspired by the architecture and user-facing capabilities of [Lively Wallpaper](https://github.com/rocksdanister/lively).
+A Windows-first live wallpaper engine written in Rust, inspired by the user-facing capabilities of [Lively Wallpaper](https://github.com/rocksdanister/lively).
 
-This project is an independent implementation. It uses Lively as a behavioral and architectural reference; it does not copy Lively source code.
+## Current project status
 
-## Project status
+The repository now contains a native wallpaper runtime, an initial daemon IPC service, and the first desktop control-panel implementation. This is still an early development build, not a production-ready Lively replacement.
 
-**Early scaffold — not yet a working wallpaper player.**
+### Implemented foundation
 
-The first milestone establishes the workspace, project boundaries, and Windows integration entry point. Desktop attachment, video playback, monitor orchestration, and the UI will be implemented and tested in later milestones.
+- Win32 desktop-host discovery and wallpaper window attachment.
+- MPV-backed video playback with per-monitor player processes.
+- Runtime supervision, monitor lifecycle and persistent assignment support.
+- Fullscreen/game-aware suspension policies and Windows event handling.
+- Explorer/player recovery and runtime health reporting.
+- Versioned JSON named-pipe IPC between the daemon and clients.
+- Initial egui desktop UI with library listing/import/removal, monitor controls, and connection recovery.
 
-## Goals
+### Not yet production-ready
 
-- Native Windows desktop wallpaper integration.
-- Video wallpapers with hardware decoding where supported.
-- Multiple-monitor awareness.
-- Explicit lifecycle management and reliable cleanup.
-- Pause policies for fullscreen applications, lock screen, and battery state.
-- Web wallpapers through WebView2 in an isolated player process.
-- A library and settings UI, kept separate from the wallpaper runtime.
+- Native Windows validation of the complete daemon/UI workflow.
+- Per-user named-pipe ACL and client identity validation.
+- Native file picker, thumbnail generation and metadata extraction.
+- System tray, Windows startup integration and settings persistence.
+- WebView2 wallpapers and interactive scenes.
+- Installer, updater, signing and crash diagnostics.
 
-## Architecture
+## Workspace
 
 ```text
 apps/
-  wallpaper-daemon/   Runtime coordinator and Windows entry point
-  desktop-ui/         Future user interface
+  wallpaper-daemon/   Runtime coordinator, Windows integration and IPC server
+  wallpaper-ui/       Native egui control panel and IPC client
+  video-player/       Standalone MPV player entry point
 crates/
-  wallpaper-core/     Domain types and orchestration contracts
-  wallpaper-windows/  Windows-specific APIs and monitor discovery
-  wallpaper-protocol/ IPC message types
-docs/
-  architecture.md
+  wallpaper-core/     Domain types, library and runtime orchestration
+  wallpaper-windows/  Win32 desktop, monitor and MPV integration
+  wallpaper-protocol/ Versioned daemon/client message contract
 ```
 
-The daemon owns wallpaper lifecycle and native desktop integration. Player implementations will run independently and communicate with the daemon over a versioned IPC protocol. The UI will be a control surface, not the rendering host.
+The daemon is the sole owner of Win32 wallpaper windows, runtime state and MPV processes. The UI communicates through `wallpaper-protocol` and does not access the database or manipulate native wallpaper windows directly.
 
 ## Development
 
-Requirements:
+Requirements: Rust stable. Windows 10/11 is required to run the native daemon and desktop UI.
 
-- Rust stable
-- Windows 10/11 for the native integration target
-- A C/C++ build toolchain may be required by future native media dependencies
-
-Run on Windows:
+On Windows:
 
 ```powershell
-cargo check --workspace
 cargo test --workspace
 cargo run -p wallpaper-daemon
+cargo run -p wallpaper-ui
 ```
 
-On non-Windows systems, the workspace can be checked, but the Windows integration executable reports that it is Windows-only.
+Start the daemon before the UI. The UI reconnects when the daemon is unavailable or restarts.
 
-## Milestones
+On non-Windows hosts, platform-independent crates can be tested and the workspace can be cross-checked for the Windows GNU target.
 
-1. Workspace and Windows platform boundary.
-2. Monitor enumeration and desktop host investigation.
-3. Native test window and desktop attachment prototype.
-4. Video player process and playback controls.
-5. Multi-monitor orchestration and performance policies.
-6. Web player, library, settings UI, and packaging.
+## Documentation
+
+- `docs/architecture.md` — runtime and platform architecture.
+- `docs/architecture-proposal-ui-ipc.md` — desktop application design proposal.
+- `docs/ipc-protocol.md` — IPC framing, commands and client behavior.
+- `apps/wallpaper-ui/README.md` — desktop UI scope and build instructions.
 
 ## License
 
