@@ -634,7 +634,7 @@ mod platform {
                 }
             }
 
-            let mut taskbar_created_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
+            let taskbar_created_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
             if taskbar_created_msg != 0 {
                 registration.mark_active(EventSource::ExplorerRestart);
             } else {
