@@ -180,8 +180,8 @@ fn hw_from_str(s: &str) -> HardwareAcceleration {
     }
 }
 
-/// SQLite-backed store. Uses its own database file, so it can never interfere with the wallpaper
-/// library's schema migrations.
+/// SQLite-backed runtime assignment store. It uses a dedicated table so it can safely share
+/// the daemon database with the wallpaper library.
 pub struct SqliteAssignmentStore {
     conn: rusqlite::Connection,
 }
