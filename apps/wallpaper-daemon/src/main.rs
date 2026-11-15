@@ -33,10 +33,10 @@ unsafe extern "system" fn ctrl_handler(_: u32) -> windows::Win32::Foundation::BO
     windows::Win32::Foundation::BOOL(1)
 }
 
-fn parse_cli_args() -> (Option<Duration>, PerformanceProfile) {
+fn parse_cli_args() -> (Option<Duration>, Option<PerformanceProfile>) {
     let args: Vec<String> = std::env::args().collect();
     let mut duration = None;
-    let mut profile = PerformanceProfile::Balanced;
+    let mut profile = None;
     for i in 1..args.len() {
         if (args[i] == "--duration" || args[i] == "--timeout") && i + 1 < args.len() {
             if let Ok(secs) = args[i + 1].parse::<u64>() {
@@ -47,13 +47,13 @@ fn parse_cli_args() -> (Option<Duration>, PerformanceProfile) {
             duration = Some(Duration::from_secs(3));
         }
         if args[i] == "--profile" && i + 1 < args.len() {
-            profile = PerformanceProfile::parse(&args[i + 1]).unwrap_or_else(|| {
+            profile = PerformanceProfile::parse(&args[i + 1]);
+            if profile.is_none() {
                 eprintln!(
-                    "unknown profile '{}', using balanced (eco|balanced|performance)",
+                    "unknown profile '{}'; expected eco, balanced or performance",
                     args[i + 1]
                 );
-                PerformanceProfile::Balanced
-            });
+            }
         }
     }
     (duration, profile)
@@ -67,7 +67,7 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let (duration_limit, profile) = parse_cli_args();
+    let (duration_limit, requested_profile) = parse_cli_args();
     info!("Rust Wallpaper daemon starting");
     info!(?profile, "RuntimeSupervisor orchestration active");
 
@@ -81,6 +81,18 @@ fn main() -> anyhow::Result<()> {
         let db_path = PathBuf::from("library.db");
         let library = WallpaperLibrary::open(&db_path)
             .context("failed to open or create SQLite wallpaper library")?;
+        let saved_profile = library
+            .get_setting("performance_profile")?
+            .and_then(|value| PerformanceProfile::parse(&value));
+        let profile = requested_profile.or(saved_profile).unwrap_or_default();
+        if requested_profile.is_some() {
+            let profile_name = match profile {
+                PerformanceProfile::Eco => "eco",
+                PerformanceProfile::Balanced => "balanced",
+                PerformanceProfile::Performance => "performance",
+            };
+            library.set_setting("performance_profile", profile_name)?;
+        }
 
         // Import the bundled demo assets when present. They are not treated as permanent
         // assignments: the monitor registry below owns the persisted user choices.
@@ -778,9 +790,18 @@ fn dispatch_ipc(
             Response::Accepted
         }
         Command::SetProfile { profile } => {
+            let profile_name = match profile {
+                PerformanceProfile::Eco => "eco",
+                PerformanceProfile::Balanced => "balanced",
+                PerformanceProfile::Performance => "performance",
+            };
+            if let Err(error) = library.set_setting("performance_profile", profile_name) {
+                return failure(ErrorCode::Internal, error.to_string());
+            }
             runtime.runtime.set_profile(profile);
             Response::Accepted
         }
+        Command::GetProfile => Response::Profile(runtime.runtime.policy().profile),
         Command::GetStatus { monitor } => {
             let selected: Option<String> = match monitor {
                 Some(name) => match resolve_device(&name, known) {
