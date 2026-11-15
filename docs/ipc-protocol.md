@@ -43,7 +43,8 @@ Commands with fields use the tagged JSON representation, for example:
 | `list_monitors` | Returns connected monitor IDs, device names, geometry, and primary flag. |
 | `list_wallpapers` | Returns the daemon's library entries. |
 | `import_wallpaper` | Imports a supported local video path and optional display title. |
-| `remove_wallpaper` | Removes a wallpaper record from the library by ID. |
+| `remove_wallpaper` | Removes a wallpaper record from the library by ID, provided no runtime assignment references its source. |
+| `set_profile` / `get_profile` | Updates or reads the persisted Eco, Balanced or Performance runtime profile. |
 | `apply_wallpaper` | Applies a library video by ID to one monitor or all connected monitors. Web/scene entries are not playable yet. |
 | `pause` / `resume` | Adds/removes the user-pause reason for one monitor or globally. |
 | `set_volume` | Sets volume from 0 through 100 on one monitor or all active players. |
