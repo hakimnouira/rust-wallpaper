@@ -50,7 +50,7 @@ async fn listener_loop(tx: SyncSender<PendingRequest>) {
         let mut options = ServerOptions::new();
         options.first_pipe_instance(first_instance);
         options.reject_remote_clients(true);
-        let server = match options.create(PIPE_NAME) {
+        let mut server = match options.create(PIPE_NAME) {
             Ok(server) => {
                 first_instance = false;
                 server
