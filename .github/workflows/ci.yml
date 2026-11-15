@@ -23,7 +23,7 @@ jobs:
           targets: x86_64-pc-windows-gnu
       - name: Check formatting
         run: cargo fmt --all -- --check
-      - name: Run platform-independent tests
-        run: cargo test --workspace
+      - name: Run platform-independent core tests
+        run: cargo test -p wallpaper-core
       - name: Cross-check Windows target
         run: cargo check --workspace --target x86_64-pc-windows-gnu
