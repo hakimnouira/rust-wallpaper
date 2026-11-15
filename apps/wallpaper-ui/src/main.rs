@@ -21,6 +21,7 @@ mod desktop {
         monitors: Vec<MonitorInfo>,
         wallpapers: Vec<Wallpaper>,
         players: Vec<PlayerStatusInfo>,
+        profile: PerformanceProfile,
         last_updated: Option<Instant>,
     }
 
@@ -39,7 +40,6 @@ mod desktop {
         import_path: String,
         import_title: String,
         search: String,
-        profile: PerformanceProfile,
         notice: String,
     }
 
@@ -54,7 +54,6 @@ mod desktop {
                 import_path: String::new(),
                 import_title: String::new(),
                 search: String::new(),
-                profile: PerformanceProfile::Balanced,
                 notice: "Connect to the wallpaper daemon to get started.".into(),
             }
         }
@@ -309,8 +308,7 @@ mod desktop {
                     (PerformanceProfile::Balanced, "Balanced"),
                     (PerformanceProfile::Performance, "Performance"),
                 ] {
-                    if ui.selectable_label(self.profile == profile, label).clicked() {
-                        self.profile = profile;
+                    if ui.selectable_label(snapshot.profile == profile, label).clicked() {
                         self.send(
                             Command::SetProfile { profile },
                             "Performance profile updated…",
@@ -492,6 +490,7 @@ mod desktop {
                                     Command::ListMonitors,
                                     Command::ListWallpapers,
                                     Command::GetStatus { monitor: None },
+                                    Command::GetProfile,
                                 ] {
                                     match send(connection, command).await {
                                         Ok(Response::MonitorList(items)) => {
