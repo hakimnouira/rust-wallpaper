@@ -498,8 +498,8 @@ mod platform {
             // The daemon will retry listener creation; partial coverage is safer to expose as
             // unavailable than to silently miss lock or display-power transitions.
             if !wts_registered || power_notify.is_none() || taskbar_msg == 0 {
-                if let Some(handle) = power_notify {
-                    let _ = UnregisterPowerSettingNotification(handle);
+                if let Some(handle) = power_notify.as_ref() {
+                    let _ = UnregisterPowerSettingNotification(*handle);
                 }
                 if wts_registered {
                     let _ = WTSUnRegisterSessionNotification(hwnd);
