@@ -40,7 +40,6 @@ mod desktop {
         selected_monitor: Option<String>,
         selected_wallpaper: Option<WallpaperId>,
         volumes: HashMap<String, u32>,
-        muted: HashMap<String, bool>,
         import_path: String,
         import_title: String,
         search: String,
@@ -56,7 +55,6 @@ mod desktop {
                 selected_monitor: None,
                 selected_wallpaper: None,
                 volumes: HashMap::new(),
-                muted: HashMap::new(),
                 import_path: String::new(),
                 import_title: String::new(),
                 search: String::new(),
@@ -334,15 +332,22 @@ mod desktop {
                                         "Volume updated…",
                                     );
                                 }
-                                let mut muted = self.muted.get(&device).copied().unwrap_or(false);
-                                if ui.checkbox(&mut muted, "Mute").changed() {
-                                    self.muted.insert(device.clone(), muted);
+                                if ui.button("Mute").clicked() {
                                     self.send(
                                         Command::SetMute {
                                             monitor: Some(device.clone()),
-                                            muted,
+                                            muted: true,
                                         },
-                                        "Mute setting updated…",
+                                        "Mute enabled…",
+                                    );
+                                }
+                                if ui.button("Unmute").clicked() {
+                                    self.send(
+                                        Command::SetMute {
+                                            monitor: Some(device.clone()),
+                                            muted: false,
+                                        },
+                                        "Mute disabled…",
                                     );
                                 }
                             });
