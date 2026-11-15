@@ -468,6 +468,11 @@ mod platform {
         }
         let state = &mut *ptr;
 
+        if msg == WM_TIMER && wparam.0 == REGISTRATION_TIMER_ID {
+            retry_due_registrations(hwnd, state);
+            return LRESULT(0);
+        }
+
         if state.taskbar_created_msg != 0 && msg == state.taskbar_created_msg {
             info!("Received TaskbarCreated: Windows Explorer restarted");
             state.emit(SystemPlatformEvent::ExplorerRestarted);
@@ -534,6 +539,7 @@ mod platform {
                 LRESULT(0)
             }
             WM_DESTROY => {
+                let _ = KillTimer(hwnd, REGISTRATION_TIMER_ID);
                 if let Some(hpower) = state.power_notify_handle.take() {
                     let _ = UnregisterPowerSettingNotification(hpower);
                 }
