@@ -383,6 +383,14 @@ mod desktop {
                             {
                                 self.selected_monitor = Some(device.clone());
                             }
+                            if ui.button("Default").clicked() {
+                                self.send(
+                                    Command::UnassignWallpaper {
+                                        monitor: device.clone(),
+                                    },
+                                    "Restoring default assignment…",
+                                );
+                            }
                         });
                     });
                 });
