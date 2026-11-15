@@ -11,6 +11,7 @@ use wallpaper_core::health::HealthPolicy;
 use wallpaper_core::monitors::{
     Assignment, MonitorLifecycle, MonitorRegistry, SqliteAssignmentStore,
 };
+use wallpaper_core::registration::RegistrationReport;
 use wallpaper_core::runtime::{parse_control_command, resolve_device, RuntimeState};
 use wallpaper_core::supervisor::RuntimeSupervisor;
 use wallpaper_core::{
@@ -153,6 +154,10 @@ fn main() -> anyhow::Result<()> {
         }
 
         let mut listener = start_listener_with_retry();
+        let mut last_listener_report = listener.as_ref().map(|l| l.registration_report());
+        if let Some(report) = &last_listener_report {
+            log_registration_report(report);
+        }
         let mut next_listener_attempt = Instant::now() + LISTENER_RETRY;
         let mut tracker = FullscreenTracker::new();
         let control_rx = spawn_control_reader();
@@ -186,7 +191,15 @@ fn main() -> anyhow::Result<()> {
             let now = Instant::now();
 
             while let Ok(cmd) = control_rx.try_recv() {
-                handle_control(cmd, &mut runtime, &mut manager, &known_monitors, now);
+                let registration_report = listener.as_ref().map(|l| l.registration_report());
+                handle_control(
+                    cmd,
+                    &mut runtime,
+                    &mut manager,
+                    &known_monitors,
+                    now,
+                    registration_report.as_ref(),
+                );
             }
 
             let mut listener_died = false;
@@ -207,12 +220,16 @@ fn main() -> anyhow::Result<()> {
             if listener_died {
                 warn!("System event listener thread exited; scheduling restart");
                 listener = None;
+                last_listener_report = None;
                 next_listener_attempt = now;
             }
             if listener.is_none() && now >= next_listener_attempt {
                 match SystemEventListener::start() {
                     Ok(l) => {
                         info!("System event listener restarted");
+                        let report = l.registration_report();
+                        log_registration_report(&report);
+                        last_listener_report = Some(report);
                         listener = Some(l);
                         next_listener_attempt = now + LISTENER_RETRY;
                     }
@@ -220,6 +237,14 @@ fn main() -> anyhow::Result<()> {
                         warn!(%e, "System event listener restart failed");
                         next_listener_attempt = now + LISTENER_RETRY;
                     }
+                }
+            }
+
+            if let Some(l) = &listener {
+                let report = l.registration_report();
+                if last_listener_report.as_ref() != Some(&report) {
+                    log_registration_report(&report);
+                    last_listener_report = Some(report);
                 }
             }
 
@@ -395,6 +420,14 @@ fn sync_monitors(
 }
 
 #[cfg(windows)]
+fn log_registration_report(report: &RegistrationReport) {
+    info!(coverage = ?report.coverage(), "Windows event registration coverage");
+    for diagnostic in report.diagnostics() {
+        warn!(%diagnostic, "Windows event source not fully registered");
+    }
+}
+
+#[cfg(windows)]
 fn spawn_control_reader() -> Receiver<ControlCommand> {
     let (tx, rx) = channel();
     let _ = std::thread::Builder::new()
@@ -428,6 +461,7 @@ fn handle_control(
     manager: &mut WallpaperManager,
     known: &[String],
     now: Instant,
+    registration_report: Option<&RegistrationReport>,
 ) {
     let resolve = |name: &str| {
         resolve_device(name, known)
@@ -497,6 +531,14 @@ fn handle_control(
             }
             for device in runtime.lifecycle.wanted_devices() {
                 info!(%device, "Monitor has an assigned wallpaper");
+            }
+            if let Some(report) = registration_report {
+                info!(coverage = ?report.coverage(), "Windows event registration coverage");
+                for diagnostic in report.diagnostics() {
+                    warn!(%diagnostic, "Windows event source not fully registered");
+                }
+            } else {
+                warn!("Windows event listener is unavailable");
             }
         }
         ControlCommand::Quit => {
