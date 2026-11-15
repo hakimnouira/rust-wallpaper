@@ -64,6 +64,9 @@ pub enum Command {
         wallpaper_id: WallpaperId,
         monitor: Option<String>,
     },
+    UnassignWallpaper {
+        monitor: String,
+    },
     Pause {
         monitor: Option<String>,
     },
