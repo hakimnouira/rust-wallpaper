@@ -55,13 +55,13 @@ Implemented on the working branch:
 
 ## Validation status
 
-GitHub Actions run [#43656212682](https://github.com/hakimnouira/rust-wallpaper/actions/runs/43656212682)
-completed successfully on commit `8c87939551744ff749de91eb12b899f50875c6c4`:
+GitHub Actions run [#43656679353](https://github.com/hakimnouira/rust-wallpaper/actions/runs/43656679353)
+completed successfully on commit `99b97c26ff20e607293fb31764c7343ef0ed8dd0`:
 
 - `cargo fmt --all -- --check`: passed.
 - `cargo test -p wallpaper-core`: **109 passed, 0 failed**.
-- `cargo check --workspace --target x86_64-pc-windows-gnu`: passed after installing MinGW
-  for the bundled SQLite build.
+- `cargo check --workspace --all-targets --target x86_64-pc-windows-gnu`: passed after installing
+  MinGW for the bundled SQLite build. This also type-checks the Windows-target test code.
 
 This proves native core tests and a Windows GNU cross-target type/build check. It does not prove
 the daemon's runtime behavior on a real Windows desktop.
