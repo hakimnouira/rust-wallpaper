@@ -247,6 +247,13 @@ mod tests {
         let encoded = serde_json::to_vec(&remove).unwrap();
         let decoded: RequestEnvelope = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, remove);
+
+        let profile = RequestEnvelope::new(Command::SetProfile {
+            profile: PerformanceProfile::Eco,
+        });
+        let encoded = serde_json::to_vec(&profile).unwrap();
+        let decoded: RequestEnvelope = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, profile);
     }
 
     #[test]
