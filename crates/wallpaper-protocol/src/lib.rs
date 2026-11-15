@@ -75,14 +75,11 @@ pub enum Command {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlayerStatusInfo {
     pub monitor: String,
-    pub wallpaper_id: Option<WallpaperId>,
     pub state: PlaybackState,
     pub active_decoder: String,
-    pub duration_secs: Option<f64>,
-    pub playback_time_secs: Option<f64>,
-    pub volume: u32,
-    pub muted: bool,
     pub memory_bytes: u64,
+    pub suspended: bool,
+    pub suspension_reasons: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
