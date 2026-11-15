@@ -225,11 +225,10 @@ mod platform {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-        GetWindowLongPtrW, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
-        SetTimer, KillTimer, SetWindowLongPtrW, UnregisterClassW, GWLP_USERDATA, HMENU, MSG,
+        GetWindowLongPtrW, KillTimer, PostQuitMessage, RegisterClassExW, RegisterWindowMessageW,
+        SetTimer, SetWindowLongPtrW, UnregisterClassW, GWLP_USERDATA, HMENU, MSG,
         REGISTER_NOTIFICATION_FLAGS, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_POWERBROADCAST,
-        WM_TIMER,
-        WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+        WM_TIMER, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
     };
 
     // Values verified against the `windows` crate's generated Win32 metadata.
@@ -366,12 +365,7 @@ mod platform {
                 self.registration.report().clone();
         }
 
-        fn registration_failed(
-            &mut self,
-            source: EventSource,
-            error: String,
-            now: Instant,
-        ) {
+        fn registration_failed(&mut self, source: EventSource, error: String, now: Instant) {
             match self.registration.record_failure(source, error.clone(), now) {
                 RetryDecision::RetryAfter(delay) => {
                     warn!(
