@@ -796,6 +796,11 @@ mod windows_integration_tests {
         events
     }
 
+    fn drain_initial(l: &SystemEventListener) {
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = l.drain();
+    }
+
     #[repr(C)]
     struct DisplayStateMessage {
         guid: windows::core::GUID,
@@ -834,6 +839,7 @@ mod windows_integration_tests {
     #[test]
     fn session_lock_and_unlock_are_reported_once() {
         let l = SystemEventListener::start().unwrap();
+        drain_initial(&l);
         send(&l, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, 0);
         send(&l, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, 0);
         send(&l, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK, 0);
@@ -850,6 +856,7 @@ mod windows_integration_tests {
     #[test]
     fn suspend_and_every_resume_flavour_are_reported() {
         let l = SystemEventListener::start().unwrap();
+        drain_initial(&l);
         send(&l, WM_POWERBROADCAST, PBT_APMSUSPEND, 0);
         send(&l, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
         send(&l, WM_POWERBROADCAST, PBT_APMRESUMESUSPEND, 0); // same wake: duplicate
@@ -874,6 +881,7 @@ mod windows_integration_tests {
     #[test]
     fn display_power_states_are_decoded() {
         let l = SystemEventListener::start().unwrap();
+        drain_initial(&l);
         send_power_setting(&l, GUID_CONSOLE_DISPLAY_STATE, 0);
         send_power_setting(&l, GUID_CONSOLE_DISPLAY_STATE, 0); // duplicate
         send_power_setting(&l, GUID_CONSOLE_DISPLAY_STATE, 2); // dimmed: no event
@@ -890,6 +898,7 @@ mod windows_integration_tests {
     #[test]
     fn foreign_power_setting_guid_is_ignored() {
         let l = SystemEventListener::start().unwrap();
+        drain_initial(&l);
         let other = windows::core::GUID::from_u128(0x12345678_1234_1234_1234_123456789abc);
         send_power_setting(&l, other, 0);
         assert!(drain(&l).is_empty());
@@ -898,6 +907,7 @@ mod windows_integration_tests {
     #[test]
     fn display_change_and_taskbar_created_are_reported() {
         let l = SystemEventListener::start().unwrap();
+        drain_initial(&l);
         send(&l, WM_DISPLAYCHANGE, 32, 0);
         let taskbar = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
         assert_ne!(taskbar, 0);

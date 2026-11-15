@@ -262,7 +262,7 @@ mod desktop {
                 painter.rect_stroke(
                     monitor_rect,
                     5.0,
-                    egui::Stroke::new(1.0, egui::Color32::LIGHT_GRAY),
+                    egui::Stroke::new(1.0_f32, egui::Color32::LIGHT_GRAY),
                 );
                 painter.text(
                     monitor_rect.center(),
