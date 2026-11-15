@@ -1,4 +1,7 @@
 //! Versioned, bounded messages shared between the daemon and desktop clients.
+
+#[cfg(windows)]
+pub mod client;
 //!
 //! The wire format is one UTF-8 JSON envelope per line. The framing helpers enforce
 //! a hard limit before growing the input buffer without bound.
