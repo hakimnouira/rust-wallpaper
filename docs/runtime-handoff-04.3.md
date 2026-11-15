@@ -1,113 +1,85 @@
-# TASK 04.3 handoff — Dynamic Monitor Lifecycle & Runtime Reliability
+# TASK 04.3 — Runtime integration completion
 
-Branch: `agent/claude-runtime` (never touch `main`). Written because the session may end.
-**Status: PARTIAL. The platform-independent core is done and tested; the Windows glue and the
-daemon migration are NOT done.** Nothing here has run on real Windows.
+Working branch: `agent/runtime-completion`
+Source branch: `agent/claude-runtime`
+Base: `c5589324497ff56b7eaae47c2d8b1e6b88061246`
 
-## How to resume (5 minutes)
+## Implementation status
 
-```
-git fetch origin && git checkout agent/claude-runtime
+The daemon has been migrated to use `wallpaper_core::supervisor::RuntimeSupervisor` as its
+single runtime orchestration path. The original Claude branch is unchanged.
+
+Implemented on the working branch:
+
+1. **Monitor lifecycle**
+   - Daemon enumerates `MonitorDetails` and converts them to stable hardware-identity descriptors.
+   - SQLite-backed user assignments are loaded from the existing `library.db` in a separate
+     `monitor_assignments` table.
+   - New monitor discovery, periodic topology reconciliation, Explorer recovery, assign and
+     unassign commands are wired through `RuntimeSupervisor`.
+   - Removing the last assignment stops the player. Renamed hardware outputs invalidate the
+     old device-name routing key; ordinary disconnect/reconnect retains the host recovery marker.
+
+2. **Player health**
+   - `WallpaperManager` implements `WallpaperHost`.
+   - Reports include playback state, uptime, working-set memory, actual child-process liveness
+     via non-blocking `Child::try_wait`, and manager recovery backoff state.
+   - Scheduled health probes use one MPV IPC request per player (`video-params`) rather than
+     the multi-property telemetry query. Probe scheduling remains controlled by
+     `RuntimeSupervisor::probe_due`.
+
+3. **Daemon orchestration**
+   - Startup, topology sync, foreground observation, health updates, reconciliation, telemetry,
+     Explorer recovery, and console commands now use the new supervisor.
+   - `assign DISPLAYn <path>` persists a monitor assignment.
+   - `unassign DISPLAYn` removes the user choice and restores the default policy.
+   - Invalid monitor names are rejected; they are not treated as global pause/resume commands.
+   - Defaults use the primary monitor's fallback wallpaper, then mirror that primary choice
+     to secondary monitors unless they have explicit user assignments.
+
+4. **Event listener safety**
+   - A listener is not reported as started if WTS session registration, display-power
+     registration, or the `TaskbarCreated` message registration fails.
+   - The daemon retries listener creation every two seconds. This is fail-closed behavior:
+     partial registration is not silently presented as complete coverage.
+   - The platform-independent `RegistrationTracker` remains available and tested, but its
+     per-source `WM_TIMER` retry/report integration is not yet wired into the Win32 listener.
+     This is the one remaining implementation gap in the event-registration requirement.
+
+5. **CI**
+   - Added `.github/workflows/ci.yml` to run formatting, workspace tests, and a
+     `x86_64-pc-windows-gnu` cross-target check on pushes to this branch and PRs to main.
+   - Check the live Actions run before treating the branch as build-verified.
+
+## Validation status
+
+Do not infer successful compilation or Windows behavior from the code changes alone.
+The GitHub Actions run is the validation source for formatting, native tests, and cross-target
+checking. A cross-target `cargo check` is not a substitute for running the daemon on Windows.
+
+Still required on a real Windows machine:
+- Start the daemon with two monitors and confirm both assignments render.
+- Lock/unlock the session and turn the display off/on.
+- Launch/close a borderless fullscreen game on each monitor.
+- Pause manually, lock/unlock, and confirm the manual pause remains active.
+- Disconnect/reconnect a monitor and confirm its persisted assignment returns.
+- Kill an MPV child and confirm recovery followed by the correct suspended/playing state.
+- Restart Explorer while paused and confirm playback returns paused.
+- Test `assign`, `unassign`, `status`, and clean shutdown.
+
+## Useful commands
+
+```text
 cargo fmt --all -- --check
-cargo test -p wallpaper-core                              # 108 tests, runs on any OS
-cargo check --workspace --all-targets --target x86_64-pc-windows-gnu   # needs mingw + windows-gnu std
+cargo test --workspace
+cargo check --workspace --target x86_64-pc-windows-gnu
 ```
-Sandbox recipe that worked (Linux): Rust >=1.78 (micromamba `rust` + `rust-std-x86_64-pc-windows-gnu`),
-`apt install gcc-mingw-w64-x86-64 wine64 xvfb`, `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc-posix`,
-run Windows test exes with `xvfb-run -a wine64 <exe>` (headless Wine without Xvfb fails CreateWindowExW).
-Do not edit `manager.rs` / `mpv.rs` / `window.rs` / `desktop_host.rs` (Agent A).
 
-## Status per requirement
+## Known limitations
 
-| # | Requirement | State | Where |
-|---|---|---|---|
-| 1 | Dynamic monitor registry, add/remove/change, restore, safe defaults | **Core DONE + tested** (not wired into daemon) | `core/src/monitors.rs`, `core/src/supervisor.rs` |
-| 1 | Stable monitor identity (Windows may renumber `\\.\DISPLAYn`) | **DONE** (core ids + `enumerate_monitor_details()`; Win32 path compiles, not run) | `monitors.rs::MonitorId`, `windows/src/lib.rs` |
-| 1 | Persist user assignments, defaults runtime-only | **DONE** (SQLite, own db file `SqliteAssignmentStore`) | `monitors.rs` |
-| 2 | Health model (7 dimensions, Unknown never faked) | **Core DONE + tested** (not wired into daemon) | `core/src/health.rs` |
-| 2 | `RuntimeError` from verdicts; Starting/Failed/Stopped not healthy | **DONE** | `RuntimeState::sync_player_health`, `health.rs` |
-| 2 | Non-blocking health checks | **Partly**: bounded by capped backoff + adaptive probe scheduler; true non-blocking needs Agent A API | `ProbeScheduler`, `Reconciler` |
-| 3 | Event registration status + bounded retries | **Pure tracker DONE + tested; Win32 listener NOT patched** | `core/src/registration.rs` (done); `windows/src/events.rs` (TODO) |
-| 4 | Recovery correctness | **DONE in core with fake host** (UserPaused/Fullscreen/Suspend survive recovery, Explorer, bursts) | `supervisor.rs` tests |
-| 5 | Tests | Core: 108 pass natively. Windows/Wine tests for new Win32 code: NOT written | see below |
-| 6 | Validation run | Partial (see Evidence) | |
-| 7 | Push + SHA | See final message / `git log` | |
-
-## Evidence (what actually ran)
-
-* `cargo fmt --all -- --check`: OK.
-* `cargo test -p wallpaper-core` (native Linux): **108 passed, 0 failed**.
-* `cargo check --workspace --all-targets --target x86_64-pc-windows-gnu`: OK (cross-compile check only).
-* Wine: the earlier 18 `wallpaper-windows` tests passed under Wine 9 + Xvfb (previous commit `795179d`);
-  **not re-run after this task's changes**.
-* **Not executed**: `cargo test --workspace` natively (fails at baseline: 2 ungated lines in Agent A's
-  `manager.rs`, `win.hwnd.0` and `attach_to_host`); `cargo test --workspace --target x86_64-pc-windows-gnu`
-  under Wine; anything on real Windows; the daemon itself.
-
-## Bugs found and fixed this task (all have regression tests)
-
-1. Reconcile throttled a *legitimate* re-pause after a respawn when the previous pause had succeeded
-   (player stayed Playing under UserPaused/suspend). Fix: verify effect right after each command.
-2. Failed-command evidence leaked from a dead process onto its healthy replacement (un-paused up to 30 s).
-   Fix: per-process evidence, reset on replacement / manual restart / vanished-and-returned / probe success.
-3. Default policy let the primary monitor adopt a secondary's personal wallpaper. Now: primary uses the
-   fallback only; others clone the primary.
-4. A hung MPV IPC (1.5 s per command, ~5 commands per telemetry call) could stall the loop; reconcile retries
-   now back off to 30 s and probes back off to 30 s.
-
-## Remaining work, in order
-
-### Step 1 — `events.rs` registration status (windows crate; Win32 code, test on Wine)
-Design is decided, code not written. In `platform::run_notification_thread`:
-* Own a `wallpaper_core::registration::RegistrationTracker` and an `Arc<Mutex<RegistrationReport>>`
-  shared with `SystemEventListener` (`registration_report()` getter; non-Windows returns default).
-* First attempt for each `EventSource`: `SessionNotifications` -> `WTSRegisterSessionNotification`;
-  `DisplayPower` -> `RegisterPowerSettingNotification`; `ExplorerRestart` -> `RegisterWindowMessageW("TaskbarCreated") != 0`;
-  `SuspendResume` and `DisplayTopology` -> `mark_active` once the hidden *top-level* window exists.
-* On failure `tracker.record_failure(..)`; drive retries with `SetTimer`/`WM_TIMER` on the same window
-  (interval ~ `min(250 ms, initial_delay/2)`), `tracker.due(now)`, `KillTimer` when
-  `!has_pending_retries()`. Keep the single dedicated thread. Publish the report after every change.
-* A failed registration must NOT fail `start()` (only window creation may). Add `ListenerOptions`
-  (retry policy + injected failure counters for WTS/power/explorer) with `start_with(options)` for tests.
-* Wine/Windows tests (extend `windows_integration_tests`): fail WTS twice then succeed -> coverage goes
-  Partial -> Full; fail forever -> `Failed`, coverage stays Partial, diagnostics non-empty; clean drop with
-  a retry timer pending.
-
-### Step 2 — `policy.rs` adapters (windows crate)
-* `impl WallpaperHost for WallpaperManager`: `start_wallpaper` = `play_video_on_monitor(device, &path, cfg)`;
-  map `WallpaperManagerError::MonitorNotFound` -> `StartError::NoWindow` (call `refresh()` once and retry).
-  `player_reports()` from `player_statuses()` (`process_alive: Unknown`, `uptime: None`, `recovery: None`).
-* Telemetry -> `ProbeResult`: `ipc_responded = width||height||fps||gpu any Some`, `video_initialized = width&&height`.
-  `collect_telemetry()` is the ONLY blocking call; gate it with `supervisor.probe_due(now)`.
-* Add a `ProcessBackoff` exhaustion/reset test (exists partly in `policy.rs` tests).
-
-### Step 3 — Agent A proposal (do not edit their files)
-Write `docs/proposals/agent-a-player-health.md` with a ready patch for `manager.rs`/`mpv.rs`:
-`WallpaperManager::player_health(&mut self) -> Vec<...>` returning non-blocking `try_wait` liveness,
-child pid/uptime, IPC pipe connected, last IPC success time, backoff attempts + exhausted flag, plus
-`play_video_on_monitor_paused`. Verify with `git apply --check` in a scratch worktree. Then switch
-`player_reports()` to fill `process_alive`, `uptime`, `recovery`. Also ask them to `#[cfg(windows)]`-gate the 2 lines
-that break Linux builds. Until then a dead player with a stale `Playing` state is only caught by probe rounds.
-
-### Step 4 — migrate the daemon loop to `RuntimeSupervisor` (`apps/wallpaper-daemon/src/main.rs`)
-Replace the static `assigned` list. Per loop: every poll `enumerate_monitor_details()` ->
-`supervisor.sync_topology(descs, &mut manager, now)`; if `supervisor.probe_due(now)`:
-`collect_telemetry()` -> `record_probes`; `manager.check_and_recover_players()`;
-`supervisor.update_health(&mut manager, now)`; `supervisor.reconcile(&mut manager, now)`.
-Startup: build `MonitorRegistry::new(Box::new(SqliteAssignmentStore::open(<next to library.db>/monitor_assignments.db)), Some(sample))`.
-Replace the two TODO arms for `Assign`/`Unassign` in `handle_control` with `supervisor.assign_user(..)` /
-`lifecycle.unassign_user(..)`. Log `registration_report().coverage()` at start and on change; show it in `status`.
-Behaviour change to document: monitors now share the primary's wallpaper by default (old demo alternated by index).
-
-### Step 5 — validation and report
-Run the 5 commands from the task; run Windows-target tests under `xvfb-run wine64`; record real output; update
-`docs/runtime-agent-b.md`; final report must separate Windows / Wine / cross-compile / not-run, and must not claim
-Windows runtime verification (still only the manual checklist in `runtime-agent-b.md` section 8, plus: unplug
-a monitor, replug it, `taskkill /f /im mpv.exe`, restart Explorer while paused).
-
-## Known limitations (carry forward)
-* A player replaced inside a single manager call (no observable gap, no uptime) keeps stale failure evidence
-  until the next probe success or the 30 s retry cap. Fix needs Agent A's uptime/pid.
-* `enumerate_monitor_details()` identity changes if a monitor moves to a different port (treated as a new monitor).
-* Empty monitor enumeration is treated as a failed query, never "all monitors gone".
-* The recovery budget is time-based (45 s) because the manager's backoff state is private.
+- Event registrations currently retry by recreating the entire listener every two seconds.
+  Per-source bounded retries and a public registration coverage report remain future work.
+- Player process liveness is sampled with `try_wait`; IPC/video health is sampled separately.
+  The scheduled probe is one IPC round-trip per player, but a probe round is still synchronous.
+- The Windows integration and real desktop behavior must be verified on the user's Windows system.
+- The Antigravity MPV/window lifecycle branch is separate and has not been merged into this branch.
