@@ -56,6 +56,9 @@ pub enum Command {
     RemoveWallpaper {
         wallpaper_id: WallpaperId,
     },
+    RetryProcessing {
+        wallpaper_id: WallpaperId,
+    },
     SetProfile {
         profile: PerformanceProfile,
     },
@@ -250,6 +253,13 @@ mod tests {
         let encoded = serde_json::to_vec(&remove).unwrap();
         let decoded: RequestEnvelope = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, remove);
+
+        let retry = RequestEnvelope::new(Command::RetryProcessing {
+            wallpaper_id: WallpaperId::new(),
+        });
+        let encoded = serde_json::to_vec(&retry).unwrap();
+        let decoded: RequestEnvelope = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, retry);
 
         let profile = RequestEnvelope::new(Command::SetProfile {
             profile: PerformanceProfile::Eco,

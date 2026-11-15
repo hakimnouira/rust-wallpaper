@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 eframe.workspace = true
+image.workspace = true
 tokio.workspace = true
 wallpaper-core = { path = "../../crates/wallpaper-core" }
 wallpaper-protocol = { path = "../../crates/wallpaper-protocol" }

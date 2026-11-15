@@ -100,6 +100,43 @@ impl Default for PlaybackConfig {
     }
 }
 
+/// Status of thumbnail generation and video metadata extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessingStatus {
+    Pending,
+    Processing,
+    Completed,
+    Failed,
+}
+
+impl Default for ProcessingStatus {
+    fn default() -> Self {
+        Self::Completed
+    }
+}
+
+/// Helper function to classify video resolution into standard human-friendly categories.
+pub fn categorize_resolution(width: u32, height: u32) -> &'static str {
+    let min_dim = width.min(height);
+    let max_dim = width.max(height);
+    if max_dim >= 7680 || min_dim >= 4320 {
+        "8K UHD"
+    } else if max_dim >= 3840 || min_dim >= 2160 {
+        "4K UHD"
+    } else if max_dim >= 2560 || min_dim >= 1440 {
+        "1440p QHD"
+    } else if max_dim >= 1920 || min_dim >= 1080 {
+        "1080p FHD"
+    } else if max_dim >= 1280 || min_dim >= 720 {
+        "720p HD"
+    } else if max_dim >= 854 || min_dim >= 480 {
+        "480p SD"
+    } else {
+        "SD"
+    }
+}
+
 /// Metadata describing a wallpaper asset.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WallpaperMetadata {
@@ -108,7 +145,40 @@ pub struct WallpaperMetadata {
     pub duration_secs: Option<f64>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    #[serde(default)]
+    pub aspect_ratio: Option<f64>,
+    #[serde(default)]
+    pub fps: Option<f64>,
+    #[serde(default)]
+    pub codec: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+    #[serde(default)]
+    pub resolution_category: Option<String>,
+    #[serde(default)]
+    pub processing_state: ProcessingStatus,
+    #[serde(default)]
+    pub processing_error: Option<String>,
     pub thumbnail_path: Option<String>,
+    #[serde(default)]
+    pub source_mtime: Option<u64>,
+}
+
+impl WallpaperMetadata {
+    pub fn is_ready(&self) -> bool {
+        self.processing_state == ProcessingStatus::Completed
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.processing_state == ProcessingStatus::Failed
+    }
+
+    pub fn is_processing(&self) -> bool {
+        matches!(
+            self.processing_state,
+            ProcessingStatus::Pending | ProcessingStatus::Processing
+        )
+    }
 }
 
 /// A wallpaper known to the local library.
@@ -133,7 +203,15 @@ impl Wallpaper {
                 duration_secs: None,
                 width: None,
                 height: None,
+                aspect_ratio: None,
+                fps: None,
+                codec: None,
+                file_size: None,
+                resolution_category: None,
+                processing_state: ProcessingStatus::Pending,
+                processing_error: None,
                 thumbnail_path: None,
+                source_mtime: None,
             },
             config: PlaybackConfig::default(),
         }

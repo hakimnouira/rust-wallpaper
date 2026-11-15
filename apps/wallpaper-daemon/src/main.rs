@@ -24,6 +24,8 @@ use wallpaper_windows::{
 
 #[cfg(windows)]
 mod ipc;
+pub mod metadata;
+pub mod pipeline;
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -95,6 +97,15 @@ fn main() -> anyhow::Result<()> {
         }
         let library = WallpaperLibrary::open(&db_path)
             .context("failed to open or create SQLite wallpaper library")?;
+
+        let thumbnails_dir = app_data_dir.join("thumbnails");
+        std::fs::create_dir_all(&thumbnails_dir).with_context(|| {
+            format!(
+                "failed to create thumbnails directory '{}'",
+                thumbnails_dir.display()
+            )
+        })?;
+        let pipeline = pipeline::ExtractionPipeline::start(library.clone(), thumbnails_dir.clone());
         let saved_profile = library
             .get_setting("performance_profile")?
             .and_then(|value| PerformanceProfile::parse(&value));
@@ -136,6 +147,21 @@ fn main() -> anyhow::Result<()> {
             count = library.list().unwrap_or_default().len(),
             "Wallpaper library loaded"
         );
+
+        // Restart recovery: scan library items and queue any missing thumbnails or pending jobs
+        if let Ok(wallpapers) = library.list() {
+            for wp in wallpapers {
+                let thumb_missing = wp
+                    .metadata
+                    .thumbnail_path
+                    .as_ref()
+                    .map_or(true, |p| !std::path::Path::new(p).exists());
+                let state_pending = wp.metadata.is_processing();
+                if thumb_missing || state_pending {
+                    pipeline.submit(wp.id, PathBuf::from(&wp.metadata.source));
+                }
+            }
+        }
 
         let fallback_path = if nature_mp4.is_file() {
             Some(nature_mp4)
@@ -237,6 +263,7 @@ fn main() -> anyhow::Result<()> {
                 let response = dispatch_ipc(
                     pending.request,
                     &library,
+                    &pipeline,
                     &mut runtime,
                     &mut manager,
                     &known_monitors,
@@ -595,6 +622,7 @@ fn handle_control(
 fn dispatch_ipc(
     request: wallpaper_protocol::RequestEnvelope,
     library: &WallpaperLibrary,
+    pipeline: &pipeline::ExtractionPipeline,
     runtime: &mut RuntimeSupervisor,
     manager: &mut WallpaperManager,
     known: &[String],
@@ -642,11 +670,30 @@ fn dispatch_ipc(
             match library.import_video(&path, title.as_deref(), None) {
                 Ok(wallpaper) => {
                     info!(wallpaper_id = %wallpaper.id, source = %path, "Wallpaper imported through IPC");
+                    pipeline.submit(wallpaper.id, PathBuf::from(&path));
                     Response::Accepted
                 }
                 Err(error) => return failure(ErrorCode::InvalidRequest, error.to_string()),
             }
         }
+        Command::RetryProcessing { wallpaper_id } => match library.get(wallpaper_id) {
+            Ok(Some(wallpaper)) => {
+                let _ = library.set_processing_state(
+                    wallpaper_id,
+                    wallpaper_core::ProcessingStatus::Pending,
+                    None,
+                );
+                pipeline.submit(wallpaper_id, PathBuf::from(&wallpaper.metadata.source));
+                Response::Accepted
+            }
+            Ok(None) => {
+                return failure(
+                    ErrorCode::NotFound,
+                    format!("wallpaper {wallpaper_id} was not found"),
+                )
+            }
+            Err(error) => return failure(ErrorCode::Internal, error.to_string()),
+        },
         Command::RemoveWallpaper { wallpaper_id } => {
             let wallpaper = match library.get(wallpaper_id) {
                 Ok(Some(wallpaper)) => wallpaper,
@@ -667,6 +714,13 @@ fn dispatch_ipc(
                     ErrorCode::InvalidRequest,
                     "wallpaper is assigned to a monitor or configured as the fallback; unassign it before removing it from the library".into(),
                 );
+            }
+            // Delete associated thumbnail from disk if present
+            if let Some(ref thumb_path_str) = wallpaper.metadata.thumbnail_path {
+                let thumb_path = PathBuf::from(thumb_path_str);
+                if thumb_path.is_file() {
+                    let _ = std::fs::remove_file(thumb_path);
+                }
             }
             match library.delete(wallpaper_id) {
                 Ok(true) => Response::Accepted,
