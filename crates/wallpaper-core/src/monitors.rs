@@ -424,8 +424,14 @@ impl MonitorRegistry {
     /// a connected monitor's derived assignment, or the configured fallback.
     /// This prevents removing a library entry while the runtime still depends on its file.
     pub fn is_path_assigned(&self, path: &std::path::Path) -> bool {
-        self.user.values().chain(self.defaults.values()).any(|assignment| assignment.video_path == path)
-            || self.fallback.as_ref().is_some_and(|assignment| assignment.video_path == path)
+        self.user
+            .values()
+            .chain(self.defaults.values())
+            .any(|assignment| assignment.video_path == path)
+            || self
+                .fallback
+                .as_ref()
+                .is_some_and(|assignment| assignment.video_path == path)
     }
 
     /// The wallpaper this monitor should show, and where that decision came from.
