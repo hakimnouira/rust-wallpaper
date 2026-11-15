@@ -213,8 +213,8 @@ mod tests {
 
     #[test]
     fn bounded_frame_reader_accepts_one_line() {
-        let mut input = Cursor::new(b"{\\"ok\\":true}\\nnext".to_vec());
-        assert_eq!(read_frame(&mut input).unwrap(), br#"{ "ok": true }"#.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect::<Vec<_>>());
+        let mut input = Cursor::new(b"{\\\"ok\\\":true}\\nnext".to_vec());
+        assert_eq!(read_frame(&mut input).unwrap(), br#"{"ok":true}"#);
     }
 
     #[test]
