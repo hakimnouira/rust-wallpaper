@@ -453,9 +453,13 @@ impl wallpaper_core::monitors::WallpaperHost for WallpaperManager {
                 if b.consecutive_failures == 0 {
                     None
                 } else if b.consecutive_failures > b.max_failures {
-                    Some(RecoveryState::Exhausted { attempts: b.consecutive_failures })
+                    Some(RecoveryState::Exhausted {
+                        attempts: b.consecutive_failures,
+                    })
                 } else {
-                    Some(RecoveryState::InProgress { attempt: b.consecutive_failures })
+                    Some(RecoveryState::InProgress {
+                        attempt: b.consecutive_failures,
+                    })
                 }
             });
             reports.push(PlayerReport {
