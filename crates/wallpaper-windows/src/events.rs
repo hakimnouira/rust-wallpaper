@@ -357,6 +357,105 @@ mod platform {
         }
     }
 
+    impl ListenerState {
+        fn publish_registration_report(&self) {
+            *self
+                .registration_report
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                self.registration.report().clone();
+        }
+
+        fn registration_failed(
+            &mut self,
+            source: EventSource,
+            error: String,
+            now: Instant,
+        ) {
+            match self.registration.record_failure(source, error.clone(), now) {
+                RetryDecision::RetryAfter(delay) => {
+                    warn!(
+                        source = source.as_str(),
+                        ?delay,
+                        error = %error,
+                        "Event-source registration failed; retry scheduled"
+                    );
+                }
+                RetryDecision::GiveUp => {
+                    error!(
+                        source = source.as_str(),
+                        error = %error,
+                        "Event-source registration retry budget exhausted"
+                    );
+                }
+            }
+            self.publish_registration_report();
+        }
+    }
+
+    unsafe fn attempt_registration(
+        hwnd: HWND,
+        state: &mut ListenerState,
+        source: EventSource,
+        now: Instant,
+    ) {
+        let result: Result<(), String> = match source {
+            EventSource::SessionNotifications => {
+                match WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) {
+                    Ok(()) => {
+                        state.wts_registered = true;
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            EventSource::DisplayPower => {
+                match RegisterPowerSettingNotification(
+                    HANDLE(hwnd.0),
+                    &GUID_CONSOLE_DISPLAY_STATE,
+                    REGISTER_NOTIFICATION_FLAGS(0),
+                ) {
+                    Ok(handle) => {
+                        state.power_notify_handle = Some(handle);
+                        Ok(())
+                    }
+                    Err(e) => Err(e.to_string()),
+                }
+            }
+            EventSource::ExplorerRestart => {
+                let message = RegisterWindowMessageW(w!("TaskbarCreated"));
+                if message == 0 {
+                    Err(windows::core::Error::from_win32().to_string())
+                } else {
+                    state.taskbar_created_msg = message;
+                    Ok(())
+                }
+            }
+            // These sources are provided by the live top-level notification window itself.
+            EventSource::SuspendResume | EventSource::DisplayTopology => Ok(()),
+        };
+
+        match result {
+            Ok(()) => {
+                state.registration.mark_active(source);
+                state.publish_registration_report();
+                info!(source = source.as_str(), "Event source registered");
+            }
+            Err(error) => state.registration_failed(source, error, now),
+        }
+    }
+
+    unsafe fn retry_due_registrations(hwnd: HWND, state: &mut ListenerState) {
+        let now = Instant::now();
+        for source in state.registration.due(now) {
+            attempt_registration(hwnd, state, source, now);
+        }
+        if !state.registration.has_pending_retries() {
+            let _ = KillTimer(hwnd, REGISTRATION_TIMER_ID);
+        }
+        state.publish_registration_report();
+    }
+
     unsafe extern "system" fn notify_wndproc(
         hwnd: HWND,
         msg: u32,
