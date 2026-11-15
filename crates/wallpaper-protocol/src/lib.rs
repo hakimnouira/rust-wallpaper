@@ -232,6 +232,7 @@ mod tests {
     #[test]
     fn bounded_frame_reader_accepts_one_line() {
         let mut input = Cursor::new(br#"{"ok":true}"#.to_vec());
+        input.get_mut().extend_from_slice(b"\\nnext");
         assert_eq!(read_frame(&mut input).unwrap(), br#"{"ok":true}"#.to_vec());
     }
 
