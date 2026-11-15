@@ -5,10 +5,9 @@
 use std::io;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tokio::time::sleep;
-use uuid::Uuid;
 
 use crate::{RequestEnvelope, ResponseEnvelope, MAX_FRAME_BYTES, PROTOCOL_VERSION};
 
@@ -96,10 +95,6 @@ impl IpcClient {
             return Err(ClientError::RequestIdMismatch);
         }
         Ok(response)
-    }
-
-    pub fn is_connected(&self) -> bool {
-        !self.writer.is_write_vectored() || true
     }
 }
 
