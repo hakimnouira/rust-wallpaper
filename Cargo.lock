@@ -2586,6 +2586,7 @@ dependencies = [
  "wallpaper-core",
  "wallpaper-daemon",
  "wallpaper-protocol",
+ "wallpaper-windows",
 ]
 
 [[package]]

@@ -14,3 +14,4 @@ wallpaper-daemon = { path = "../wallpaper-daemon" }
 
 [target.'cfg(windows)'.dependencies]
 rfd.workspace = true
+wallpaper-windows = { path = "../../crates/wallpaper-windows" }

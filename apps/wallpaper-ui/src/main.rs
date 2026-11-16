@@ -185,6 +185,7 @@ mod desktop {
         online_is_searching: bool,
         online_search_cache: HashMap<(String, String), Vec<wallpaper_core::OnlineWallpaper>>,
         pending_apply_source: Option<String>,
+        autostart_enabled: bool,
     }
 
     impl DesktopApp {
@@ -311,6 +312,10 @@ mod desktop {
                 online_is_searching: false,
                 online_search_cache: HashMap::new(),
                 pending_apply_source: None,
+                #[cfg(windows)]
+                autostart_enabled: wallpaper_windows::is_autostart_enabled(),
+                #[cfg(not(windows))]
+                autostart_enabled: false,
             }
         }
 
@@ -1910,6 +1915,43 @@ mod desktop {
                     "Performance settings applied…",
                 );
             }
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.label("Windows Startup");
+            ui.add_space(4.0);
+
+            let mut autostart = self.autostart_enabled;
+            if ui
+                .checkbox(
+                    &mut autostart,
+                    "Start Rust Wallpaper automatically on Windows startup",
+                )
+                .changed()
+            {
+                self.autostart_enabled = autostart;
+                #[cfg(windows)]
+                {
+                    match wallpaper_windows::set_autostart(autostart) {
+                        Ok(()) => {
+                            self.notice = if autostart {
+                                "Startup enabled: Rust Wallpaper will start automatically on Windows boot".into()
+                            } else {
+                                "Startup disabled: Removed from Windows startup".into()
+                            };
+                        }
+                        Err(e) => {
+                            self.notice = format!("Failed to update Windows startup: {e}");
+                        }
+                    }
+                }
+            }
+            if self.autostart_enabled {
+                ui.small("✔ Active: Live wallpapers start seamlessly in the background when you log into Windows.");
+            } else {
+                ui.small("Disabled: Launch manually whenever you want live wallpapers.");
+            }
+
             ui.separator();
             ui.label("Current implementation");
             ui.label(
@@ -1917,8 +1959,8 @@ mod desktop {
             );
             ui.label("This UI communicates only through the versioned named-pipe protocol.");
             ui.separator();
-            ui.label("Not yet available");
-            ui.label("WebView2 wallpapers, interactive scenes, startup settings and updater are future milestones.");
+            ui.label("Future Roadmap");
+            ui.label("WebView2 interactive HTML/web wallpapers, audio visualizer scenes, and automatic updater.");
         }
     }
 
