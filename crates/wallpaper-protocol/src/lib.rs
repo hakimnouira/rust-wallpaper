@@ -8,7 +8,7 @@ pub mod client;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use uuid::Uuid;
-use wallpaper_core::{PerformanceProfile, PlaybackState, Wallpaper, WallpaperId};
+use wallpaper_core::{PerformanceProfile, PlaybackState, VideoQuality, Wallpaper, WallpaperId};
 
 /// Increment when an incompatible wire-contract change is made.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -90,6 +90,12 @@ pub enum Command {
     GetStatus {
         monitor: Option<String>,
     },
+    SetPerformanceSettings {
+        target_fps: Option<u32>,
+        ram_budget_mb: Option<u32>,
+        quality: VideoQuality,
+    },
+    GetPerformanceSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +170,11 @@ pub enum Response {
     },
     PlayerStatus(Vec<PlayerStatusInfo>),
     Profile(PerformanceProfile),
+    PerformanceSettings {
+        target_fps: Option<u32>,
+        ram_budget_mb: Option<u32>,
+        quality: VideoQuality,
+    },
     Accepted,
     Error {
         code: ErrorCode,

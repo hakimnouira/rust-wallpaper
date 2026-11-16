@@ -90,6 +90,35 @@ impl HardwareAcceleration {
     }
 }
 
+/// Video scaling and post-processing quality profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoQuality {
+    Fast,
+    #[default]
+    Balanced,
+    High,
+}
+
+impl VideoQuality {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fast" | "eco" | "bilinear" => Some(Self::Fast),
+            "balanced" | "spline36" => Some(Self::Balanced),
+            "high" | "lanczos" | "ewa_lanczos" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::High => "high",
+        }
+    }
+}
+
 /// Playback configuration settings for a wallpaper instance.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaybackConfig {
@@ -97,6 +126,12 @@ pub struct PlaybackConfig {
     pub mute: bool,
     pub volume: u32,
     pub hardware_acceleration: HardwareAcceleration,
+    #[serde(default)]
+    pub target_fps: Option<u32>,
+    #[serde(default)]
+    pub ram_budget_mb: Option<u32>,
+    #[serde(default)]
+    pub quality: VideoQuality,
 }
 
 impl Default for PlaybackConfig {
@@ -106,6 +141,9 @@ impl Default for PlaybackConfig {
             mute: true,
             volume: 100,
             hardware_acceleration: HardwareAcceleration::Auto,
+            target_fps: None,
+            ram_budget_mb: None,
+            quality: VideoQuality::Balanced,
         }
     }
 }

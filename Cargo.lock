@@ -2584,6 +2584,7 @@ dependencies = [
  "rfd",
  "tokio",
  "wallpaper-core",
+ "wallpaper-daemon",
  "wallpaper-protocol",
 ]
 

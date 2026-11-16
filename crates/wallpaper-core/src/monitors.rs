@@ -260,6 +260,7 @@ impl AssignmentStore for SqliteAssignmentStore {
                         mute: row.get::<_, i64>(3)? != 0,
                         volume: row.get::<_, i64>(4)?.max(0) as u32,
                         hardware_acceleration: hw_from_str(&hw),
+                        ..Default::default()
                     },
                 },
             ))

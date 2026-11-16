@@ -79,7 +79,8 @@ pub fn search_wallhaven(
 
     let agent = ureq::builder()
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent("RustWallpaperEngine/0.1.0")
+        .redirects(5)
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .build();
 
     let response = agent
@@ -121,59 +122,48 @@ pub fn search_wallhaven(
 pub fn get_curated_video_wallpapers() -> Vec<OnlineWallpaper> {
     vec![
         OnlineWallpaper {
-            id: "vid-cyberpunk-city".to_string(),
-            title: "Cyberpunk Futuristic City Loop".to_string(),
-            thumbnail_url: "https://images.pexels.com/videos/3129671/free-video-3129671.jpg?auto=compress&cs=tinysrgb&dpr=1&w=500".to_string(),
-            download_url: "https://assets.mixkit.co/videos/preview/mixkit-futuristic-city-with-flying-cars-and-tall-buildings-41551-large.mp4".to_string(),
-            resolution: "1920x1080".to_string(),
-            category: "Cyberpunk".to_string(),
+            id: "vid-big-buck-bunny".to_string(),
+            title: "Big Buck Bunny Open Film".to_string(),
+            thumbnail_url: "https://archive.org/services/img/BigBuckBunny_124".to_string(),
+            download_url: "https://archive.org/download/BigBuckBunny_124/Content/big_buck_bunny_720p_surround.mp4".to_string(),
+            resolution: "1280x720".to_string(),
+            category: "Animation".to_string(),
             is_video: true,
-            source_platform: "Mixkit Free".to_string(),
-            file_size_bytes: Some(15_400_000),
+            source_platform: "Blender Open Movie".to_string(),
+            file_size_bytes: Some(61_878_609),
         },
         OnlineWallpaper {
-            id: "vid-neon-highway".to_string(),
-            title: "Neon Retro Wave Highway".to_string(),
-            thumbnail_url: "https://images.pexels.com/videos/3129957/free-video-3129957.jpg?auto=compress&cs=tinysrgb&dpr=1&w=500".to_string(),
-            download_url: "https://assets.mixkit.co/videos/preview/mixkit-driving-on-a-highway-with-neon-lights-at-night-41550-large.mp4".to_string(),
-            resolution: "1920x1080".to_string(),
-            category: "Retro".to_string(),
+            id: "vid-elephants-dream".to_string(),
+            title: "Elephants Dream Sci-Fi Loop".to_string(),
+            thumbnail_url: "https://archive.org/services/img/ElephantsDream".to_string(),
+            download_url: "https://archive.org/download/ElephantsDream/ed_1024_512kb.mp4".to_string(),
+            resolution: "1024x576".to_string(),
+            category: "Sci-Fi".to_string(),
             is_video: true,
-            source_platform: "Mixkit Free".to_string(),
-            file_size_bytes: Some(12_200_000),
+            source_platform: "Blender Open Movie".to_string(),
+            file_size_bytes: Some(47_065_346),
         },
         OnlineWallpaper {
-            id: "vid-aurora-borealis".to_string(),
-            title: "Aurora Borealis Northern Lights".to_string(),
-            thumbnail_url: "https://images.pexels.com/videos/3141207/free-video-3141207.jpg?auto=compress&cs=tinysrgb&dpr=1&w=500".to_string(),
-            download_url: "https://assets.mixkit.co/videos/preview/mixkit-northern-lights-in-a-night-sky-41553-large.mp4".to_string(),
+            id: "vid-city-traffic".to_string(),
+            title: "City Street Bicycle & Traffic Detection".to_string(),
+            thumbnail_url: "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/person-bicycle-car-detection.mp4".to_string(),
+            download_url: "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/person-bicycle-car-detection.mp4".to_string(),
             resolution: "1920x1080".to_string(),
-            category: "Nature".to_string(),
+            category: "Urban".to_string(),
             is_video: true,
-            source_platform: "Mixkit Free".to_string(),
-            file_size_bytes: Some(18_700_000),
+            source_platform: "Open Video".to_string(),
+            file_size_bytes: Some(6_031_199),
         },
         OnlineWallpaper {
-            id: "vid-space-nebula".to_string(),
-            title: "Deep Space Stars & Nebula".to_string(),
-            thumbnail_url: "https://images.pexels.com/videos/3129672/free-video-3129672.jpg?auto=compress&cs=tinysrgb&dpr=1&w=500".to_string(),
-            download_url: "https://assets.mixkit.co/videos/preview/mixkit-space-travel-through-stars-and-a-nebula-41552-large.mp4".to_string(),
+            id: "vid-highway-drive".to_string(),
+            title: "Highway Motion Dashcam Loop".to_string(),
+            thumbnail_url: "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/driver-action-recognition.mp4".to_string(),
+            download_url: "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/driver-action-recognition.mp4".to_string(),
             resolution: "1920x1080".to_string(),
-            category: "Space".to_string(),
+            category: "Motion".to_string(),
             is_video: true,
-            source_platform: "Mixkit Free".to_string(),
-            file_size_bytes: Some(14_500_000),
-        },
-        OnlineWallpaper {
-            id: "vid-ocean-waves".to_string(),
-            title: "Gentle Ocean Waves Sunset".to_string(),
-            thumbnail_url: "https://images.pexels.com/videos/1536322/free-video-1536322.jpg?auto=compress&cs=tinysrgb&dpr=1&w=500".to_string(),
-            download_url: "https://assets.mixkit.co/videos/preview/mixkit-waves-coming-to-the-beach-5016-large.mp4".to_string(),
-            resolution: "1920x1080".to_string(),
-            category: "Nature".to_string(),
-            is_video: true,
-            source_platform: "Mixkit Free".to_string(),
-            file_size_bytes: Some(11_900_000),
+            source_platform: "Open Video".to_string(),
+            file_size_bytes: Some(53_804_027),
         },
     ]
 }
@@ -186,7 +176,8 @@ pub fn download_online_file(url: &str, destination: &Path) -> Result<u64, Online
 
     let agent = ureq::builder()
         .timeout(std::time::Duration::from_secs(60))
-        .user_agent("RustWallpaperEngine/0.1.0")
+        .redirects(5)
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .build();
 
     let response = agent
@@ -205,7 +196,8 @@ pub fn download_online_file(url: &str, destination: &Path) -> Result<u64, Online
 pub fn fetch_thumbnail_bytes(url: &str) -> Result<Vec<u8>, OnlineError> {
     let agent = ureq::builder()
         .timeout(std::time::Duration::from_secs(10))
-        .user_agent("RustWallpaperEngine/0.1.0")
+        .redirects(5)
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .build();
 
     let response = agent

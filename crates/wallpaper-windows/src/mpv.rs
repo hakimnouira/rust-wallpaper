@@ -477,6 +477,38 @@ impl MpvPlayer {
             cmd_args.push("--mute=yes".to_string());
         }
 
+        // Framerate limit (Wallpaper Engine style)
+        if let Some(target_fps) = launch_cfg.config.target_fps {
+            if target_fps > 0 {
+                cmd_args.push(format!("--vf=fps=fps={target_fps}"));
+            }
+        }
+
+        // Memory budget / RAM limit (Wallpaper Engine style)
+        if let Some(ram_mb) = launch_cfg.config.ram_budget_mb {
+            if ram_mb > 0 {
+                cmd_args.push(format!("--demuxer-max-bytes={ram_mb}M"));
+                cmd_args.push(format!("--demuxer-max-back-bytes={}M", (ram_mb / 2).max(4)));
+            }
+        }
+
+        // Scaling quality preset
+        match launch_cfg.config.quality {
+            wallpaper_core::VideoQuality::Fast => {
+                cmd_args.push("--scale=bilinear".to_string());
+                cmd_args.push("--cscale=bilinear".to_string());
+                cmd_args.push("--dscale=bilinear".to_string());
+            }
+            wallpaper_core::VideoQuality::Balanced => {
+                cmd_args.push("--scale=spline36".to_string());
+                cmd_args.push("--cscale=spline36".to_string());
+            }
+            wallpaper_core::VideoQuality::High => {
+                cmd_args.push("--scale=ewa_lanczos".to_string());
+                cmd_args.push("--cscale=ewa_lanczos".to_string());
+            }
+        }
+
         cmd_args.push("--".to_string());
         cmd_args.push(format!("\"{}\"", launch_cfg.video_path.display()));
 

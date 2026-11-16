@@ -543,6 +543,7 @@ impl WallpaperLibrary {
                 mute: mute != 0,
                 volume,
                 hardware_acceleration: hwdec,
+                ..Default::default()
             },
         })
     }

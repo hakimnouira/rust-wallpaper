@@ -26,6 +26,9 @@ mod desktop {
         wallpapers: Vec<Wallpaper>,
         players: Vec<PlayerStatusInfo>,
         profile: PerformanceProfile,
+        target_fps: Option<u32>,
+        ram_budget_mb: Option<u32>,
+        quality: wallpaper_core::VideoQuality,
         last_updated: Option<Instant>,
     }
 
@@ -1116,12 +1119,12 @@ mod desktop {
                 for chunk in filtered.chunks(cols) {
                     ui.horizontal(|ui| {
                         for item in chunk {
-                            ui.vertical(|ui| {
-                                ui.set_width(card_width);
+                            ui.allocate_ui(egui::vec2(card_width, 224.0), |ui| {
                                 egui::Frame::group(ui.style())
                                     .inner_margin(8.0)
                                     .show(ui, |ui| {
                                         ui.set_width(card_width - 16.0);
+                                        ui.set_height(208.0);
 
                                         // Preview thumbnail
                                         let thumb_size = egui::vec2(card_width - 16.0, 110.0);
@@ -1141,13 +1144,15 @@ mod desktop {
                                         }
 
                                         ui.add_space(4.0);
-                                        ui.add(
+                                        let title_resp = ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(&item.title).strong(),
                                             )
                                             .truncate(),
                                         );
+                                        title_resp.on_hover_text(&item.title);
 
+                                        ui.add_space(2.0);
                                         ui.horizontal(|ui| {
                                             if item.is_compatible_video {
                                                 ui.colored_label(
@@ -1326,19 +1331,20 @@ mod desktop {
                 for chunk in items.chunks(cols) {
                     ui.horizontal(|ui| {
                         for item in chunk {
-                            ui.vertical(|ui| {
-                                ui.set_width(card_width);
+                            ui.allocate_ui(egui::vec2(card_width, 175.0), |ui| {
                                 egui::Frame::group(ui.style())
                                     .inner_margin(8.0)
                                     .show(ui, |ui| {
                                         ui.set_width(card_width - 16.0);
+                                        ui.set_height(159.0);
 
-                                        ui.add(
+                                        let title_resp = ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(&item.title).strong(),
                                             )
                                             .truncate(),
                                         );
+                                        title_resp.on_hover_text(&item.title);
 
                                         ui.horizontal(|ui| {
                                             ui.colored_label(
@@ -1715,12 +1721,12 @@ mod desktop {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
             ui.separator();
-            ui.label("Performance profile");
+            ui.label("Performance profile (Fullscreen & Power Saving)");
             ui.horizontal(|ui| {
                 for (profile, label) in [
-                    (PerformanceProfile::Eco, "Eco"),
-                    (PerformanceProfile::Balanced, "Balanced"),
-                    (PerformanceProfile::Performance, "Performance"),
+                    (PerformanceProfile::Eco, "Eco (Aggressive)"),
+                    (PerformanceProfile::Balanced, "Balanced (Recommended)"),
+                    (PerformanceProfile::Performance, "Performance (High Uptime)"),
                 ] {
                     if ui
                         .selectable_label(snapshot.profile == profile, label)
@@ -1733,6 +1739,177 @@ mod desktop {
                     }
                 }
             });
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.label("Wallpaper Engine Performance & Quality");
+            ui.add_space(4.0);
+
+            let mut settings_changed = false;
+            let mut target_fps = snapshot.target_fps;
+            let mut ram_budget = snapshot.ram_budget_mb;
+            let mut quality = snapshot.quality;
+
+            ui.horizontal(|ui| {
+                ui.label("Framerate Limit (FPS):");
+                let current_fps_text = match target_fps {
+                    Some(15) => "15 FPS (Battery Saver)",
+                    Some(24) => "24 FPS (Cinematic)",
+                    Some(30) => "30 FPS (Balanced)",
+                    Some(45) => "45 FPS (Smooth)",
+                    Some(60) => "60 FPS (Ultra Smooth)",
+                    None | Some(0) => "Uncapped (Native)",
+                    Some(_) => "Custom",
+                };
+                egui::ComboBox::from_id_salt("fps_combo")
+                    .selected_text(current_fps_text)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_value(&mut target_fps, None, "Uncapped (Native)")
+                            .clicked()
+                        {
+                            settings_changed = true;
+                        }
+                        if ui
+                            .selectable_value(&mut target_fps, Some(15), "15 FPS (Battery Saver)")
+                            .clicked()
+                        {
+                            settings_changed = true;
+                        }
+                        if ui
+                            .selectable_value(&mut target_fps, Some(24), "24 FPS (Cinematic)")
+                            .clicked()
+                        {
+                            settings_changed = true;
+                        }
+                        if ui
+                            .selectable_value(&mut target_fps, Some(30), "30 FPS (Balanced)")
+                            .clicked()
+                        {
+                            settings_changed = true;
+                        }
+                        if ui
+                            .selectable_value(&mut target_fps, Some(60), "60 FPS (Ultra Smooth)")
+                            .clicked()
+                        {
+                            settings_changed = true;
+                        }
+                    });
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("RAM Cache / Demuxer Limit:");
+                let current_ram_text = match ram_budget {
+                    Some(32) => "32 MB (Minimal / Low RAM)",
+                    Some(64) => "64 MB (Standard)",
+                    Some(128) => "128 MB (High Performance)",
+                    Some(256) => "256 MB (Ultra / Instant Seek)",
+                    None | Some(0) => "Default (Auto)",
+                    Some(_) => "Custom",
+                };
+                egui::ComboBox::from_id_salt("ram_combo")
+                    .selected_text(current_ram_text)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_value(&mut ram_budget, None, "Default (Auto)")
+                            .clicked()
+                        {
+                            settings_changed = true;
+                        }
+                        if ui
+                            .selectable_value(
+                                &mut ram_budget,
+                                Some(32),
+                                "32 MB (Minimal / Low RAM)",
+                            )
+                            .clicked()
+                        {
+                            settings_changed = true;
+                        }
+                        if ui
+                            .selectable_value(&mut ram_budget, Some(64), "64 MB (Standard)")
+                            .clicked()
+                        {
+                            settings_changed = true;
+                        }
+                        if ui
+                            .selectable_value(
+                                &mut ram_budget,
+                                Some(128),
+                                "128 MB (High Performance)",
+                            )
+                            .clicked()
+                        {
+                            settings_changed = true;
+                        }
+                        if ui
+                            .selectable_value(
+                                &mut ram_budget,
+                                Some(256),
+                                "256 MB (Ultra / Instant Seek)",
+                            )
+                            .clicked()
+                        {
+                            settings_changed = true;
+                        }
+                    });
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label("Video Scaling Filter:");
+                let current_q_text = match quality {
+                    wallpaper_core::VideoQuality::Fast => "Fast (Bilinear - Low CPU)",
+                    wallpaper_core::VideoQuality::Balanced => "Balanced (Spline36 - Sharp)",
+                    wallpaper_core::VideoQuality::High => "High Quality (EWA Lanczos)",
+                };
+                egui::ComboBox::from_id_salt("quality_combo")
+                    .selected_text(current_q_text)
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_value(
+                                &mut quality,
+                                wallpaper_core::VideoQuality::Fast,
+                                "Fast (Bilinear - Low CPU)",
+                            )
+                            .clicked()
+                        {
+                            settings_changed = true;
+                        }
+                        if ui
+                            .selectable_value(
+                                &mut quality,
+                                wallpaper_core::VideoQuality::Balanced,
+                                "Balanced (Spline36 - Sharp)",
+                            )
+                            .clicked()
+                        {
+                            settings_changed = true;
+                        }
+                        if ui
+                            .selectable_value(
+                                &mut quality,
+                                wallpaper_core::VideoQuality::High,
+                                "High Quality (EWA Lanczos)",
+                            )
+                            .clicked()
+                        {
+                            settings_changed = true;
+                        }
+                    });
+            });
+
+            if settings_changed {
+                self.send(
+                    Command::SetPerformanceSettings {
+                        target_fps,
+                        ram_budget_mb: ram_budget,
+                        quality,
+                    },
+                    "Performance settings applied…",
+                );
+            }
             ui.separator();
             ui.label("Current implementation");
             ui.label(
@@ -1901,6 +2078,36 @@ mod desktop {
         }
     }
 
+    fn ensure_daemon_started() {
+        #[cfg(windows)]
+        {
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(parent) = exe.parent() {
+                    let daemon_exe = parent.join("wallpaper-daemon.exe");
+                    if daemon_exe.is_file() {
+                        use std::os::windows::process::CommandExt;
+                        const CREATE_NO_WINDOW: u32 = 0x08000000;
+                        const DETACHED_PROCESS: u32 = 0x00000008;
+                        if std::process::Command::new(&daemon_exe)
+                            .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+                            .spawn()
+                            .is_ok()
+                        {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: spawn the embedded daemon in background thread
+        std::thread::Builder::new()
+            .name("embedded-daemon".into())
+            .spawn(|| {
+                let _ = wallpaper_daemon::run_daemon();
+            })
+            .ok();
+    }
+
     fn spawn_worker(snapshot: Arc<Mutex<Snapshot>>) -> mpsc::Sender<Command> {
         let (tx, rx) = mpsc::channel::<Command>();
         std::thread::Builder::new()
@@ -1918,6 +2125,7 @@ mod desktop {
                 runtime.block_on(async move {
                     let mut client: Option<IpcClient> = None;
                     let mut next_refresh = Instant::now();
+                    let mut attempted_autostart = false;
                     loop {
                         if client.is_none() {
                             match IpcClient::connect().await {
@@ -1930,6 +2138,12 @@ mod desktop {
                                     next_refresh = Instant::now();
                                 }
                                 Err(error) => {
+                                    if !attempted_autostart {
+                                        attempted_autostart = true;
+                                        ensure_daemon_started();
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                        continue;
+                                    }
                                     if let Ok(mut state) = snapshot.lock() {
                                         state.connected = false;
                                         state.last_error = Some(error.to_string());
@@ -1964,6 +2178,7 @@ mod desktop {
                                     Command::ListWallpapers,
                                     Command::GetStatus { monitor: None },
                                     Command::GetProfile,
+                                    Command::GetPerformanceSettings,
                                 ] {
                                     match send(connection, command).await {
                                         Ok(Response::MonitorList(items)) => {
@@ -1984,6 +2199,17 @@ mod desktop {
                                         Ok(Response::Profile(profile)) => {
                                             if let Ok(mut state) = snapshot.lock() {
                                                 state.profile = profile;
+                                            }
+                                        }
+                                        Ok(Response::PerformanceSettings {
+                                            target_fps,
+                                            ram_budget_mb,
+                                            quality,
+                                        }) => {
+                                            if let Ok(mut state) = snapshot.lock() {
+                                                state.target_fps = target_fps;
+                                                state.ram_budget_mb = ram_budget_mb;
+                                                state.quality = quality;
                                             }
                                         }
                                         Ok(Response::Error { message, .. }) => {
@@ -2024,11 +2250,10 @@ mod desktop {
     fn configure_fonts(ctx: &egui::Context) {
         let mut fonts = egui::FontDefinitions::default();
         let font_candidates = [
-            ("msyh", "C:\\Windows\\Fonts\\msyh.ttc"),
-            ("msyh_ttf", "C:\\Windows\\Fonts\\msyh.ttf"),
-            ("simsun", "C:\\Windows\\Fonts\\simsun.ttc"),
             ("malgun", "C:\\Windows\\Fonts\\malgun.ttf"),
             ("segoeui", "C:\\Windows\\Fonts\\segoeui.ttf"),
+            ("seguisym", "C:\\Windows\\Fonts\\seguisym.ttf"),
+            ("seguiemj", "C:\\Windows\\Fonts\\seguiemj.ttf"),
         ];
 
         for (name, path) in font_candidates {
@@ -2046,7 +2271,6 @@ mod desktop {
                     .entry(egui::FontFamily::Monospace)
                     .or_default()
                     .push(name.to_string());
-                break;
             }
         }
 
@@ -2075,6 +2299,16 @@ mod desktop {
 
 #[cfg(windows)]
 fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args
+        .iter()
+        .any(|a| a == "--daemon" || a == "--headless" || a == "-d")
+    {
+        if let Err(e) = wallpaper_daemon::run_daemon() {
+            eprintln!("Daemon error: {e}");
+        }
+        return Ok(());
+    }
     desktop::run()
 }
 

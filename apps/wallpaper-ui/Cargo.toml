@@ -10,6 +10,7 @@ image.workspace = true
 tokio.workspace = true
 wallpaper-core = { path = "../../crates/wallpaper-core" }
 wallpaper-protocol = { path = "../../crates/wallpaper-protocol" }
+wallpaper-daemon = { path = "../wallpaper-daemon" }
 
 [target.'cfg(windows)'.dependencies]
 rfd.workspace = true
