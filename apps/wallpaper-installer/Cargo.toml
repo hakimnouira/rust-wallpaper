@@ -1,0 +1,21 @@
+[package]
+name = "wallpaper-installer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "RustWallpaper-Setup"
+
+[[bin]]
+name = "RustWallpaper-Setup"
+path = "src/main.rs"
+
+[[bin]]
+name = "uninstall"
+path = "src/uninstall.rs"
+
+[dependencies]
+eframe.workspace = true
+image.workspace = true
+rfd.workspace = true
+wallpaper-windows = { path = "../../crates/wallpaper-windows" }
+windows.workspace = true

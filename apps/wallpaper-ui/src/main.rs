@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 //! Native desktop control panel for Rust Wallpaper.
 //!
 //! The UI is deliberately a protocol client: it never creates wallpaper windows,
@@ -2305,12 +2307,13 @@ mod desktop {
         #[cfg(windows)]
         {
             if let Ok(exe) = std::env::current_exe() {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                const DETACHED_PROCESS: u32 = 0x00000008;
+
                 if let Some(parent) = exe.parent() {
                     let daemon_exe = parent.join("wallpaper-daemon.exe");
                     if daemon_exe.is_file() {
-                        use std::os::windows::process::CommandExt;
-                        const CREATE_NO_WINDOW: u32 = 0x08000000;
-                        const DETACHED_PROCESS: u32 = 0x00000008;
                         if std::process::Command::new(&daemon_exe)
                             .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
                             .spawn()
@@ -2319,6 +2322,16 @@ mod desktop {
                             return;
                         }
                     }
+                }
+
+                // Single-exe mode: spawn current exe with --daemon detached
+                if std::process::Command::new(&exe)
+                    .arg("--daemon")
+                    .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+                    .spawn()
+                    .is_ok()
+                {
+                    return;
                 }
             }
         }
@@ -2503,10 +2516,30 @@ mod desktop {
     pub fn run() -> eframe::Result<()> {
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let commands = spawn_worker(snapshot.clone());
+
+        let icon_data = image::load_from_memory(include_bytes!("../../../assets/icon.png"))
+            .ok()
+            .map(|img| {
+                let rgba = img.to_rgba8();
+                let (width, height) = rgba.dimensions();
+                egui::IconData {
+                    rgba: rgba.into_raw(),
+                    width,
+                    height,
+                }
+            });
+
+        let mut viewport = egui::ViewportBuilder::default()
+            .with_inner_size([1180.0, 760.0])
+            .with_min_inner_size([860.0, 560.0])
+            .with_title("Rust Wallpaper");
+
+        if let Some(icon) = icon_data {
+            viewport = viewport.with_icon(icon);
+        }
+
         let options = eframe::NativeOptions {
-            viewport: egui::ViewportBuilder::default()
-                .with_inner_size([1180.0, 760.0])
-                .with_min_inner_size([860.0, 560.0]),
+            viewport,
             ..Default::default()
         };
         eframe::run_native(
@@ -2530,6 +2563,22 @@ fn main() -> eframe::Result<()> {
         if let Err(e) = wallpaper_daemon::run_daemon() {
             eprintln!("Daemon error: {e}");
         }
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--version" || a == "-v") {
+        println!("Rust Wallpaper v0.1.0 (production release)");
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("Rust Wallpaper - Next-Generation Live Video Wallpaper Engine");
+        println!();
+        println!("Usage: RustWallpaper.exe [OPTIONS]");
+        println!();
+        println!("Options:");
+        println!("  (no args)      Launch the interactive UI control panel");
+        println!("  --daemon, -d   Run wallpaper engine daemon in background/headless mode");
+        println!("  --version, -v  Print version information");
+        println!("  --help, -h     Print this help message");
         return Ok(());
     }
     desktop::run()

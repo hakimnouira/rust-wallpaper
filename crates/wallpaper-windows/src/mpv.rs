@@ -50,13 +50,35 @@ pub enum MpvError {
 
 /// Discovers the path to `mpv.exe` on Windows.
 pub fn find_mpv_executable() -> Result<PathBuf, MpvError> {
-    // 1. Check local bin/mpv
-    let local_path = PathBuf::from("bin").join("mpv").join("mpv.exe");
-    if local_path.is_file() {
-        return Ok(local_path);
+    // 1. Check relative to current running executable
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            let candidates = [
+                exe_dir.join("mpv.exe"),
+                exe_dir.join("bin").join("mpv.exe"),
+                exe_dir.join("bin").join("mpv").join("mpv.exe"),
+            ];
+            for candidate in candidates {
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+        }
     }
 
-    // 2. Check user profile .mpv
+    // 2. Check local working directory bin/mpv
+    let local_paths = [
+        PathBuf::from("bin").join("mpv").join("mpv.exe"),
+        PathBuf::from("bin").join("mpv.exe"),
+        PathBuf::from("mpv.exe"),
+    ];
+    for local_path in local_paths {
+        if local_path.is_file() {
+            return Ok(local_path);
+        }
+    }
+
+    // 3. Check user profile .mpv
     if let Ok(user_profile) = std::env::var("USERPROFILE") {
         let profile_path = PathBuf::from(user_profile).join(".mpv").join("mpv.exe");
         if profile_path.is_file() {
@@ -64,7 +86,7 @@ pub fn find_mpv_executable() -> Result<PathBuf, MpvError> {
         }
     }
 
-    // 3. Check system PATH
+    // 4. Check system PATH
     if let Ok(paths) = std::env::var("PATH") {
         for dir in std::env::split_paths(&paths) {
             let candidate = dir.join("mpv.exe");

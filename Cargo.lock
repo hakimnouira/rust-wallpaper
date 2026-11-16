@@ -2564,6 +2564,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "wallpaper-installer"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "image",
+ "rfd",
+ "wallpaper-windows",
+ "windows",
+]
+
+[[package]]
 name = "wallpaper-protocol"
 version = "0.1.0"
 dependencies = [

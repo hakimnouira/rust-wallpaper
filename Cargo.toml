@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "apps/wallpaper-daemon",
     "apps/wallpaper-ui",
+    "apps/wallpaper-installer",
     "apps/video-player",
     "crates/wallpaper-core",
     "crates/wallpaper-windows",
@@ -43,3 +44,10 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
