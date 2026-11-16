@@ -186,6 +186,7 @@ mod desktop {
         online_search_cache: HashMap<(String, String), Vec<wallpaper_core::OnlineWallpaper>>,
         pending_apply_source: Option<String>,
         autostart_enabled: bool,
+        steam_engine_status: Option<wallpaper_core::SteamEngineStatus>,
     }
 
     impl DesktopApp {
@@ -316,6 +317,7 @@ mod desktop {
                 autostart_enabled: wallpaper_windows::is_autostart_enabled(),
                 #[cfg(not(windows))]
                 autostart_enabled: false,
+                steam_engine_status: Some(wallpaper_core::detect_steam_and_wallpaper_engine()),
             }
         }
 
@@ -1050,6 +1052,81 @@ mod desktop {
         }
 
         fn render_steam_workshop(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+            let status = self
+                .steam_engine_status
+                .get_or_insert_with(wallpaper_core::detect_steam_and_wallpaper_engine);
+
+            if status.wallpaper_engine_installed {
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_rgb(20, 35, 48))
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(100, 200, 255),
+                                "✔ Wallpaper Engine detected on Steam",
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .button("🚀 Sync / Launch Steam")
+                                    .on_hover_text("Tells Steam to download all recently subscribed workshop items to disk.")
+                                    .clicked()
+                                {
+                                    #[cfg(windows)]
+                                    {
+                                        let _ = std::process::Command::new("rundll32")
+                                            .args(["url.dll,FileProtocolHandler", "steam://rungameid/431960"])
+                                            .spawn();
+                                    }
+                                }
+                                if ui
+                                    .button("🌐 Browse Steam Workshop")
+                                    .on_hover_text("Open Wallpaper Engine Steam Workshop in your web browser.")
+                                    .clicked()
+                                {
+                                    #[cfg(windows)]
+                                    {
+                                        let _ = std::process::Command::new("rundll32")
+                                            .args(["url.dll,FileProtocolHandler", "https://steamcommunity.com/app/431960/workshop/"])
+                                            .spawn();
+                                    }
+                                }
+                            });
+                        });
+                        ui.small(
+                            "💡 Steam only downloads subscribed items to your PC while Steam / Wallpaper Engine is running. If a new subscription is missing, launch Wallpaper Engine to download it, then click 'Refresh / Scan'.",
+                        );
+                    });
+            } else {
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_rgb(45, 30, 20))
+                    .inner_margin(8.0)
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(255, 180, 60),
+                                "⚠ Wallpaper Engine not detected on Steam",
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .button("🌐 Switch to Free Online Wallpapers")
+                                    .clicked()
+                                {
+                                    self.browse_tab = BrowseTab::OnlineWallpapers;
+                                    if self.online_items.is_empty() {
+                                        self.online_items = wallpaper_core::get_curated_video_wallpapers();
+                                    }
+                                }
+                            });
+                        });
+                        ui.small(
+                            "Steam requires you to own and launch Wallpaper Engine in Steam before it will download subscribed Workshop files to your computer. To get video wallpapers without Wallpaper Engine, browse free videos in the 'Online Wallpapers' tab.",
+                        );
+                    });
+            }
+
+            ui.add_space(4.0);
+
             ui.horizontal(|ui| {
                 ui.label("🔍 Search:");
                 ui.text_edit_singleline(&mut self.workshop_search);
@@ -1060,6 +1137,8 @@ mod desktop {
                         Vec::new()
                     };
                     self.workshop_items = wallpaper_core::scan_wallpaper_engine_items(&custom);
+                    self.steam_engine_status =
+                        Some(wallpaper_core::detect_steam_and_wallpaper_engine());
                     self.workshop_scanned = true;
                     self.notice = format!("Found {} Steam items", self.workshop_items.len());
                 }
@@ -1100,12 +1179,34 @@ mod desktop {
                 .collect();
 
             if filtered.is_empty() {
+                let we_installed = self
+                    .steam_engine_status
+                    .as_ref()
+                    .map(|s| s.wallpaper_engine_installed)
+                    .unwrap_or(false);
+
                 ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
+                    ui.add_space(30.0);
                     ui.heading("No Workshop items found");
-                    ui.label(
-                        "Subscribe to video wallpapers in Wallpaper Engine or Steam Workshop, or click 'Refresh / Scan'.",
-                    );
+                    if we_installed {
+                        ui.label(
+                            "Subscribed to a new wallpaper? Launch Wallpaper Engine via the button above so Steam downloads the files, then click 'Refresh / Scan'.",
+                        );
+                    } else {
+                        ui.label(
+                            "Wallpaper Engine is not installed on this PC. Steam Workshop only downloads files for installed games/apps.",
+                        );
+                        ui.add_space(8.0);
+                        if ui
+                            .button("🌐 Browse Free Online Wallpapers (No Steam required)")
+                            .clicked()
+                        {
+                            self.browse_tab = BrowseTab::OnlineWallpapers;
+                            if self.online_items.is_empty() {
+                                self.online_items = wallpaper_core::get_curated_video_wallpapers();
+                            }
+                        }
+                    }
                 });
                 return;
             }

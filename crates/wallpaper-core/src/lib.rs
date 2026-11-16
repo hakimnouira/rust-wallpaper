@@ -25,8 +25,9 @@ use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
 pub use workshop::{
-    find_steam_installations, find_steam_library_folders, parse_workshop_directory,
-    scan_wallpaper_engine_items, WorkshopItem, WALLPAPER_ENGINE_APP_ID,
+    detect_steam_and_wallpaper_engine, find_steam_installations, find_steam_library_folders,
+    parse_workshop_directory, scan_wallpaper_engine_items, SteamEngineStatus, WorkshopItem,
+    WALLPAPER_ENGINE_APP_ID,
 };
 
 /// Stable identifier for an imported wallpaper.

@@ -12,6 +12,63 @@ use std::path::{Path, PathBuf};
 /// App ID for Wallpaper Engine on Steam.
 pub const WALLPAPER_ENGINE_APP_ID: u32 = 431960;
 
+/// Status of Steam and Wallpaper Engine detection on the local system.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteamEngineStatus {
+    /// Whether Steam installation was found in the registry or default directories.
+    pub steam_installed: bool,
+    /// Detected path to the primary Steam installation directory.
+    pub steam_path: Option<PathBuf>,
+    /// Whether Wallpaper Engine is detected in any Steam library folder.
+    pub wallpaper_engine_installed: bool,
+    /// Path to the Wallpaper Engine installation directory if found.
+    pub wallpaper_engine_dir: Option<PathBuf>,
+    /// Path to the Steam Workshop items content folder if found.
+    pub workshop_dir: Option<PathBuf>,
+}
+
+/// Detects Steam and Wallpaper Engine installation status across local drives.
+pub fn detect_steam_and_wallpaper_engine() -> SteamEngineStatus {
+    let steam_installs = find_steam_installations();
+    let steam_installed = !steam_installs.is_empty();
+    let steam_path = steam_installs.first().cloned();
+
+    let mut we_installed = false;
+    let mut we_dir = None;
+    let mut ws_dir = None;
+
+    for steam_dir in &steam_installs {
+        for lib in find_steam_library_folders(steam_dir) {
+            let we_candidate = lib
+                .join("steamapps")
+                .join("common")
+                .join("wallpaper_engine");
+            if we_candidate.is_dir() {
+                we_installed = true;
+                if we_dir.is_none() {
+                    we_dir = Some(we_candidate);
+                }
+            }
+            let ws_candidate = lib
+                .join("steamapps")
+                .join("workshop")
+                .join("content")
+                .join(WALLPAPER_ENGINE_APP_ID.to_string());
+            if ws_candidate.is_dir() && ws_dir.is_none() {
+                ws_dir = Some(ws_candidate);
+            }
+        }
+    }
+
+    SteamEngineStatus {
+        steam_installed,
+        steam_path,
+        wallpaper_engine_installed: we_installed,
+        wallpaper_engine_dir: we_dir,
+        workshop_dir: ws_dir,
+    }
+}
+
 /// Represents a locally detected Steam Workshop or Wallpaper Engine item.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkshopItem {
