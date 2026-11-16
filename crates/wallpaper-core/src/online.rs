@@ -165,6 +165,28 @@ pub fn get_curated_video_wallpapers() -> Vec<OnlineWallpaper> {
             source_platform: "Open Video".to_string(),
             file_size_bytes: Some(53_804_027),
         },
+        OnlineWallpaper {
+            id: "vid-tears-of-steel".to_string(),
+            title: "Tears of Steel Futuristic Sci-Fi".to_string(),
+            thumbnail_url: "https://archive.org/services/img/Tears-of-Steel".to_string(),
+            download_url: "https://archive.org/download/Tears-of-Steel/tears_of_steel_720p.mp4".to_string(),
+            resolution: "1280x720".to_string(),
+            category: "Sci-Fi".to_string(),
+            is_video: true,
+            source_platform: "Blender Open Movie".to_string(),
+            file_size_bytes: Some(52_400_000),
+        },
+        OnlineWallpaper {
+            id: "vid-cosmos-laundromat".to_string(),
+            title: "Cosmos Laundromat Surreal Landscape".to_string(),
+            thumbnail_url: "https://archive.org/services/img/CosmosLaundromatFirstCycle".to_string(),
+            download_url: "https://archive.org/download/CosmosLaundromatFirstCycle/Cosmos%20Laundromat%20-%20First%20Cycle%20-%20Official%20Blender%20Foundation%20release_720p.mp4".to_string(),
+            resolution: "1280x720".to_string(),
+            category: "Fantasy".to_string(),
+            is_video: true,
+            source_platform: "Blender Open Movie".to_string(),
+            file_size_bytes: Some(78_100_000),
+        },
     ]
 }
 

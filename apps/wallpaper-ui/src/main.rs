@@ -43,8 +43,8 @@ mod desktop {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     enum BrowseTab {
         #[default]
-        SteamWorkshop,
         OnlineWallpapers,
+        LocalWorkshop,
     }
 
     enum DownloadMessage {
@@ -186,7 +186,8 @@ mod desktop {
         online_search_cache: HashMap<(String, String), Vec<wallpaper_core::OnlineWallpaper>>,
         pending_apply_source: Option<String>,
         autostart_enabled: bool,
-        steam_engine_status: Option<wallpaper_core::SteamEngineStatus>,
+        direct_url_input: String,
+        direct_url_status: Option<String>,
     }
 
     impl DesktopApp {
@@ -295,7 +296,7 @@ mod desktop {
                 thumb_req_tx,
                 thumb_res_rx,
                 frame_counter: 0,
-                browse_tab: BrowseTab::SteamWorkshop,
+                browse_tab: BrowseTab::OnlineWallpapers,
                 workshop_items: Vec::new(),
                 workshop_scanned: false,
                 workshop_filter_video_only: true,
@@ -317,7 +318,8 @@ mod desktop {
                 autostart_enabled: wallpaper_windows::is_autostart_enabled(),
                 #[cfg(not(windows))]
                 autostart_enabled: false,
-                steam_engine_status: Some(wallpaper_core::detect_steam_and_wallpaper_engine()),
+                direct_url_input: String::new(),
+                direct_url_status: None,
             }
         }
 
@@ -951,6 +953,108 @@ mod desktop {
             }
         }
 
+        fn start_direct_url_download(&mut self, auto_apply: bool) {
+            let url = self.direct_url_input.trim().to_string();
+            if url.is_empty() {
+                return;
+            }
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                self.direct_url_status =
+                    Some("Error: URL must start with http:// or https://".to_string());
+                return;
+            }
+
+            // Determine filename & extension from URL
+            let parsed_filename = url
+                .split('?')
+                .next()
+                .and_then(|u| u.split('/').last())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("web_video.mp4");
+
+            let has_ext = parsed_filename.ends_with(".mp4")
+                || parsed_filename.ends_with(".webm")
+                || parsed_filename.ends_with(".mkv")
+                || parsed_filename.ends_with(".mov");
+
+            let clean_stem = if has_ext {
+                parsed_filename
+                    .rsplit_once('.')
+                    .map(|(s, _)| s)
+                    .unwrap_or(parsed_filename)
+            } else {
+                parsed_filename
+            };
+
+            let ext = if has_ext {
+                parsed_filename
+                    .rsplit_once('.')
+                    .map(|(_, e)| e)
+                    .unwrap_or("mp4")
+            } else {
+                "mp4"
+            };
+
+            // Sanitize filename
+            let safe_stem: String = clean_stem
+                .chars()
+                .map(|c| {
+                    if c.is_alphanumeric() || c == '_' || c == '-' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            let safe_name = if safe_stem.is_empty() {
+                "downloaded_wallpaper".to_string()
+            } else {
+                safe_stem
+            };
+
+            let local_app_data = std::env::var_os("LOCALAPPDATA").unwrap_or_default();
+            let downloads_dir = std::path::PathBuf::from(local_app_data)
+                .join("RustWallpaper")
+                .join("downloads");
+            let dest = downloads_dir.join(format!("{}.{}", safe_name, ext));
+
+            let title = safe_name.replace('_', " ");
+            let id = format!("url-{}", uuid::Uuid::new_v4());
+
+            if auto_apply {
+                self.pending_apply_source = Some(dest.to_string_lossy().to_string());
+            }
+
+            self.direct_url_status = Some(format!("Downloading '{}'…", safe_name));
+            let tx = self.download_tx.clone();
+            let dest_clone = dest.clone();
+            let title_clone = title.clone();
+            let id_clone = id.clone();
+
+            std::thread::spawn(move || {
+                let _ = tx.send(DownloadMessage::Progress {
+                    id: id_clone.clone(),
+                    status: "Downloading video from URL…".into(),
+                });
+
+                match wallpaper_core::download_online_file(&url, &dest_clone) {
+                    Ok(_) => {
+                        let _ = tx.send(DownloadMessage::Complete {
+                            id: id_clone,
+                            path: dest_clone,
+                            title: title_clone,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(DownloadMessage::Failed {
+                            id: id_clone,
+                            error: e.to_string(),
+                        });
+                    }
+                }
+            });
+        }
+
         fn render_browse(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
             // Process any background download completion messages
             while let Ok(msg) = self.download_rx.try_recv() {
@@ -961,6 +1065,10 @@ mod desktop {
                     DownloadMessage::Complete { id, path, title } => {
                         self.online_download_status
                             .insert(id.clone(), "Downloaded! Adding to library…".into());
+                        if id.starts_with("url-") {
+                            self.direct_url_status =
+                                Some("Downloaded & imported to library!".into());
+                        }
                         self.send(
                             Command::ImportWallpaper {
                                 path: path.to_string_lossy().to_string(),
@@ -970,6 +1078,9 @@ mod desktop {
                         );
                     }
                     DownloadMessage::Failed { id, error } => {
+                        if id.starts_with("url-") {
+                            self.direct_url_status = Some(format!("Download failed: {error}"));
+                        }
                         self.online_download_status
                             .insert(id, format!("Failed: {error}"));
                     }
@@ -1003,7 +1114,7 @@ mod desktop {
                 }
             }
 
-            // Auto-scan Steam Workshop on first visit
+            // Auto-scan local items on first visit
             if !self.workshop_scanned {
                 let custom = if !self.custom_steam_path.trim().is_empty() {
                     vec![std::path::PathBuf::from(self.custom_steam_path.trim())]
@@ -1014,119 +1125,95 @@ mod desktop {
                 self.workshop_scanned = true;
             }
 
-            ui.heading("Browse & Workshop");
+            // Auto-load curated video wallpapers
+            if self.online_items.is_empty() {
+                self.online_items = wallpaper_core::get_curated_video_wallpapers();
+            }
+
+            ui.heading("Browse Wallpapers");
             ui.add_space(4.0);
 
             // Sub-tabs
             ui.horizontal(|ui| {
                 if ui
                     .selectable_label(
-                        matches!(self.browse_tab, BrowseTab::SteamWorkshop),
-                        "📂  Steam Workshop (Local)",
-                    )
-                    .clicked()
-                {
-                    self.browse_tab = BrowseTab::SteamWorkshop;
-                }
-                if ui
-                    .selectable_label(
                         matches!(self.browse_tab, BrowseTab::OnlineWallpapers),
-                        "🌐  Online Wallpapers (Wallhaven & Videos)",
+                        "🌐  Free Video Wallpapers",
                     )
                     .clicked()
                 {
                     self.browse_tab = BrowseTab::OnlineWallpapers;
-                    if self.online_items.is_empty() {
-                        self.online_items = wallpaper_core::get_curated_video_wallpapers();
-                    }
+                }
+                if ui
+                    .selectable_label(
+                        matches!(self.browse_tab, BrowseTab::LocalWorkshop),
+                        "📂  Local & Workshop Folder",
+                    )
+                    .clicked()
+                {
+                    self.browse_tab = BrowseTab::LocalWorkshop;
                 }
             });
 
-            ui.separator();
             ui.add_space(6.0);
 
+            // Direct Web Video URL Downloader bar
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_rgb(26, 32, 42))
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("📥 Download from Web URL:").strong());
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.direct_url_input)
+                                .hint_text("Paste any video link (https://.../video.mp4 or .webm)")
+                                .desired_width(320.0),
+                        );
+                        let has_url = self.direct_url_input.trim().starts_with("http://")
+                            || self.direct_url_input.trim().starts_with("https://");
+
+                        if ui
+                            .add_enabled(has_url, egui::Button::new("⬇ Download"))
+                            .on_hover_text("Download video and save to your wallpaper library")
+                            .clicked()
+                        {
+                            self.start_direct_url_download(false);
+                        }
+
+                        if ui
+                            .add_enabled(has_url, egui::Button::new("▶ Download & Apply"))
+                            .on_hover_text(
+                                "Download video, add to library, and apply directly to desktop",
+                            )
+                            .clicked()
+                        {
+                            self.start_direct_url_download(true);
+                        }
+
+                        if resp.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                            && has_url
+                        {
+                            self.start_direct_url_download(true);
+                        }
+                    });
+
+                    if let Some(status) = &self.direct_url_status {
+                        ui.add_space(2.0);
+                        ui.colored_label(egui::Color32::from_rgb(100, 200, 255), status);
+                    }
+                });
+
+            ui.separator();
+            ui.add_space(4.0);
+
             match self.browse_tab {
-                BrowseTab::SteamWorkshop => self.render_steam_workshop(ui, snapshot),
                 BrowseTab::OnlineWallpapers => self.render_online_wallpapers(ui, snapshot),
+                BrowseTab::LocalWorkshop => self.render_local_workshop(ui, snapshot),
             }
         }
 
-        fn render_steam_workshop(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-            let status = self
-                .steam_engine_status
-                .get_or_insert_with(wallpaper_core::detect_steam_and_wallpaper_engine);
-
-            if status.wallpaper_engine_installed {
-                egui::Frame::group(ui.style())
-                    .fill(egui::Color32::from_rgb(20, 35, 48))
-                    .inner_margin(8.0)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(100, 200, 255),
-                                "✔ Wallpaper Engine detected on Steam",
-                            );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui
-                                    .button("🚀 Sync / Launch Steam")
-                                    .on_hover_text("Tells Steam to download all recently subscribed workshop items to disk.")
-                                    .clicked()
-                                {
-                                    #[cfg(windows)]
-                                    {
-                                        let _ = std::process::Command::new("rundll32")
-                                            .args(["url.dll,FileProtocolHandler", "steam://rungameid/431960"])
-                                            .spawn();
-                                    }
-                                }
-                                if ui
-                                    .button("🌐 Browse Steam Workshop")
-                                    .on_hover_text("Open Wallpaper Engine Steam Workshop in your web browser.")
-                                    .clicked()
-                                {
-                                    #[cfg(windows)]
-                                    {
-                                        let _ = std::process::Command::new("rundll32")
-                                            .args(["url.dll,FileProtocolHandler", "https://steamcommunity.com/app/431960/workshop/"])
-                                            .spawn();
-                                    }
-                                }
-                            });
-                        });
-                        ui.small(
-                            "💡 Steam only downloads subscribed items to your PC while Steam / Wallpaper Engine is running. If a new subscription is missing, launch Wallpaper Engine to download it, then click 'Refresh / Scan'.",
-                        );
-                    });
-            } else {
-                egui::Frame::group(ui.style())
-                    .fill(egui::Color32::from_rgb(45, 30, 20))
-                    .inner_margin(8.0)
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(255, 180, 60),
-                                "⚠ Wallpaper Engine not detected on Steam",
-                            );
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui
-                                    .button("🌐 Switch to Free Online Wallpapers")
-                                    .clicked()
-                                {
-                                    self.browse_tab = BrowseTab::OnlineWallpapers;
-                                    if self.online_items.is_empty() {
-                                        self.online_items = wallpaper_core::get_curated_video_wallpapers();
-                                    }
-                                }
-                            });
-                        });
-                        ui.small(
-                            "Steam requires you to own and launch Wallpaper Engine in Steam before it will download subscribed Workshop files to your computer. To get video wallpapers without Wallpaper Engine, browse free videos in the 'Online Wallpapers' tab.",
-                        );
-                    });
-            }
-
-            ui.add_space(4.0);
-
+        fn render_local_workshop(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
             ui.horizontal(|ui| {
                 ui.label("🔍 Search:");
                 ui.text_edit_singleline(&mut self.workshop_search);
@@ -1137,10 +1224,8 @@ mod desktop {
                         Vec::new()
                     };
                     self.workshop_items = wallpaper_core::scan_wallpaper_engine_items(&custom);
-                    self.steam_engine_status =
-                        Some(wallpaper_core::detect_steam_and_wallpaper_engine());
                     self.workshop_scanned = true;
-                    self.notice = format!("Found {} Steam items", self.workshop_items.len());
+                    self.notice = format!("Found {} video wallpapers", self.workshop_items.len());
                 }
                 ui.checkbox(
                     &mut self.workshop_filter_video_only,
@@ -1149,8 +1234,22 @@ mod desktop {
             });
 
             ui.horizontal(|ui| {
-                ui.small("Custom Steam / Wallpaper Engine folder (optional):");
+                ui.small("Folder to scan (Steam Workshop, Videos, or custom folder):");
                 ui.text_edit_singleline(&mut self.custom_steam_path);
+                if ui.button("📁 Browse Folder…").clicked() {
+                    #[cfg(windows)]
+                    {
+                        if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                            self.custom_steam_path = folder.display().to_string();
+                            let custom = vec![folder];
+                            self.workshop_items =
+                                wallpaper_core::scan_wallpaper_engine_items(&custom);
+                            self.workshop_scanned = true;
+                            self.notice =
+                                format!("Found {} items in folder", self.workshop_items.len());
+                        }
+                    }
+                }
             });
 
             ui.add_space(6.0);
@@ -1179,33 +1278,14 @@ mod desktop {
                 .collect();
 
             if filtered.is_empty() {
-                let we_installed = self
-                    .steam_engine_status
-                    .as_ref()
-                    .map(|s| s.wallpaper_engine_installed)
-                    .unwrap_or(false);
-
                 ui.vertical_centered(|ui| {
                     ui.add_space(30.0);
-                    ui.heading("No Workshop items found");
-                    if we_installed {
-                        ui.label(
-                            "Subscribed to a new wallpaper? Launch Wallpaper Engine via the button above so Steam downloads the files, then click 'Refresh / Scan'.",
-                        );
-                    } else {
-                        ui.label(
-                            "Wallpaper Engine is not installed on this PC. Steam Workshop only downloads files for installed games/apps.",
-                        );
-                        ui.add_space(8.0);
-                        if ui
-                            .button("🌐 Browse Free Online Wallpapers (No Steam required)")
-                            .clicked()
-                        {
-                            self.browse_tab = BrowseTab::OnlineWallpapers;
-                            if self.online_items.is_empty() {
-                                self.online_items = wallpaper_core::get_curated_video_wallpapers();
-                            }
-                        }
+                    ui.heading("No video wallpapers found in folder");
+                    ui.label("Click '📁 Browse Folder…' to select any folder containing .mp4 or .webm files,");
+                    ui.label("paste a web video link into the URL bar above, or switch to 'Free Video Wallpapers'.");
+                    ui.add_space(8.0);
+                    if ui.button("🌐 Switch to Free Video Wallpapers").clicked() {
+                        self.browse_tab = BrowseTab::OnlineWallpapers;
                     }
                 });
                 return;

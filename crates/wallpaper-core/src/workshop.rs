@@ -250,6 +250,35 @@ fn scan_directory_for_items(
                     items.push(item);
                 }
             }
+        } else if path.is_file() {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                let lower = ext.to_lowercase();
+                if lower == "mp4" || lower == "webm" || lower == "mkv" || lower == "mov" {
+                    let id = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("video")
+                        .to_string();
+                    if !seen_ids.contains(&id) {
+                        seen_ids.insert(id.clone());
+                        let title = id.clone();
+                        let file_size_bytes = fs::metadata(&path).ok().map(|m| m.len());
+                        items.push(WorkshopItem {
+                            id,
+                            title,
+                            description: None,
+                            item_type: "video".to_string(),
+                            file_path: path.clone(),
+                            preview_path: None,
+                            is_compatible_video: true,
+                            tags: Vec::new(),
+                            content_rating: None,
+                            file_size_bytes,
+                            folder_path: dir.to_path_buf(),
+                        });
+                    }
+                }
+            }
         }
     }
 }
@@ -731,6 +760,33 @@ mod tests {
         // it must not resolve to the outside secret file!
         assert_ne!(item.file_path, outside_secret);
         assert!(!item.is_compatible_video);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_scan_directory_with_loose_videos() {
+        let temp_dir = std::env::temp_dir().join(format!("test_wp_loose_{}", uuid::Uuid::new_v4()));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let video1 = temp_dir.join("beach_sunset.mp4");
+        let video2 = temp_dir.join("matrix_rain.webm");
+        let text_file = temp_dir.join("notes.txt");
+
+        fs::write(&video1, b"dummy video 1").unwrap();
+        fs::write(&video2, b"dummy video 2").unwrap();
+        fs::write(&text_file, b"ignore me").unwrap();
+
+        let mut items = Vec::new();
+        let mut seen = HashSet::new();
+        scan_directory_for_items(&temp_dir, &mut items, &mut seen);
+        assert_eq!(items.len(), 2);
+        assert!(items
+            .iter()
+            .any(|i| i.title == "beach_sunset" && i.is_compatible_video));
+        assert!(items
+            .iter()
+            .any(|i| i.title == "matrix_rain" && i.is_compatible_video));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

@@ -8,6 +8,7 @@ license.workspace = true
 eframe.workspace = true
 image.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 wallpaper-core = { path = "../../crates/wallpaper-core" }
 wallpaper-protocol = { path = "../../crates/wallpaper-protocol" }
 wallpaper-daemon = { path = "../wallpaper-daemon" }

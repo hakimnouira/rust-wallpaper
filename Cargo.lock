@@ -2583,6 +2583,7 @@ dependencies = [
  "image",
  "rfd",
  "tokio",
+ "uuid",
  "wallpaper-core",
  "wallpaper-daemon",
  "wallpaper-protocol",
