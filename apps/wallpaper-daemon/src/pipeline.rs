@@ -81,12 +81,48 @@ pub enum SubmitError {
     Disconnected,
 }
 
+#[derive(Clone)]
 pub struct ExtractionPipeline {
     sender: SyncSender<ExtractionJob>,
     thumbnail_dir: PathBuf,
 }
 
 impl ExtractionPipeline {
+    /// Defers library scan and missing-thumbnail recovery so daemon startup can begin serving first.
+    pub fn start_recovery(library: WallpaperLibrary, pipeline: Self, thumbnail_dir: PathBuf) {
+        if let Err(error) = thread::Builder::new()
+            .name("thumbnail-startup-recovery".into())
+            .spawn(move || {
+                cleanup_orphaned_thumbnails(&library, &thumbnail_dir);
+                if let Ok(wallpapers) = library.list() {
+                    for wallpaper in wallpapers {
+                        let thumb_missing = wallpaper
+                            .metadata
+                            .thumbnail_path
+                            .as_ref()
+                            .is_none_or(|path| !Path::new(path).exists());
+                        if thumb_missing || wallpaper.metadata.is_processing() {
+                            if let Err(error) = pipeline.submit(
+                                wallpaper.id,
+                                PathBuf::from(&wallpaper.metadata.source),
+                            ) {
+                                let message = error.to_string();
+                                warn!(wallpaper_id = %wallpaper.id, %message, "Could not queue wallpaper metadata recovery");
+                                let _ = library.set_processing_state(
+                                    wallpaper.id,
+                                    ProcessingStatus::Failed,
+                                    Some(&message),
+                                );
+                            }
+                        }
+                    }
+                }
+            })
+        {
+            warn!(%error, "Could not start thumbnail recovery thread");
+        }
+    }
+
     /// Starts the background extraction worker thread.
     pub fn start(library: WallpaperLibrary, thumbnail_dir: PathBuf) -> Self {
         let (sender, receiver) = sync_channel::<ExtractionJob>(128);

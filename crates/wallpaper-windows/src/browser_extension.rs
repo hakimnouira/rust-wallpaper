@@ -50,9 +50,11 @@ pub fn register_browser_extension(custom_crx_path: Option<&Path>) -> Result<(), 
         }
 
         // 1. Register in standard Chromium External Extensions
+        let mut registered_browsers = 0;
+        let mut errors = Vec::new();
         for base_key in BROWSER_REG_KEYS {
             let full_key = format!(r"{base_key}\{EXTENSION_ID}");
-            if let Err(e) = set_reg_values(
+            match set_reg_values(
                 &full_key,
                 &[
                     ("path", &crx_str),
@@ -60,9 +62,14 @@ pub fn register_browser_extension(custom_crx_path: Option<&Path>) -> Result<(), 
                     ("update_url", UPDATE_URL),
                 ],
             ) {
-                warn!(%full_key, %e, "Failed to write browser external extension key");
-            } else {
-                info!(%full_key, "Successfully registered browser external extension");
+                Ok(()) => {
+                    registered_browsers += 1;
+                    info!(%full_key, "Successfully registered browser external extension");
+                }
+                Err(error) => {
+                    warn!(%full_key, %error, "Failed to write browser external extension key");
+                    errors.push(format!("{full_key}: {error}"));
+                }
             }
         }
 
@@ -82,6 +89,12 @@ pub fn register_browser_extension(custom_crx_path: Option<&Path>) -> Result<(), 
             }
         }
 
+        if registered_browsers == 0 {
+            return Err(format!(
+                "Could not register the extension in any supported browser: {}",
+                errors.join("; ")
+            ));
+        }
         Ok(())
     }
 
@@ -219,7 +232,14 @@ fn set_reg_values(subkey: &str, values: &[(&str, &str)]) -> Result<(), String> {
             let bytes =
                 std::slice::from_raw_parts(wide_data.as_ptr() as *const u8, wide_data.len() * 2);
 
-            let _ = RegSetValueExW(hkey, PCWSTR(wide_name.as_ptr()), 0, REG_SZ, Some(bytes));
+            let status = RegSetValueExW(hkey, PCWSTR(wide_name.as_ptr()), 0, REG_SZ, Some(bytes));
+            if status.0 != 0 {
+                let _ = RegCloseKey(hkey);
+                return Err(format!(
+                    "Failed to write registry value '{val_name}': Windows error {}",
+                    status.0
+                ));
+            }
         }
 
         let _ = RegCloseKey(hkey);

@@ -41,6 +41,20 @@ unsafe extern "system" fn ctrl_handler(_: u32) -> windows::Win32::Foundation::BO
     windows::Win32::Foundation::BOOL(1)
 }
 
+fn bundled_asset_path(file_name: &str) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("assets").join("wallpapers").join(file_name));
+        }
+    }
+    candidates.push(PathBuf::from("assets").join("wallpapers").join(file_name));
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)))
+}
+
 fn parse_cli_args() -> (Option<Duration>, Option<PerformanceProfile>) {
     let args: Vec<String> = std::env::args().collect();
     let mut duration = None;
@@ -119,7 +133,6 @@ pub fn run_daemon_with_options(
                 thumbnails_dir.display()
             )
         })?;
-        pipeline::cleanup_orphaned_thumbnails(&library, &thumbnails_dir);
         let pipeline = pipeline::ExtractionPipeline::start(library.clone(), thumbnails_dir.clone());
         let saved_profile = library
             .get_setting("performance_profile")?
@@ -134,28 +147,9 @@ pub fn run_daemon_with_options(
             library.set_setting("performance_profile", profile_name)?;
         }
 
-        // Import bundled demo assets only once when not already present in the library.
-        // Use canonical absolute paths to avoid relative-path resolution failures.
-        let nature_mp4 = std::fs::canonicalize("assets/wallpapers/sample-nature.mp4")
-            .ok()
-            .or_else(|| {
-                let p = PathBuf::from("assets/wallpapers/sample-nature.mp4");
-                if p.is_file() {
-                    Some(p)
-                } else {
-                    None
-                }
-            });
-        let abstract_webm = std::fs::canonicalize("assets/wallpapers/sample-abstract.webm")
-            .ok()
-            .or_else(|| {
-                let p = PathBuf::from("assets/wallpapers/sample-abstract.webm");
-                if p.is_file() {
-                    Some(p)
-                } else {
-                    None
-                }
-            });
+        // Resolve packaged sample media beside the installed binaries, independent of cwd.
+        let nature_mp4 = bundled_asset_path("sample-nature.mp4");
+        let abstract_webm = bundled_asset_path("sample-abstract.webm");
 
         let demo_config = PlaybackConfig {
             loop_playback: true,
@@ -195,29 +189,6 @@ pub fn run_daemon_with_options(
             count = library.list().unwrap_or_default().len(),
             "Wallpaper library loaded"
         );
-
-        // Restart recovery: scan library items and queue any missing thumbnails or pending jobs
-        if let Ok(wallpapers) = library.list() {
-            for wp in wallpapers {
-                let thumb_missing = wp
-                    .metadata
-                    .thumbnail_path
-                    .as_ref()
-                    .is_none_or(|p| !std::path::Path::new(p).exists());
-                let state_pending = wp.metadata.is_processing();
-                if thumb_missing || state_pending {
-                    if let Err(error) = pipeline.submit(wp.id, PathBuf::from(&wp.metadata.source)) {
-                        let message = error.to_string();
-                        warn!(wallpaper_id = %wp.id, %message, "Could not queue wallpaper metadata recovery");
-                        let _ = library.set_processing_state(
-                            wp.id,
-                            wallpaper_core::ProcessingStatus::Failed,
-                            Some(&message),
-                        );
-                    }
-                }
-            }
-        }
 
         let fallback_path = nature_mp4.or(abstract_webm);
         let fallback = fallback_path.map(|path| Assignment {
@@ -268,6 +239,12 @@ pub fn run_daemon_with_options(
         let control_rx = spawn_control_reader();
         let (ipc_tx, ipc_rx) = ipc::start();
         web_api::start(ipc_tx.clone(), web_api::DEFAULT_PORT);
+        // Scan disk and queue stale thumbnail work only after IPC and HTTP are serving requests.
+        pipeline::ExtractionPipeline::start_recovery(
+            library.clone(),
+            pipeline.clone(),
+            thumbnails_dir,
+        );
         info!(pipe = ipc::PIPE_NAME, "Named-pipe IPC server started");
         info!(
             port = web_api::DEFAULT_PORT,
@@ -446,7 +423,7 @@ pub fn run_daemon_with_options(
                 last_reconcile = now;
             }
 
-            if now.saturating_duration_since(last_telemetry) >= Duration::from_secs(2) {
+            if now.saturating_duration_since(last_telemetry) >= Duration::from_secs(10) {
                 last_telemetry = now;
                 // Keep the daemon loop non-blocking: detailed MPV telemetry performs several
                 // synchronous IPC requests. The fast status snapshot uses cached process data.

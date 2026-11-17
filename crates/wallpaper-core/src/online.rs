@@ -497,35 +497,188 @@ fn extract_media_url_from_html(html: &str) -> String {
     String::new()
 }
 
-/// Resolves a video webpage URL (such as Pixabay, Pexels, or open media pages)
-/// into a direct playable/downloadable media stream URL (e.g. .mp4 or .webm).
-pub fn resolve_direct_video_url(url: &str) -> String {
-    resolve_direct_video_url_with_cancel(url, &AtomicBool::new(false))
-        .unwrap_or_else(|_| url.trim().to_string())
+fn clean_html_title(raw: &str) -> String {
+    raw.replace("&amp;", "&")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .trim()
+        .to_string()
 }
 
-fn resolve_direct_video_url_with_cancel(
+fn extract_steam_workshop_title(html: &str) -> Option<String> {
+    if let Some(pos) = html.find("workshopItemTitle") {
+        let slice = &html[pos..];
+        if let Some(tag_end) = slice.find('>') {
+            let after = &slice[tag_end + 1..];
+            if let Some(end_tag) = after.find('<') {
+                let title = after[..end_tag].trim();
+                if !title.is_empty() {
+                    return Some(clean_html_title(title));
+                }
+            }
+        }
+    }
+    if let Some(pos) = html.find("property=\"og:title\"") {
+        let start = if pos > 50 { pos - 50 } else { 0 };
+        let end = (pos + 300).min(html.len());
+        let slice = &html[start..end];
+        if let Some(c_pos) = slice.find("content=\"") {
+            let after = &slice[c_pos + 9..];
+            if let Some(end_q) = after.find('"') {
+                let mut title = after[..end_q].trim();
+                if let Some(stripped) = title.strip_prefix("Steam Workshop::") {
+                    title = stripped.trim();
+                }
+                if !title.is_empty() {
+                    return Some(clean_html_title(title));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_steam_workshop_media_url(html: &str) -> String {
+    // 1. Look for ShowEnlargedImagePreview( 'https://...' )
+    if let Some(pos) = html.find("ShowEnlargedImagePreview") {
+        let slice = &html[pos..];
+        if let Some(start_quote) = slice.find('\'') {
+            let after = &slice[start_quote + 1..];
+            if let Some(end_quote) = after.find('\'') {
+                let candidate = &after[..end_quote];
+                if candidate.starts_with("http") {
+                    // Strip ?imw=... query params to get original full uncompressed asset
+                    return candidate.split('?').next().unwrap_or(candidate).to_string();
+                }
+            }
+        }
+    }
+
+    // 2. Look for previewImage element: <img id="previewImage" ... src="..."
+    if let Some(pos) = html.find("id=\"previewImage\"") {
+        let slice = &html[pos..];
+        if let Some(s_pos) = slice.find("src=\"") {
+            let after = &slice[s_pos + 5..];
+            if let Some(end_q) = after.find('"') {
+                let candidate = &after[..end_q];
+                if candidate.starts_with("http") {
+                    return candidate.split('?').next().unwrap_or(candidate).to_string();
+                }
+            }
+        }
+    }
+
+    // 3. Look for og:image with steamusercontent
+    if let Some(pos) = html.find("property=\"og:image\"") {
+        let start = if pos > 50 { pos - 50 } else { 0 };
+        let end = (pos + 300).min(html.len());
+        let slice = &html[start..end];
+        if let Some(c_pos) = slice.find("content=\"http") {
+            let after = &slice[c_pos + 9..];
+            if let Some(end_q) = after.find('"') {
+                let candidate = &after[..end_q];
+                if candidate.contains("steamusercontent.com") {
+                    return candidate.split('?').next().unwrap_or(candidate).to_string();
+                }
+            }
+        }
+    }
+
+    String::new()
+}
+
+/// Detects the media container or image format from the file's leading magic bytes.
+pub fn detect_media_extension_from_magic_bytes(path: &Path) -> Option<&'static str> {
+    let mut header = [0u8; 32];
+    let mut file = File::open(path).ok()?;
+    let read = file.read(&mut header).ok()?;
+    let slice = &header[..read];
+
+    if slice.len() >= 3 && &slice[0..3] == b"\xFF\xD8\xFF" {
+        return Some("jpg");
+    }
+    if slice.len() >= 8 && &slice[0..8] == b"\x89PNG\r\n\x1a\n" {
+        return Some("png");
+    }
+    if slice.len() >= 6 && (&slice[0..6] == b"GIF87a" || &slice[0..6] == b"GIF89a") {
+        return Some("gif");
+    }
+    if slice.len() >= 12 && &slice[0..4] == b"RIFF" && &slice[8..12] == b"WEBP" {
+        return Some("webp");
+    }
+    if slice.len() >= 2 && &slice[0..2] == b"BM" {
+        return Some("bmp");
+    }
+    if slice.len() >= 4 && &slice[0..4] == b"\x1A\x45\xDF\xA3" {
+        return Some("webm");
+    }
+    if slice.len() >= 12 && (&slice[4..8] == b"ftyp" || &slice[4..8] == b"moov") {
+        return Some("mp4");
+    }
+    None
+}
+
+/// Resolved media information extracted from a web page or direct URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedWebMedia {
+    pub media_url: String,
+    pub title: Option<String>,
+}
+
+/// Resolves a webpage URL (such as Steam Workshop, Pixabay, or open media)
+/// into a direct playable/downloadable media stream URL and optional title.
+pub fn resolve_web_media_info(url: &str) -> ResolvedWebMedia {
+    resolve_web_media_info_with_cancel(url, &AtomicBool::new(false)).unwrap_or_else(|_| {
+        ResolvedWebMedia {
+            media_url: url.trim().to_string(),
+            title: None,
+        }
+    })
+}
+
+pub fn resolve_web_media_info_with_cancel(
     url: &str,
     cancelled: &AtomicBool,
-) -> Result<String, OnlineError> {
-    resolve_direct_video_url_with_policy(url, cancelled, false)
+) -> Result<ResolvedWebMedia, OnlineError> {
+    resolve_web_media_info_with_policy(url, cancelled, false)
 }
 
-fn resolve_direct_video_url_with_policy(
+pub fn resolve_web_media_info_with_policy(
     url: &str,
     cancelled: &AtomicBool,
     allow_local: bool,
-) -> Result<String, OnlineError> {
+) -> Result<ResolvedWebMedia, OnlineError> {
     if cancelled.load(Ordering::Relaxed) {
         return Err(OnlineError::Cancelled);
     }
     let trimmed = url.trim();
     let lower = trimmed.to_lowercase();
 
-    // Special handling for Pixabay:
+    // 1. Special handling for Steam Community Workshop:
+    // URLs like: https://steamcommunity.com/sharedfiles/filedetails/?id=3830732662
+    // or https://steamcommunity.com/workshop/filedetails/?id=...
+    if lower.contains("steamcommunity.com/sharedfiles")
+        || lower.contains("steamcommunity.com/workshop")
+    {
+        validate_remote_url_with_policy(trimmed, allow_local)?;
+        if let Some(html) = fetch_html_content_with_policy(trimmed, Some(cancelled), allow_local) {
+            let extracted = extract_steam_workshop_media_url(&html);
+            let title = extract_steam_workshop_title(&html);
+            if !extracted.is_empty() {
+                validate_remote_url_with_policy(&extracted, allow_local)?;
+                return Ok(ResolvedWebMedia {
+                    media_url: extracted,
+                    title,
+                });
+            }
+        }
+    }
+
+    // 2. Special handling for Pixabay:
     // If it's on pixabay.com and NOT cdn.pixabay.com:
-    // Even if it ends with .mp4 (like /videos/download/x-173656_medium.mp4),
-    // it is a webpage or download captcha gate, NOT a direct CDN stream!
     if lower.contains("pixabay.com") && !lower.contains("cdn.pixabay.com") {
         let mut target_page = trimmed.to_string();
         if let Some(id) = extract_pixabay_video_id(trimmed) {
@@ -538,12 +691,15 @@ fn resolve_direct_video_url_with_policy(
             let extracted = extract_media_url_from_html(&html);
             if !extracted.is_empty() {
                 validate_remote_url_with_policy(&extracted, allow_local)?;
-                return Ok(extracted);
+                return Ok(ResolvedWebMedia {
+                    media_url: extracted,
+                    title: None,
+                });
             }
         }
     }
 
-    // If it's already a direct video or audio/image link, return as-is
+    // 3. If it's already a direct video or audio/image link, return as-is
     if lower.ends_with(".mp4")
         || lower.ends_with(".webm")
         || lower.ends_with(".mkv")
@@ -555,23 +711,57 @@ fn resolve_direct_video_url_with_policy(
         || lower.contains(".mp4?")
         || lower.contains(".webm?")
     {
-        return Ok(trimmed.to_string());
+        return Ok(ResolvedWebMedia {
+            media_url: trimmed.to_string(),
+            title: None,
+        });
     }
 
     let Some(html) = fetch_html_content_with_policy(trimmed, Some(cancelled), allow_local) else {
         if cancelled.load(Ordering::Relaxed) {
             return Err(OnlineError::Cancelled);
         }
-        return Ok(trimmed.to_string());
+        return Ok(ResolvedWebMedia {
+            media_url: trimmed.to_string(),
+            title: None,
+        });
     };
 
     let extracted = extract_media_url_from_html(&html);
     if !extracted.is_empty() {
         validate_remote_url_with_policy(&extracted, allow_local)?;
-        return Ok(extracted);
+        return Ok(ResolvedWebMedia {
+            media_url: extracted,
+            title: None,
+        });
     }
 
-    Ok(trimmed.to_string())
+    Ok(ResolvedWebMedia {
+        media_url: trimmed.to_string(),
+        title: None,
+    })
+}
+
+/// Resolves a video webpage URL (such as Pixabay, Steam Workshop, or open media)
+/// into a direct playable/downloadable media stream URL (e.g. .mp4, .webm, or image/gif).
+pub fn resolve_direct_video_url(url: &str) -> String {
+    resolve_web_media_info(url).media_url
+}
+
+#[allow(dead_code)]
+fn resolve_direct_video_url_with_cancel(
+    url: &str,
+    cancelled: &AtomicBool,
+) -> Result<String, OnlineError> {
+    resolve_web_media_info_with_cancel(url, cancelled).map(|r| r.media_url)
+}
+
+fn resolve_direct_video_url_with_policy(
+    url: &str,
+    cancelled: &AtomicBool,
+    allow_local: bool,
+) -> Result<String, OnlineError> {
+    resolve_web_media_info_with_policy(url, cancelled, allow_local).map(|r| r.media_url)
 }
 
 /// Downloads a remote file into a sibling temporary file then atomically publishes it.
@@ -880,6 +1070,64 @@ fn urlencoding(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_steam_workshop_media_and_title() {
+        let sample_html = r#"
+            <html>
+                <head>
+                    <meta property="og:title" content="Steam Workshop::YoRHa Terminal - NieR:Automata UI">
+                    <meta property="og:image" content="https://images.steamusercontent.com/ugc/11610979304480761089/E9C694307B3B994385D1ED7CAFEE0D35DAB0B869/?imw=512">
+                </head>
+                <body>
+                    <div class="workshopItemTitle">YoRHa Terminal - NieR:Automata UI</div>
+                    <div class="workshopItemPreviewImageEnlargeableContainer">
+                        <a onclick="ShowEnlargedImagePreview( 'https://images.steamusercontent.com/ugc/11610979304480761089/E9C694307B3B994385D1ED7CAFEE0D35DAB0B869/?imw=5000&imh=5000' );">
+                            <img id="previewImage" src="https://images.steamusercontent.com/ugc/11610979304480761089/E9C694307B3B994385D1ED7CAFEE0D35DAB0B869/?imw=637">
+                        </a>
+                    </div>
+                </body>
+            </html>
+        "#;
+
+        let title = extract_steam_workshop_title(sample_html);
+        assert_eq!(title.as_deref(), Some("YoRHa Terminal - NieR:Automata UI"));
+
+        let media = extract_steam_workshop_media_url(sample_html);
+        assert_eq!(
+            media,
+            "https://images.steamusercontent.com/ugc/11610979304480761089/E9C694307B3B994385D1ED7CAFEE0D35DAB0B869/"
+        );
+    }
+
+    #[test]
+    fn test_detect_media_extension_from_magic_bytes() {
+        let temp_dir = std::env::temp_dir().join(format!("test_magic_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let gif_file = temp_dir.join("test.bin");
+        std::fs::write(&gif_file, b"GIF89a\x01\x00\x01\x00").unwrap();
+        assert_eq!(
+            detect_media_extension_from_magic_bytes(&gif_file),
+            Some("gif")
+        );
+
+        let png_file = temp_dir.join("test.png");
+        std::fs::write(&png_file, b"\x89PNG\r\n\x1a\n\x00\x00").unwrap();
+        assert_eq!(
+            detect_media_extension_from_magic_bytes(&png_file),
+            Some("png")
+        );
+
+        let jpg_file = temp_dir.join("test.jpg");
+        std::fs::write(&jpg_file, b"\xFF\xD8\xFF\xE0\x00\x10JFIF").unwrap();
+        assert_eq!(
+            detect_media_extension_from_magic_bytes(&jpg_file),
+            Some("jpg")
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
 
     #[test]
     fn test_resolve_video_page_from_metadata() {

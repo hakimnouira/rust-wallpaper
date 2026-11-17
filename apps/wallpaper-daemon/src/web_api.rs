@@ -279,7 +279,8 @@ async fn handle_wallpaper(
         return Ok(());
     }
 
-    let url = wallpaper_core::resolve_direct_video_url(&raw_url);
+    let resolved = wallpaper_core::resolve_web_media_info(&raw_url);
+    let url = resolved.media_url;
 
     // Determine filename
     let parsed_filename = url
@@ -292,7 +293,11 @@ async fn handle_wallpaper(
     let has_ext = parsed_filename.ends_with(".mp4")
         || parsed_filename.ends_with(".webm")
         || parsed_filename.ends_with(".mkv")
-        || parsed_filename.ends_with(".mov");
+        || parsed_filename.ends_with(".mov")
+        || parsed_filename.ends_with(".gif")
+        || parsed_filename.ends_with(".jpg")
+        || parsed_filename.ends_with(".png")
+        || parsed_filename.ends_with(".webp");
 
     let stem = if has_ext {
         parsed_filename
@@ -337,6 +342,7 @@ async fn handle_wallpaper(
     let title = req
         .title
         .filter(|t| !t.trim().is_empty())
+        .or(resolved.title)
         .unwrap_or_else(|| safe_name.replace('_', " "));
 
     // Download in blocking task
@@ -356,9 +362,19 @@ async fn handle_wallpaper(
         return Ok(());
     }
 
+    let mut final_dest = dest.clone();
+    if let Some(detected_ext) = wallpaper_core::detect_media_extension_from_magic_bytes(&dest) {
+        let candidate = dest.with_extension(detected_ext);
+        if candidate != dest {
+            if let Ok(()) = std::fs::rename(&dest, &candidate) {
+                final_dest = candidate;
+            }
+        }
+    }
+
     // Import into library via IPC
     let import_cmd = Command::ImportWallpaper {
-        path: dest.to_string_lossy().to_string(),
+        path: final_dest.to_string_lossy().to_string(),
         title: Some(title.clone()),
     };
 

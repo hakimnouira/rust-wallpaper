@@ -16,9 +16,10 @@ pub use filter::{
 };
 pub use library::{LibraryError, WallpaperLibrary};
 pub use online::{
-    download_online_file, download_online_file_cancellable, fetch_thumbnail_bytes,
-    get_curated_video_wallpapers, resolve_direct_video_url, search_wallhaven, OnlineError,
-    OnlineWallpaper,
+    detect_media_extension_from_magic_bytes, download_online_file,
+    download_online_file_cancellable, fetch_thumbnail_bytes, get_curated_video_wallpapers,
+    resolve_direct_video_url, resolve_web_media_info, search_wallhaven, OnlineError,
+    OnlineWallpaper, ResolvedWebMedia,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -96,8 +97,8 @@ impl HardwareAcceleration {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VideoQuality {
-    Fast,
     #[default]
+    Fast,
     Balanced,
     High,
 }
@@ -145,7 +146,7 @@ impl Default for PlaybackConfig {
             hardware_acceleration: HardwareAcceleration::Auto,
             target_fps: None,
             ram_budget_mb: None,
-            quality: VideoQuality::Balanced,
+            quality: VideoQuality::Fast,
         }
     }
 }

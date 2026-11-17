@@ -439,7 +439,10 @@ impl WallpaperLibrary {
             .unwrap_or("")
             .to_lowercase();
 
-        if extension != "mp4" && extension != "webm" && extension != "mkv" && extension != "mov" {
+        if !matches!(
+            extension.as_str(),
+            "mp4" | "webm" | "mkv" | "mov" | "gif" | "jpg" | "jpeg" | "png" | "webp" | "bmp"
+        ) {
             return Err(LibraryError::UnsupportedFormat(extension));
         }
 

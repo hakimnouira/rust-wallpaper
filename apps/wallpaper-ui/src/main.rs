@@ -150,8 +150,8 @@ mod desktop {
         },
     }
 
-    const MAX_TEXTURE_CACHE_BYTES: usize = 64 * 1024 * 1024; // 64 MB
-    const TARGET_TEXTURE_CACHE_BYTES: usize = 48 * 1024 * 1024; // 48 MB low watermark
+    const MAX_TEXTURE_CACHE_BYTES: usize = 32 * 1024 * 1024; // 32 MB
+    const TARGET_TEXTURE_CACHE_BYTES: usize = 24 * 1024 * 1024; // 24 MB low watermark
 
     struct DesktopApp {
         snapshot: Arc<Mutex<Snapshot>>,
@@ -204,12 +204,12 @@ mod desktop {
         fn new(snapshot: Arc<Mutex<Snapshot>>, commands: mpsc::Sender<Command>) -> Self {
             let (download_tx, download_rx) = mpsc::channel();
 
-            // Asynchronous thumbnail decoding worker pool
-            let (thumb_req_tx, thumb_req_rx) = mpsc::sync_channel::<ThumbnailRequest>(128);
+            // A single decoder limits peak CPU and memory while browsing large libraries.
+            let (thumb_req_tx, thumb_req_rx) = mpsc::sync_channel::<ThumbnailRequest>(32);
             let (thumb_res_tx, thumb_res_rx) = mpsc::channel::<DecodedThumbnail>();
             let thumb_req_rx = Arc::new(Mutex::new(thumb_req_rx));
 
-            for i in 0..2 {
+            for i in 0..1 {
                 let req_rx = thumb_req_rx.clone();
                 let res_tx = thumb_res_tx.clone();
                 std::thread::Builder::new()
@@ -386,7 +386,7 @@ mod desktop {
 
             if !self.in_flight_thumbnails.contains(path)
                 && path.is_file()
-                && self.in_flight_thumbnails.len() < 32
+                && self.in_flight_thumbnails.len() < 8
                 && self
                     .thumb_req_tx
                     .try_send(ThumbnailRequest {
@@ -404,7 +404,8 @@ mod desktop {
 
     impl eframe::App for DesktopApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-            ctx.request_repaint_after(Duration::from_millis(100));
+            // Status is refreshed from IPC every two seconds; egui input events still repaint immediately.
+            ctx.request_repaint_after(Duration::from_secs(1));
 
             // Drain completed asynchronous thumbnail decodes and upload to GPU
             while let Ok(decoded) = self.thumb_res_rx.try_recv() {
@@ -741,12 +742,8 @@ mod desktop {
 
     fn configure_fonts(ctx: &egui::Context) {
         let mut fonts = egui::FontDefinitions::default();
-        let font_candidates = [
-            ("malgun", "C:\\Windows\\Fonts\\malgun.ttf"),
-            ("segoeui", "C:\\Windows\\Fonts\\segoeui.ttf"),
-            ("seguisym", "C:\\Windows\\Fonts\\seguisym.ttf"),
-            ("seguiemj", "C:\\Windows\\Fonts\\seguiemj.ttf"),
-        ];
+        // Egui's bundled fonts provide fallback glyphs; load only the primary Windows UI font.
+        let font_candidates = [("segoeui", "C:\\Windows\\Fonts\\segoeui.ttf")];
 
         for (name, path) in font_candidates {
             if let Ok(font_data) = std::fs::read(path) {

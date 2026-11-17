@@ -13,74 +13,15 @@ impl DesktopApp {
         }
 
         let url = raw_url;
-
-        // Determine filename & extension from URL
-        let parsed_filename = url
-            .split('?')
-            .next()
-            .and_then(|u| u.split('/').last())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("web_video.mp4");
-
-        let has_ext = parsed_filename.ends_with(".mp4")
-            || parsed_filename.ends_with(".webm")
-            || parsed_filename.ends_with(".mkv")
-            || parsed_filename.ends_with(".mov");
-
-        let clean_stem = if has_ext {
-            parsed_filename
-                .rsplit_once('.')
-                .map(|(s, _)| s)
-                .unwrap_or(parsed_filename)
-        } else {
-            parsed_filename
-        };
-
-        let ext = if has_ext {
-            parsed_filename
-                .rsplit_once('.')
-                .map(|(_, e)| e)
-                .unwrap_or("mp4")
-        } else {
-            "mp4"
-        };
-
-        // Sanitize filename
-        let safe_stem: String = clean_stem
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        let safe_name = if safe_stem.is_empty() {
-            "downloaded_wallpaper".to_string()
-        } else {
-            safe_stem
-        };
-
-        let local_app_data = std::env::var_os("LOCALAPPDATA").unwrap_or_default();
-        let downloads_dir = std::path::PathBuf::from(local_app_data)
-            .join("RustWallpaper")
-            .join("downloads");
-        let dest = downloads_dir.join(format!("{}.{}", safe_name, ext));
-
-        let title = safe_name.replace('_', " ");
         let id = format!("url-{}", uuid::Uuid::new_v4());
 
         if auto_apply {
-            self.pending_apply_source = Some(dest.to_string_lossy().to_string());
             self.pending_apply_download_id = Some(id.clone());
         }
 
-        self.direct_url_status = Some(format!("Downloading '{}'…", safe_name));
+        self.direct_url_status = Some("Connecting & resolving media…".into());
         self.direct_download_id = Some(id.clone());
         let tx = self.download_tx.clone();
-        let dest_clone = dest.clone();
-        let title_clone = title.clone();
         let id_clone = id.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         self.download_cancellations
@@ -89,13 +30,43 @@ impl DesktopApp {
         std::thread::spawn(move || {
             let _ = tx.send(DownloadMessage::Progress {
                 id: id_clone.clone(),
-                status: "Downloading video from URL…".into(),
+                status: "Resolving media from page…".into(),
+            });
+
+            let resolved = wallpaper_core::resolve_web_media_info(&url);
+            let media_url = resolved.media_url;
+            let display_title = resolved.title.unwrap_or_else(|| {
+                media_url
+                    .split('?')
+                    .next()
+                    .and_then(|u| u.split('/').filter(|s| !s.is_empty()).last())
+                    .map(|s| {
+                        s.rsplit_once('.')
+                            .map(|(base, _)| base)
+                            .unwrap_or(s)
+                            .replace('_', " ")
+                            .replace('-', " ")
+                    })
+                    .unwrap_or_else(|| "Web Wallpaper".into())
+            });
+
+            let local_app_data = std::env::var_os("LOCALAPPDATA").unwrap_or_default();
+            let downloads_dir = std::path::PathBuf::from(local_app_data)
+                .join("RustWallpaper")
+                .join("downloads");
+            let _ = std::fs::create_dir_all(&downloads_dir);
+
+            let temp_dest = downloads_dir.join(format!("{id_clone}.download"));
+
+            let _ = tx.send(DownloadMessage::Progress {
+                id: id_clone.clone(),
+                status: format!("Downloading '{display_title}'…"),
             });
 
             let mut last_reported = 0u64;
             match wallpaper_core::download_online_file_cancellable(
-                &url,
-                &dest_clone,
+                &media_url,
+                &temp_dest,
                 &cancelled,
                 2 * 1024 * 1024 * 1024,
                 |received, total| {
@@ -115,13 +86,20 @@ impl DesktopApp {
                 },
             ) {
                 Ok(_) => {
+                    let detected_ext =
+                        wallpaper_core::detect_media_extension_from_magic_bytes(&temp_dest)
+                            .unwrap_or("mp4");
+                    let final_dest = downloads_dir.join(format!("{id_clone}.{detected_ext}"));
+                    let _ = std::fs::rename(&temp_dest, &final_dest);
+
                     let _ = tx.send(DownloadMessage::Complete {
                         id: id_clone,
-                        path: dest_clone,
-                        title: title_clone,
+                        path: final_dest,
+                        title: display_title,
                     });
                 }
                 Err(e) => {
+                    let _ = std::fs::remove_file(&temp_dest);
                     let _ = tx.send(DownloadMessage::Failed {
                         id: id_clone,
                         error: e.to_string(),
@@ -130,6 +108,7 @@ impl DesktopApp {
             }
         });
     }
+
     pub(super) fn start_curated_download(
         &mut self,
         item: wallpaper_core::OnlineWallpaper,
@@ -182,17 +161,11 @@ impl DesktopApp {
                 },
             );
             match result {
-                Ok(_) if item.is_video => {
+                Ok(_) => {
                     let _ = tx.send(DownloadMessage::Complete {
                         id: item.id,
                         path: destination,
                         title: item.title,
-                    });
-                }
-                Ok(_) => {
-                    let _ = tx.send(DownloadMessage::Failed {
-                        id: item.id,
-                        error: "Static images cannot be imported into video engine".into(),
                     });
                 }
                 Err(error) => {
@@ -217,6 +190,7 @@ impl DesktopApp {
                         self.direct_download_id = None;
                     }
                     if self.pending_apply_download_id.as_deref() == Some(id.as_str()) {
+                        self.pending_apply_source = Some(path.to_string_lossy().to_string());
                         self.pending_apply_download_id = None;
                     }
                     self.online_download_status

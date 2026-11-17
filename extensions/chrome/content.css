@@ -69,3 +69,47 @@
   color: #ffffff !important;
   box-shadow: 0 4px 14px rgba(239, 68, 68, 0.4) !important;
 }
+
+/* Steam Workshop Native-Style Button */
+.rust-wp-steam-action-btn {
+  display: inline-flex !important;
+  align-items: center !important;
+  gap: 8px !important;
+  margin-left: 10px !important;
+  background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%) !important;
+  border-radius: 3px !important;
+  padding: 0 15px !important;
+  height: 32px !important;
+  line-height: 32px !important;
+  color: #ffffff !important;
+  font-weight: bold !important;
+  font-size: 13px !important;
+  cursor: pointer !important;
+  text-decoration: none !important;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.4) !important;
+  border: 1px solid rgba(255, 255, 255, 0.2) !important;
+  transition: transform 0.15s ease, background 0.15s ease !important;
+}
+
+.rust-wp-steam-action-btn:hover {
+  background: linear-gradient(135deg, #3b82f6 0%, #2563eb 100%) !important;
+  transform: translateY(-1px) !important;
+  color: #ffffff !important;
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.5) !important;
+}
+
+.rust-wp-steam-action-btn.success {
+  background: linear-gradient(135deg, #10b981 0%, #059669 100%) !important;
+}
+
+.rust-wp-steam-action-btn.error {
+  background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%) !important;
+}
+
+/* Workshop Grid Card Overlay */
+.workshopItem.rust-wallpaper-wrapper-relative:hover .rust-wallpaper-overlay-btn,
+.workshop_showcase.rust-wallpaper-wrapper-relative:hover .rust-wallpaper-overlay-btn {
+  opacity: 1 !important;
+  pointer-events: auto !important;
+  transform: translateY(0) scale(1) !important;
+}

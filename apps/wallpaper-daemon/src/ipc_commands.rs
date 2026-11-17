@@ -178,24 +178,25 @@ pub(super) fn dispatch_ipc(
             }
             let mut play_config = wallpaper.config.clone();
             if play_config.target_fps.is_none() {
-                if let Ok(Some(fps_str)) = library.get_setting("target_fps") {
-                    if !fps_str.is_empty() {
-                        play_config.target_fps = fps_str.parse().ok();
-                    }
-                }
+                play_config.target_fps = match library.get_setting("target_fps") {
+                    Ok(Some(value)) if value.is_empty() => None,
+                    Ok(Some(value)) => value.parse().ok(),
+                    _ => Some(30),
+                };
             }
             if play_config.ram_budget_mb.is_none() {
-                if let Ok(Some(ram_str)) = library.get_setting("ram_budget_mb") {
-                    if !ram_str.is_empty() {
-                        play_config.ram_budget_mb = ram_str.parse().ok();
-                    }
-                }
+                play_config.ram_budget_mb = match library.get_setting("ram_budget_mb") {
+                    Ok(Some(value)) if value.is_empty() => None,
+                    Ok(Some(value)) => value.parse().ok(),
+                    _ => Some(64),
+                };
             }
-            if let Ok(Some(q_str)) = library.get_setting("quality") {
-                if let Some(q) = wallpaper_core::VideoQuality::parse(&q_str) {
-                    play_config.quality = q;
-                }
-            }
+            play_config.quality = library
+                .get_setting("quality")
+                .ok()
+                .flatten()
+                .and_then(|value| wallpaper_core::VideoQuality::parse(&value))
+                .unwrap_or(wallpaper_core::VideoQuality::Fast);
             let assignment = Assignment {
                 video_path: PathBuf::from(&wallpaper.metadata.source),
                 config: play_config,
@@ -377,18 +378,16 @@ pub(super) fn dispatch_ipc(
             Response::Accepted
         }
         Command::GetPerformanceSettings => {
-            let target_fps = library
-                .get_setting("target_fps")
-                .ok()
-                .flatten()
-                .filter(|s| !s.is_empty())
-                .and_then(|s| s.parse().ok());
-            let ram_budget_mb = library
-                .get_setting("ram_budget_mb")
-                .ok()
-                .flatten()
-                .filter(|s| !s.is_empty())
-                .and_then(|s| s.parse().ok());
+            let target_fps = match library.get_setting("target_fps") {
+                Ok(Some(value)) if value.is_empty() => None,
+                Ok(Some(value)) => value.parse().ok(),
+                _ => Some(30),
+            };
+            let ram_budget_mb = match library.get_setting("ram_budget_mb") {
+                Ok(Some(value)) if value.is_empty() => None,
+                Ok(Some(value)) => value.parse().ok(),
+                _ => Some(64),
+            };
             let quality = library
                 .get_setting("quality")
                 .ok()

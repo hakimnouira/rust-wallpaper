@@ -496,6 +496,7 @@ impl MpvPlayer {
             "--hwdec-codecs=all".to_string(),
             "--hwdec-software-fallback=yes".to_string(),
             format!("--loop-file={}", loop_arg),
+            "--image-display-duration=inf".to_string(),
             format!("--volume={}", launch_cfg.config.volume),
             "--idle=yes".to_string(),
             "--force-window=yes".to_string(),

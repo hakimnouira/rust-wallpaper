@@ -196,13 +196,44 @@ pub fn extract_video_metadata_and_thumbnail(
     let ffmpeg_bin = find_ffmpeg_executable();
     let mpv_bin = wallpaper_windows::find_mpv_executable().ok();
 
-    if let Some(ref ffmpeg) = ffmpeg_bin {
+    let ext = source_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let is_image = matches!(
+        ext.as_str(),
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp"
+    );
+
+    let result = if let Some(ref ffmpeg) = ffmpeg_bin {
         extract_via_ffmpeg(ffmpeg, source_path, thumbnail_path, file_size, source_mtime)
     } else if let Some(ref mpv) = mpv_bin {
         extract_via_mpv(mpv, source_path, thumbnail_path, file_size, source_mtime)
     } else {
         Err("Neither ffmpeg nor mpv executable found on system".into())
+    };
+
+    if result.is_err() && is_image {
+        // Fallback for static image / GIF files if ffmpeg/mpv extraction fails or isn't installed
+        if !thumbnail_path.exists() {
+            let _ = std::fs::copy(source_path, thumbnail_path);
+        }
+        return Ok(ExtractedMetadata {
+            duration_secs: None,
+            width: None,
+            height: None,
+            aspect_ratio: None,
+            fps: None,
+            codec: Some(ext),
+            resolution_category: None,
+            thumbnail_path: thumbnail_path.to_string_lossy().to_string(),
+            file_size: Some(file_size),
+            source_mtime,
+        });
     }
+
+    result
 }
 
 fn extract_via_ffmpeg(

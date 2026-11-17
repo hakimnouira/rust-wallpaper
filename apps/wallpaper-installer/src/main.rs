@@ -11,6 +11,7 @@ enum InstallStep {
     Options,
     Installing,
     Finished,
+    Failed,
 }
 
 struct InstallerApp {
@@ -133,71 +134,94 @@ fn register_uninstaller(install_dir: &Path, version: &str) -> Result<(), String>
                 hkey: windows::Win32::System::Registry::HKEY,
                 name: &str,
                 value: &str,
-            ) {
+            ) -> Result<(), String> {
                 let name_h = HSTRING::from(name);
                 let val_wide: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
                 let bytes =
                     std::slice::from_raw_parts(val_wide.as_ptr() as *const u8, val_wide.len() * 2);
-                let _ = RegSetValueExW(
+                let status = RegSetValueExW(
                     hkey,
                     windows::core::PCWSTR(name_h.as_ptr()),
                     0,
                     REG_SZ,
                     Some(bytes),
                 );
+                if status.0 == 0 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Failed to write uninstall registry value '{name}': Windows error {}",
+                        status.0
+                    ))
+                }
             }
 
             let exe_path = install_dir.join("RustWallpaper.exe");
             let uninstaller_path = install_dir.join("uninstall.exe");
 
-            set_sz(hkey, "DisplayName", "Rust Wallpaper");
-            set_sz(hkey, "DisplayVersion", version);
-            set_sz(hkey, "Publisher", "Rust Wallpaper");
-            set_sz(hkey, "InstallLocation", &install_dir.to_string_lossy());
-            set_sz(
-                hkey,
-                "DisplayIcon",
-                &format!("{},0", exe_path.to_string_lossy()),
-            );
-            set_sz(
-                hkey,
-                "UninstallString",
-                &format!("\"{}\"", uninstaller_path.to_string_lossy()),
-            );
-            set_sz(
-                hkey,
-                "QuietUninstallString",
-                &format!("\"{}\" /S", uninstaller_path.to_string_lossy()),
-            );
-
+            let values = [
+                ("DisplayName", "Rust Wallpaper".to_string()),
+                ("DisplayVersion", version.to_string()),
+                ("Publisher", "Rust Wallpaper".to_string()),
+                (
+                    "InstallLocation",
+                    install_dir.to_string_lossy().into_owned(),
+                ),
+                ("DisplayIcon", format!("{},0", exe_path.to_string_lossy())),
+                (
+                    "UninstallString",
+                    format!("\"{}\"", uninstaller_path.to_string_lossy()),
+                ),
+                (
+                    "QuietUninstallString",
+                    format!("\"{}\" /S", uninstaller_path.to_string_lossy()),
+                ),
+            ];
+            let write_result = values
+                .iter()
+                .try_for_each(|(name, value)| set_sz(hkey, name, value));
             let _ = windows::Win32::System::Registry::RegCloseKey(hkey);
+            write_result?;
         }
     }
     Ok(())
 }
 
-fn find_file_candidate(names: &[&str]) -> Option<PathBuf> {
-    // 1. Next to current installer exe
+fn candidate_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            for name in names {
-                let candidate = parent.join(name);
-                if candidate.is_file() {
-                    return Some(candidate);
-                }
-            }
+            roots.push(parent.to_path_buf());
         }
     }
-    // 2. target/release and target/debug relative to current working dir
-    for dir in ["target/release", "target/debug", "dist", "."] {
-        for name in names {
-            let candidate = PathBuf::from(dir).join(name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.extend([
+            cwd.clone(),
+            cwd.join("dist"),
+            cwd.join("target/release"),
+            cwd.join("target/debug"),
+        ]);
     }
-    None
+    roots
+}
+
+fn find_file_candidate(names: &[&str]) -> Option<PathBuf> {
+    candidate_roots()
+        .into_iter()
+        .flat_map(|root| names.iter().map(move |name| root.join(name)))
+        .find(|candidate| candidate.is_file())
+}
+
+fn copy_required(source: &Path, destination: &Path, description: &str) -> Result<(), String> {
+    std::fs::copy(source, destination)
+        .map(|_| ())
+        .map_err(|error| {
+            format!(
+                "Failed to install {description} from '{}' to '{}': {error}",
+                source.display(),
+                destination.display()
+            )
+        })
 }
 
 fn execute_installation(
@@ -233,48 +257,71 @@ fn execute_installation(
 
     // Also copy alias wallpaper-ui.exe if needed
     let dest_ui_alias = target_dir.join("wallpaper-ui.exe");
-    let _ = std::fs::copy(&main_exe, &dest_ui_alias);
+    copy_required(&main_exe, &dest_ui_alias, "UI executable alias")?;
 
-    // 2. Copy wallpaper-daemon.exe if available
+    // 2. The installed UI starts this companion daemon beside itself.
     let _ = tx.send((0.40, "Installing daemon companion binary…".into()));
-    if let Some(daemon_exe) = find_file_candidate(&["wallpaper-daemon.exe"]) {
-        let _ = std::fs::copy(&daemon_exe, target_dir.join("wallpaper-daemon.exe"));
-    }
+    let daemon_exe = find_file_candidate(&["wallpaper-daemon.exe"])
+        .ok_or_else(|| "Release package is missing wallpaper-daemon.exe".to_string())?;
+    copy_required(
+        &daemon_exe,
+        &target_dir.join("wallpaper-daemon.exe"),
+        "wallpaper daemon",
+    )?;
 
-    // 3. Copy or generate uninstall.exe
+    // 3. The uninstaller is required for a complete Windows installation.
     let _ = tx.send((0.55, "Installing uninstaller…".into()));
-    if let Some(uninstaller_exe) = find_file_candidate(&["uninstall.exe"]) {
-        let _ = std::fs::copy(&uninstaller_exe, target_dir.join("uninstall.exe"));
+    let uninstaller_exe = find_file_candidate(&["uninstall.exe"])
+        .ok_or_else(|| "Release package is missing uninstall.exe".to_string())?;
+    copy_required(
+        &uninstaller_exe,
+        &target_dir.join("uninstall.exe"),
+        "uninstaller",
+    )?;
+
+    // 4. Copy packaged branding and demo wallpapers.
+    let _ = tx.send((0.65, "Installing application assets…".into()));
+    for asset in [
+        "assets/icon.ico",
+        "assets/icon.png",
+        "assets/wallpapers/sample-nature.mp4",
+        "assets/wallpapers/sample-abstract.webm",
+    ] {
+        if let Some(source) = find_file_candidate(&[asset]) {
+            let destination = target_dir.join(asset);
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|error| format!("Failed to create asset directory: {error}"))?;
+            }
+            copy_required(&source, &destination, asset)?;
+        } else if asset.contains("wallpapers/") {
+            return Err(format!(
+                "Release package is missing required asset '{asset}'"
+            ));
+        }
     }
 
-    // 4. Copy assets icon
-    let _ = tx.send((0.65, "Installing application icons and branding…".into()));
-    if let Some(icon) = find_file_candidate(&["assets/icon.ico", "icon.ico"]) {
-        let _ = std::fs::copy(&icon, assets_dir.join("icon.ico"));
-    }
-    if let Some(icon_png) = find_file_candidate(&["assets/icon.png", "icon.png"]) {
-        let _ = std::fs::copy(&icon_png, assets_dir.join("icon.png"));
-    }
-
-    // 5. Copy MPV and FFmpeg video playback components
+    // 5. Find and install the bundled MPV runtime, independent of the launch working directory.
     let _ = tx.send((
         0.75,
         "Configuring hardware-accelerated video engine (MPV)…".into(),
     ));
-    let mpv_source_dirs = [
-        PathBuf::from("bin").join("mpv"),
-        std::env::var("USERPROFILE")
-            .map(|u| PathBuf::from(u).join(".mpv"))
-            .unwrap_or_default(),
-    ];
-
-    for src_dir in &mpv_source_dirs {
-        if src_dir.is_dir() {
-            for binary_name in ["mpv.exe", "ffmpeg.exe", "d3dcompiler_43.dll"] {
-                let src_file = src_dir.join(binary_name);
-                if src_file.is_file() {
-                    let _ = std::fs::copy(&src_file, mpv_dir.join(binary_name));
-                }
+    let mpv_exe = find_file_candidate(&["bin/mpv/mpv.exe", "mpv.exe"])
+        .or_else(|| {
+            std::env::var("USERPROFILE")
+                .ok()
+                .map(|profile| PathBuf::from(profile).join(".mpv/mpv.exe"))
+                .filter(|path| path.is_file())
+        })
+        .ok_or_else(|| {
+            "MPV is missing. Re-download the complete Rust Wallpaper release package.".to_string()
+        })?;
+    copy_required(&mpv_exe, &mpv_dir.join("mpv.exe"), "MPV player")?;
+    if let Some(mpv_parent) = mpv_exe.parent() {
+        for binary_name in ["ffmpeg.exe", "d3dcompiler_43.dll"] {
+            let source = mpv_parent.join(binary_name);
+            if source.is_file() {
+                copy_required(&source, &mpv_dir.join(binary_name), binary_name)?;
             }
         }
     }
@@ -289,37 +336,41 @@ fn execute_installation(
     };
 
     if create_desktop {
-        if let Ok(userprofile) = std::env::var("USERPROFILE") {
-            let desktop_shortcut = PathBuf::from(userprofile)
-                .join("Desktop")
-                .join("Rust Wallpaper.lnk");
-            let _ = create_shortcut(&dest_main_exe, &desktop_shortcut, icon_opt, &target_dir);
-        }
+        let userprofile = std::env::var("USERPROFILE")
+            .map_err(|_| "USERPROFILE is not set; cannot create Desktop shortcut".to_string())?;
+        let desktop_shortcut = PathBuf::from(userprofile)
+            .join("Desktop")
+            .join("Rust Wallpaper.lnk");
+        create_shortcut(&dest_main_exe, &desktop_shortcut, icon_opt, &target_dir)?;
     }
 
     if create_start_menu {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            let start_menu_shortcut = PathBuf::from(appdata)
-                .join("Microsoft")
-                .join("Windows")
-                .join("Start Menu")
-                .join("Programs")
-                .join("Rust Wallpaper.lnk");
-            let _ = create_shortcut(&dest_main_exe, &start_menu_shortcut, icon_opt, &target_dir);
-        }
+        let appdata = std::env::var("APPDATA")
+            .map_err(|_| "APPDATA is not set; cannot create Start Menu shortcut".to_string())?;
+        let start_menu_shortcut = PathBuf::from(appdata)
+            .join("Microsoft")
+            .join("Windows")
+            .join("Start Menu")
+            .join("Programs")
+            .join("Rust Wallpaper.lnk");
+        create_shortcut(&dest_main_exe, &start_menu_shortcut, icon_opt, &target_dir)?;
     }
 
     // 7. Register Uninstaller in Windows Add/Remove Programs
     let _ = tx.send((0.92, "Registering application in Windows settings…".into()));
-    let _ = register_uninstaller(&target_dir, "0.1.0");
+    register_uninstaller(&target_dir, env!("CARGO_PKG_VERSION"))?;
 
     // 8. Register autostart if requested
-    if start_on_boot {
-        let _ = tx.send((0.96, "Enabling Windows startup launch…".into()));
-        #[cfg(windows)]
-        {
-            let _ = wallpaper_windows::set_autostart(true);
-        }
+    #[cfg(windows)]
+    {
+        let status = if start_on_boot {
+            "Enabling Windows startup launch…"
+        } else {
+            "Disabling Windows startup launch…"
+        };
+        let _ = tx.send((0.96, status.into()));
+        wallpaper_windows::set_autostart(start_on_boot)
+            .map_err(|error| format!("Could not update Windows startup setting: {error}"))?;
     }
 
     // 9. Browser Extension Integration (Chrome, Edge, Brave)
@@ -329,26 +380,21 @@ fn execute_installation(
             "Configuring browser live wallpaper companion (Chrome, Edge, Brave)…".into(),
         ));
         let ext_dir = target_dir.join("extension");
-        let _ = std::fs::create_dir_all(&ext_dir);
+        std::fs::create_dir_all(&ext_dir)
+            .map_err(|error| format!("Could not create browser extension directory: {error}"))?;
 
-        // Copy chrome.crx if found
-        if let Some(crx_candidate) = find_file_candidate(&[
+        let crx_candidate = find_file_candidate(&[
             "extension/chrome.crx",
             "chrome.crx",
             "RustWallpaper-Extension.crx",
-            "extensions/chrome.crx",
-            "dist/extension/chrome.crx",
-        ]) {
-            let _ = std::fs::copy(&crx_candidate, ext_dir.join("chrome.crx"));
-        }
-
-        // Register in Windows Registry
+        ])
+        .ok_or_else(|| {
+            "Release package is missing the signed browser extension package".to_string()
+        })?;
         let target_crx = ext_dir.join("chrome.crx");
-        let _ = wallpaper_windows::register_browser_extension(if target_crx.is_file() {
-            Some(&target_crx)
-        } else {
-            None
-        });
+        copy_required(&crx_candidate, &target_crx, "browser extension")?;
+        wallpaper_windows::register_browser_extension(Some(&target_crx))
+            .map_err(|error| format!("Could not register the browser extension: {error}"))?;
     }
 
     let _ = tx.send((1.0, "Installation complete!".into()));
@@ -363,8 +409,11 @@ impl eframe::App for InstallerApp {
         if let Some(ref rx) = self.progress_rx {
             while let Ok((pct, status)) = rx.try_recv() {
                 self.progress_pct = pct;
+                let failed = status.starts_with("ERROR:");
                 self.progress_status = status;
-                if pct >= 1.0 {
+                if failed {
+                    self.step = InstallStep::Failed;
+                } else if pct >= 1.0 {
                     self.step = InstallStep::Finished;
                 }
             }
@@ -383,7 +432,7 @@ impl eframe::App for InstallerApp {
                         );
                         ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new("Version 0.1.0 (Production Release)")
+                            egui::RichText::new(format!("Version {} (Release Candidate)", env!("CARGO_PKG_VERSION")))
                                 .color(egui::Color32::from_rgb(100, 200, 255)),
                         );
                         ui.add_space(16.0);
@@ -489,7 +538,7 @@ impl eframe::App for InstallerApp {
                                     ) {
                                         Ok(_) => {}
                                         Err(e) => {
-                                            let _ = tx.send((1.0, format!("ERROR: {e}")));
+                                            let _ = tx.send((0.99, format!("ERROR: {e}")));
                                         }
                                     }
                                 });
@@ -519,6 +568,26 @@ impl eframe::App for InstallerApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     }
+                }
+
+                InstallStep::Failed => {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(20.0);
+                        ui.heading(
+                            egui::RichText::new("Installation failed")
+                                .color(egui::Color32::LIGHT_RED)
+                                .size(22.0)
+                                .strong(),
+                        );
+                    });
+                    ui.add_space(16.0);
+                    ui.colored_label(egui::Color32::LIGHT_RED, &self.progress_status);
+                    ui.label("One or more required installation steps did not complete.");
+                    ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
+                        if ui.button("Close").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
                 }
 
                 InstallStep::Finished => {
@@ -567,7 +636,9 @@ impl eframe::App for InstallerApp {
                                 if self.launch_on_finish {
                                     let target_exe =
                                         PathBuf::from(&self.install_dir).join("RustWallpaper.exe");
-                                    let _ = std::process::Command::new(target_exe).spawn();
+                                    if let Err(error) = std::process::Command::new(target_exe).spawn() {
+                                        self.progress_status = format!("Installed, but could not launch the app: {error}");
+                                    }
                                 }
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             }
