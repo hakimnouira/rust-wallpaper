@@ -7,6 +7,44 @@
   const BADGE_CLASS = "rust-wallpaper-overlay-btn";
   const CONTAINER_CLASS = "rust-wallpaper-wrapper-relative";
 
+  function extractBestVideoUrl(video) {
+    let direct = video.currentSrc || video.src || (video.querySelector("source")?.src);
+    if (direct && !direct.startsWith("blob:") && (direct.includes(".mp4") || direct.includes(".webm") || direct.includes("cdn.pixabay.com"))) {
+      return direct;
+    }
+
+    // Try schema.org JSON-LD (Pixabay and other rich media video sites)
+    try {
+      const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+      for (const script of scripts) {
+        const text = script.textContent || "";
+        if (text.includes("contentUrl")) {
+          const data = JSON.parse(text);
+          if (data.contentUrl) return data.contentUrl;
+          if (Array.isArray(data["@graph"])) {
+            for (const item of data["@graph"]) {
+              if (item.contentUrl) return item.contentUrl;
+            }
+          }
+        }
+      }
+    } catch (_) {}
+
+    // Try OpenGraph / Twitter meta video tags
+    const ogVideo = document.querySelector('meta[property="og:video"], meta[property="og:video:secure_url"], meta[name="twitter:player:stream"]');
+    if (ogVideo && ogVideo.content && !ogVideo.content.startsWith("blob:")) {
+      return ogVideo.content;
+    }
+
+    // Return direct if available (non-blob)
+    if (direct && !direct.startsWith("blob:")) {
+      return direct;
+    }
+
+    // Fall back to current page URL (RustWallpaper daemon will resolve it automatically)
+    return window.location.href;
+  }
+
   function attachBadgeToVideo(video) {
     if (video.dataset.rustWallpaperAttached) return;
     video.dataset.rustWallpaperAttached = "true";
@@ -38,7 +76,7 @@
       e.stopPropagation();
       e.preventDefault();
 
-      const mediaUrl = video.currentSrc || video.src || (video.querySelector("source")?.src);
+      const mediaUrl = extractBestVideoUrl(video);
       if (!mediaUrl) {
         showStatus(btn, "No URL", false);
         return;

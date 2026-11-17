@@ -53,6 +53,16 @@ document.addEventListener("DOMContentLoaded", async () => {
     chrome.storage.local.set({ targetMonitor: monitorSelect.value });
   });
 
+  // Auto-detect active tab video/page URL
+  try {
+    const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (activeTab && activeTab.url && (activeTab.url.startsWith("http://") || activeTab.url.startsWith("https://"))) {
+      if (activeTab.url.includes("/videos/") || activeTab.url.includes(".mp4") || activeTab.url.includes(".webm")) {
+        urlInput.value = activeTab.url;
+      }
+    }
+  } catch (_) {}
+
   // Apply button listener
   applyBtn.addEventListener("click", async () => {
     const url = urlInput.value.trim();
