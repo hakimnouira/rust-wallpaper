@@ -4,3 +4,6 @@
 .env
 .vscode/
 .idea/
+
+# Browser extension signing key (private)
+/extensions/chrome.pem

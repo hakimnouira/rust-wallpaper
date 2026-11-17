@@ -232,8 +232,8 @@ async fn handle_wallpaper(
         }
     };
 
-    let url = req.url.trim().to_string();
-    if !url.starts_with("http://") && !url.starts_with("https://") {
+    let raw_url = req.url.trim().to_string();
+    if !raw_url.starts_with("http://") && !raw_url.starts_with("https://") {
         let json = serde_json::json!({
             "error": "Bad Request",
             "message": "URL must begin with http:// or https://"
@@ -241,6 +241,8 @@ async fn handle_wallpaper(
         send_json_response(stream, 400, "Bad Request", &json).await?;
         return Ok(());
     }
+
+    let url = wallpaper_core::resolve_direct_video_url(&raw_url);
 
     // Determine filename
     let parsed_filename = url
@@ -506,7 +508,7 @@ async fn handle_extension_crx_download(
         }
     };
 
-    let bytes = match std::fs::read(&crx_path) {
+    let bytes = match tokio::fs::read(&crx_path).await {
         Ok(b) => b,
         Err(e) => {
             let json = serde_json::json!({

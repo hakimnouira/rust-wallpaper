@@ -1,4 +1,4 @@
-﻿# Production build and packaging script for Rust Wallpaper
+# Production build and packaging script for Rust Wallpaper
 $ErrorActionPreference = "Stop"
 
 Write-Host "==========================================================" -ForegroundColor Cyan

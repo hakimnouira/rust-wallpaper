@@ -340,7 +340,7 @@ mod tests {
 
         let start = Instant::now();
         let mut failed = false;
-        while start.elapsed() < Duration::from_secs(5) {
+        while start.elapsed() < Duration::from_secs(15) {
             if let Ok(Some(item)) = library.get(wp.id) {
                 if item.metadata.processing_state == ProcessingStatus::Failed {
                     assert!(item.metadata.processing_error.is_some());

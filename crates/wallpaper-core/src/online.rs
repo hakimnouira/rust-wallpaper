@@ -195,6 +195,145 @@ pub fn get_curated_video_wallpapers() -> Vec<OnlineWallpaper> {
     ]
 }
 
+fn fetch_html_content(url: &str) -> Option<String> {
+    // 1. First attempt with ureq
+    let agent = ureq::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .redirects(5)
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .build();
+
+    let response = agent
+        .get(url)
+        .set(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        )
+        .set("Accept-Language", "en-US,en;q=0.9")
+        .call()
+        .ok()?;
+
+    const MAX_HTML_BYTES: u64 = 2 * 1024 * 1024;
+    if response
+        .header("Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > MAX_HTML_BYTES)
+    {
+        return None;
+    }
+
+    let mut html = Vec::new();
+    response
+        .into_reader()
+        .take(MAX_HTML_BYTES + 1)
+        .read_to_end(&mut html)
+        .ok()?;
+    if html.len() as u64 > MAX_HTML_BYTES {
+        return None;
+    }
+    String::from_utf8(html).ok()
+}
+
+/// Resolves a video webpage URL (such as Pixabay, Pexels, or open media pages)
+/// into a direct playable/downloadable media stream URL (e.g. .mp4 or .webm).
+pub fn resolve_direct_video_url(url: &str) -> String {
+    let trimmed = url.trim();
+    let lower = trimmed.to_lowercase();
+
+    // If it's already a direct video or audio/image link, return as-is
+    if lower.ends_with(".mp4")
+        || lower.ends_with(".webm")
+        || lower.ends_with(".mkv")
+        || lower.ends_with(".mov")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.contains(".mp4?")
+        || lower.contains(".webm?")
+    {
+        return trimmed.to_string();
+    }
+
+    let Some(html) = fetch_html_content(trimmed) else {
+        return trimmed.to_string();
+    };
+
+    // 1. Look for schema.org JSON-LD contentUrl (used by Pixabay, Schema.org video tags)
+    // Matches "contentUrl":"https://cdn.pixabay.com/video/...mp4"
+    if let Some(pos) = html.find("\"contentUrl\"") {
+        let slice = &html[pos..];
+        if let Some(quote_start) = slice.find("http") {
+            let after_http = &slice[quote_start..];
+            if let Some(quote_end) = after_http.find('"') {
+                let candidate = &after_http[..quote_end];
+                if candidate.contains(".mp4") || candidate.contains(".webm") {
+                    return candidate.replace(r"\/", "/");
+                }
+            }
+        }
+    }
+
+    // 2. Look for OpenGraph og:video or og:video:secure_url
+    for marker in [
+        "property=\"og:video\"",
+        "property=\"og:video:secure_url\"",
+        "property=\"og:video:url\"",
+        "name=\"twitter:player:stream\"",
+    ] {
+        if let Some(pos) = html.find(marker) {
+            let start = if pos > 100 { pos - 100 } else { 0 };
+            let end = (pos + 250).min(html.len());
+            let context = &html[start..end];
+            if let Some(c_pos) = context.find("content=\"http") {
+                let after = &context[c_pos + 9..];
+                if let Some(end_quote) = after.find('"') {
+                    let candidate = &after[..end_quote];
+                    if candidate.contains(".mp4") || candidate.contains(".webm") {
+                        return candidate.replace(r"\/", "/");
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Look for Pixabay CDN video pattern (e.g. https://cdn.pixabay.com/video/2021/04/15/71122-537102350_large.mp4)
+    if let Some(pos) = html.find("https://cdn.pixabay.com/video/") {
+        let slice = &html[pos..];
+        if let Some(end_pos) = slice.find(".mp4") {
+            let candidate = &slice[..end_pos + 4];
+            if !candidate.contains(' ')
+                && !candidate.contains('<')
+                && !candidate.contains('"')
+                && !candidate.contains('\'')
+            {
+                return candidate.to_string();
+            }
+        }
+    }
+
+    // 4. Look for HTML5 <source src="...mp4"> or <video src="...mp4">
+    for src_marker in ["<source", "<video"] {
+        let mut cur = &html[..];
+        while let Some(pos) = cur.find(src_marker) {
+            cur = &cur[pos + src_marker.len()..];
+            let tag_end = cur.find('>').unwrap_or(cur.len());
+            let tag_content = &cur[..tag_end];
+            if let Some(s_pos) = tag_content.find("src=\"http") {
+                let after = &tag_content[s_pos + 5..];
+                if let Some(q_end) = after.find('"') {
+                    let candidate = &after[..q_end];
+                    if candidate.contains(".mp4") || candidate.contains(".webm") {
+                        return candidate.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
 /// Downloads a remote file into a sibling temporary file before publishing it.
 ///
 /// The legacy convenience API remains uncancellable and allows up to 2 GiB. UI download
@@ -229,13 +368,18 @@ where
         if cancelled.load(Ordering::Relaxed) {
             return Err(OnlineError::Cancelled);
         }
+        let target_url = resolve_direct_video_url(url);
         let agent = ureq::builder()
             .timeout(std::time::Duration::from_secs(60))
             .redirects(5)
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
             .build();
-        let response = agent
-            .get(url)
+        let mut req = agent.get(&target_url);
+        req = req
+            .set("Accept", "*/*")
+            .set("Accept-Language", "en-US,en;q=0.9")
+            .set("Referer", url);
+        let response = req
             .call()
             .map_err(|e| OnlineError::Network(e.to_string()))?;
         let total = response
@@ -352,6 +496,33 @@ fn urlencoding(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_resolve_video_page_from_metadata() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let body = r#"<html><script>{"contentUrl":"https://cdn.example.test/video/sample.mp4"}</script></html>"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let resolved = resolve_direct_video_url(&format!("http://{address}/video-page"));
+        server.join().unwrap();
+        assert_eq!(resolved, "https://cdn.example.test/video/sample.mp4");
+    }
 
     #[test]
     fn test_curated_video_wallpapers() {

@@ -2,15 +2,17 @@ use super::*;
 
 impl DesktopApp {
     pub(super) fn start_direct_url_download(&mut self, auto_apply: bool) {
-        let url = self.direct_url_input.trim().to_string();
-        if url.is_empty() {
+        let raw_url = self.direct_url_input.trim().to_string();
+        if raw_url.is_empty() {
             return;
         }
-        if !url.starts_with("http://") && !url.starts_with("https://") {
+        if !raw_url.starts_with("http://") && !raw_url.starts_with("https://") {
             self.direct_url_status =
                 Some("Error: URL must start with http:// or https://".to_string());
             return;
         }
+
+        let url = wallpaper_core::resolve_direct_video_url(&raw_url);
 
         // Determine filename & extension from URL
         let parsed_filename = url
