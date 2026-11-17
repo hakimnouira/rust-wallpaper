@@ -12,6 +12,8 @@ use wallpaper_protocol::{
     ErrorCode, ProtocolError, RequestEnvelope, ResponseEnvelope, MAX_FRAME_BYTES,
 };
 
+use crate::ipc_security::{validate_pipe_client, CurrentUserPipeSecurity};
+
 pub const PIPE_NAME: &str = r"\\.\pipe\rust-wallpaper-ipc";
 const REQUEST_QUEUE_CAPACITY: usize = 64;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -21,10 +23,11 @@ pub struct PendingRequest {
     pub reply: oneshot::Sender<ResponseEnvelope>,
 }
 
-/// Starts the named-pipe listener and returns the bounded queue consumed by the
+/// Starts the named-pipe listener and returns the sender and bounded queue consumed by the
 /// daemon's main thread. The listener reconnects after transient pipe errors.
-pub fn start() -> Receiver<PendingRequest> {
+pub fn start() -> (SyncSender<PendingRequest>, Receiver<PendingRequest>) {
     let (tx, rx) = mpsc::sync_channel(REQUEST_QUEUE_CAPACITY);
+    let tx_clone = tx.clone();
     std::thread::Builder::new()
         .name("wallpaper-ipc-server".into())
         .spawn(move || {
@@ -38,10 +41,10 @@ pub fn start() -> Receiver<PendingRequest> {
                     return;
                 }
             };
-            runtime.block_on(listener_loop(tx));
+            runtime.block_on(listener_loop(tx_clone));
         })
         .expect("failed to start IPC server thread");
-    rx
+    (tx, rx)
 }
 
 async fn listener_loop(tx: SyncSender<PendingRequest>) {
@@ -51,7 +54,17 @@ async fn listener_loop(tx: SyncSender<PendingRequest>) {
         options.first_pipe_instance(first_instance);
         options.max_instances(16);
         options.reject_remote_clients(true);
-        let server = match options.create(PIPE_NAME) {
+        let security = match CurrentUserPipeSecurity::new() {
+            Ok(security) => security,
+            Err(error) => {
+                tracing::error!(%error, "Could not build current-user IPC pipe security descriptor");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        let server = match unsafe {
+            options.create_with_security_attributes_raw(PIPE_NAME, security.attributes())
+        } {
             Ok(server) => server,
             Err(error) => {
                 tracing::warn!(%error, "Could not create IPC named pipe; retrying");
@@ -59,6 +72,7 @@ async fn listener_loop(tx: SyncSender<PendingRequest>) {
                 continue;
             }
         };
+        drop(security);
 
         if let Err(error) = server.connect().await {
             tracing::warn!(%error, "IPC client connection failed");
@@ -124,6 +138,12 @@ async fn serve_client(
     stream: tokio::net::windows::named_pipe::NamedPipeServer,
     tx: SyncSender<PendingRequest>,
 ) -> Result<(), ProtocolError> {
+    use std::os::windows::io::AsRawHandle;
+    let pipe_handle = windows::Win32::Foundation::HANDLE(stream.as_raw_handle());
+    if let Err(error) = validate_pipe_client(pipe_handle) {
+        tracing::warn!(%error, "Rejected IPC client identity");
+        return Ok(());
+    }
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     while let Some(frame) = read_bounded_frame(&mut reader).await? {

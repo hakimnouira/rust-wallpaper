@@ -4,9 +4,10 @@
 //! and curated open video wallpaper collections.
 
 use serde::{Deserialize, Serialize};
-use std::fs::File;
-use std::io::{copy, Read};
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -17,6 +18,10 @@ pub enum OnlineError {
     Parse(String),
     #[error("I/O error during download: {0}")]
     Io(#[from] std::io::Error),
+    #[error("download was cancelled")]
+    Cancelled,
+    #[error("download exceeded the maximum allowed size of {0} bytes")]
+    TooLarge(u64),
 }
 
 /// Represents an online wallpaper item available for browsing and download.
@@ -190,28 +195,101 @@ pub fn get_curated_video_wallpapers() -> Vec<OnlineWallpaper> {
     ]
 }
 
-/// Downloads a remote file to a local destination with timeout and size check.
+/// Downloads a remote file into a sibling temporary file before publishing it.
+///
+/// The legacy convenience API remains uncancellable and allows up to 2 GiB. UI download
+/// workers should use `download_online_file_cancellable` so they can report progress and cancel.
 pub fn download_online_file(url: &str, destination: &Path) -> Result<u64, OnlineError> {
+    download_online_file_cancellable(
+        url,
+        destination,
+        &AtomicBool::new(false),
+        2 * 1024 * 1024 * 1024,
+        |_, _| {},
+    )
+}
+
+/// Downloads a remote file with periodic cancellation checks, bounded size, and byte progress.
+/// A failed or cancelled transfer never leaves a partial file at `destination`.
+pub fn download_online_file_cancellable<F>(
+    url: &str,
+    destination: &Path,
+    cancelled: &AtomicBool,
+    max_bytes: u64,
+    mut progress: F,
+) -> Result<u64, OnlineError>
+where
+    F: FnMut(u64, Option<u64>),
+{
     if let Some(parent) = destination.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        fs::create_dir_all(parent)?;
     }
+    let temp_path = temporary_download_path(destination);
+    let result = (|| {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(OnlineError::Cancelled);
+        }
+        let agent = ureq::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .redirects(5)
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .build();
+        let response = agent
+            .get(url)
+            .call()
+            .map_err(|e| OnlineError::Network(e.to_string()))?;
+        let total = response
+            .header("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok());
+        if total.is_some_and(|bytes| bytes > max_bytes) {
+            return Err(OnlineError::TooLarge(max_bytes));
+        }
+        let mut reader = response.into_reader();
+        let mut file = File::create(&temp_path)?;
+        let mut buffer = [0u8; 64 * 1024];
+        let mut copied = 0u64;
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                return Err(OnlineError::Cancelled);
+            }
+            let bytes = reader.read(&mut buffer)?;
+            if bytes == 0 {
+                break;
+            }
+            copied = copied.saturating_add(bytes as u64);
+            if copied > max_bytes {
+                return Err(OnlineError::TooLarge(max_bytes));
+            }
+            file.write_all(&buffer[..bytes])?;
+            progress(copied, total);
+        }
+        file.sync_all()?;
+        drop(file);
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(OnlineError::Cancelled);
+        }
+        publish_download(&temp_path, destination)?;
+        Ok(copied)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
+}
 
-    let agent = ureq::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .redirects(5)
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-        .build();
+fn temporary_download_path(destination: &Path) -> PathBuf {
+    let name = destination
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    destination.with_file_name(format!(".{name}.{}.part", uuid::Uuid::new_v4()))
+}
 
-    let response = agent
-        .get(url)
-        .call()
-        .map_err(|e| OnlineError::Network(e.to_string()))?;
-
-    let mut reader = response.into_reader();
-    let mut file = File::create(destination)?;
-    let bytes_copied = copy(&mut reader, &mut file)?;
-
-    Ok(bytes_copied)
+fn publish_download(temp_path: &Path, destination: &Path) -> std::io::Result<()> {
+    if destination.exists() {
+        fs::remove_file(destination)?;
+    }
+    fs::rename(temp_path, destination)
 }
 
 /// Downloads an image to memory buffer for thumbnail rendering.
@@ -263,6 +341,27 @@ mod tests {
             assert!(item.download_url.starts_with("https://"));
             assert!(item.thumbnail_url.starts_with("https://"));
         }
+    }
+
+    #[test]
+    fn cancelled_download_does_not_create_destination_or_partial_file() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("wallpaper-download-{}", uuid::Uuid::new_v4()));
+        let destination = temp_dir.join("cancelled.mp4");
+        let cancelled = AtomicBool::new(true);
+
+        let result = download_online_file_cancellable(
+            "https://example.invalid/video.mp4",
+            &destination,
+            &cancelled,
+            1024,
+            |_, _| {},
+        );
+
+        assert!(matches!(result, Err(OnlineError::Cancelled)));
+        assert!(!destination.exists());
+        assert!(fs::read_dir(&temp_dir).map_or(true, |mut entries| entries.next().is_none()));
+        let _ = fs::remove_dir_all(temp_dir);
     }
 
     #[test]

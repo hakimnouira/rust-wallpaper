@@ -16,8 +16,8 @@ pub use filter::{
 };
 pub use library::{LibraryError, WallpaperLibrary};
 pub use online::{
-    download_online_file, fetch_thumbnail_bytes, get_curated_video_wallpapers, search_wallhaven,
-    OnlineError, OnlineWallpaper,
+    download_online_file, download_online_file_cancellable, fetch_thumbnail_bytes,
+    get_curated_video_wallpapers, search_wallhaven, OnlineError, OnlineWallpaper,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;

@@ -24,8 +24,12 @@ use wallpaper_windows::{
 
 #[cfg(windows)]
 mod ipc;
+#[cfg(windows)]
+mod ipc_security;
 pub mod metadata;
 pub mod pipeline;
+#[cfg(windows)]
+pub mod web_api;
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -200,7 +204,15 @@ pub fn run_daemon_with_options(
                     .is_none_or(|p| !std::path::Path::new(p).exists());
                 let state_pending = wp.metadata.is_processing();
                 if thumb_missing || state_pending {
-                    pipeline.submit(wp.id, PathBuf::from(&wp.metadata.source));
+                    if let Err(error) = pipeline.submit(wp.id, PathBuf::from(&wp.metadata.source)) {
+                        let message = error.to_string();
+                        warn!(wallpaper_id = %wp.id, %message, "Could not queue wallpaper metadata recovery");
+                        let _ = library.set_processing_state(
+                            wp.id,
+                            wallpaper_core::ProcessingStatus::Failed,
+                            Some(&message),
+                        );
+                    }
                 }
             }
         }
@@ -252,8 +264,13 @@ pub fn run_daemon_with_options(
         let mut next_listener_attempt = Instant::now() + LISTENER_RETRY;
         let mut tracker = FullscreenTracker::new();
         let control_rx = spawn_control_reader();
-        let ipc_rx = ipc::start();
+        let (ipc_tx, ipc_rx) = ipc::start();
+        web_api::start(ipc_tx.clone(), web_api::DEFAULT_PORT);
         info!(pipe = ipc::PIPE_NAME, "Named-pipe IPC server started");
+        info!(
+            port = web_api::DEFAULT_PORT,
+            "Local Web API HTTP bridge started on 127.0.0.1"
+        );
         info!("Commands: pause [DISPLAYn] | resume [DISPLAYn] | assign DISPLAYn <video path> | unassign DISPLAYn | profile <eco|balanced|performance> | status | quit");
 
         if let Some(dur) = duration_limit {
@@ -711,7 +728,15 @@ fn dispatch_ipc(
             match library.import_video(&path, title.as_deref(), None) {
                 Ok(wallpaper) => {
                     info!(wallpaper_id = %wallpaper.id, source = %path, "Wallpaper imported through IPC");
-                    pipeline.submit(wallpaper.id, PathBuf::from(&path));
+                    if let Err(error) = pipeline.submit(wallpaper.id, PathBuf::from(&path)) {
+                        let message = error.to_string();
+                        let _ = library.set_processing_state(
+                            wallpaper.id,
+                            wallpaper_core::ProcessingStatus::Failed,
+                            Some(&message),
+                        );
+                        return failure(ErrorCode::RuntimeFailure, message);
+                    }
                     Response::Accepted
                 }
                 Err(error) => return failure(ErrorCode::InvalidRequest, error.to_string()),
@@ -719,13 +744,26 @@ fn dispatch_ipc(
         }
         Command::RetryProcessing { wallpaper_id } => match library.get(wallpaper_id) {
             Ok(Some(wallpaper)) => {
-                let _ = library.set_processing_state(
+                let source = PathBuf::from(&wallpaper.metadata.source);
+                if let Err(error) = library.set_processing_state(
                     wallpaper_id,
                     wallpaper_core::ProcessingStatus::Pending,
                     None,
-                );
-                pipeline.submit(wallpaper_id, PathBuf::from(&wallpaper.metadata.source));
-                Response::Accepted
+                ) {
+                    return failure(ErrorCode::Internal, error.to_string());
+                }
+                match pipeline.submit(wallpaper_id, source) {
+                    Ok(()) => Response::Accepted,
+                    Err(error) => {
+                        let message = error.to_string();
+                        let _ = library.set_processing_state(
+                            wallpaper_id,
+                            wallpaper_core::ProcessingStatus::Failed,
+                            Some(&message),
+                        );
+                        return failure(ErrorCode::RuntimeFailure, message);
+                    }
+                }
             }
             Ok(None) => {
                 return failure(
@@ -892,11 +930,10 @@ fn dispatch_ipc(
                 None => known.to_vec(),
             };
             for device in targets {
-                let player = match manager.player_mut(&device) {
-                    Some(player) => player,
-                    None => continue,
-                };
-                if let Err(error) = player.set_volume(volume) {
+                if let Err(error) = manager.set_volume_monitor(&device, volume) {
+                    if error.contains("no active player") {
+                        continue;
+                    }
                     return failure(
                         ErrorCode::RuntimeFailure,
                         format!("volume update failed on {device}: {error}"),
@@ -916,11 +953,10 @@ fn dispatch_ipc(
                 None => known.to_vec(),
             };
             for device in targets {
-                let player = match manager.player_mut(&device) {
-                    Some(player) => player,
-                    None => continue,
-                };
-                if let Err(error) = player.set_mute(muted) {
+                if let Err(error) = manager.set_mute_monitor(&device, muted) {
+                    if error.contains("no active player") {
+                        continue;
+                    }
                     return failure(
                         ErrorCode::RuntimeFailure,
                         format!("mute update failed on {device}: {error}"),

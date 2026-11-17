@@ -2,7 +2,7 @@
 
 use crate::metadata::extract_video_metadata_and_thumbnail;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::thread;
 use tracing::{error, info, warn};
 use wallpaper_core::{ProcessingStatus, WallpaperId, WallpaperLibrary};
@@ -73,8 +73,16 @@ pub(crate) mod test_hooks {
     }
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SubmitError {
+    #[error("metadata processing queue is full")]
+    QueueFull,
+    #[error("metadata processing worker is unavailable")]
+    Disconnected,
+}
+
 pub struct ExtractionPipeline {
-    sender: SyncSender<ExtractionJob>,
+    sender: Option<SyncSender<ExtractionJob>>,
     thumbnail_dir: PathBuf,
 }
 
@@ -94,18 +102,31 @@ impl ExtractionPipeline {
             .expect("failed to spawn thumbnail worker thread");
 
         Self {
-            sender,
+            sender: Some(sender),
             thumbnail_dir,
         }
     }
 
+    #[cfg(test)]
+    fn with_sender(sender: Option<SyncSender<ExtractionJob>>) -> Self {
+        Self {
+            sender,
+            thumbnail_dir: PathBuf::new(),
+        }
+    }
+
     /// Submits a wallpaper for background processing.
-    pub fn submit(&self, wallpaper_id: WallpaperId, source: PathBuf) {
-        if let Err(e) = self.sender.try_send(ExtractionJob {
+    pub fn submit(&self, wallpaper_id: WallpaperId, source: PathBuf) -> Result<(), SubmitError> {
+        let Some(sender) = self.sender.as_ref() else {
+            return Err(SubmitError::Disconnected);
+        };
+        match sender.try_send(ExtractionJob {
             wallpaper_id,
             source,
         }) {
-            warn!(%wallpaper_id, %e, "Background extraction queue is full or disconnected");
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(SubmitError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(SubmitError::Disconnected),
         }
     }
 
@@ -231,7 +252,38 @@ impl ExtractionPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::sync_channel;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn submit_reports_full_queue() {
+        let (sender, _receiver) = sync_channel(0);
+        let pipeline = ExtractionPipeline::with_sender(Some(sender));
+        assert_eq!(
+            pipeline.submit(WallpaperId::new(), PathBuf::from("pending.mp4")),
+            Err(SubmitError::QueueFull)
+        );
+    }
+
+    #[test]
+    fn submit_reports_disconnected_worker() {
+        let (sender, receiver) = sync_channel(1);
+        drop(receiver);
+        let pipeline = ExtractionPipeline::with_sender(Some(sender));
+        assert_eq!(
+            pipeline.submit(WallpaperId::new(), PathBuf::from("pending.mp4")),
+            Err(SubmitError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn submit_reports_missing_worker() {
+        let pipeline = ExtractionPipeline::with_sender(None);
+        assert_eq!(
+            pipeline.submit(WallpaperId::new(), PathBuf::from("pending.mp4")),
+            Err(SubmitError::Disconnected)
+        );
+    }
 
     #[test]
     fn test_pipeline_end_to_end_valid_video() {
@@ -252,7 +304,7 @@ mod tests {
             .unwrap();
         assert_eq!(wp.metadata.processing_state, ProcessingStatus::Pending);
 
-        pipeline.submit(wp.id, video_path);
+        pipeline.submit(wp.id, video_path).unwrap();
 
         // Wait for background worker up to 5s
         let start = Instant::now();
@@ -296,7 +348,7 @@ mod tests {
         let wp = library
             .import_video(&corrupt_video, Some("Corrupt Video"), None)
             .unwrap();
-        pipeline.submit(wp.id, corrupt_video);
+        pipeline.submit(wp.id, corrupt_video).unwrap();
 
         let start = Instant::now();
         let mut failed = false;
@@ -341,7 +393,9 @@ mod tests {
                     .as_ref()
                     .map_or(true, |p| !std::path::Path::new(p).exists())
             {
-                pipeline.submit(item.id, PathBuf::from(&item.metadata.source));
+                pipeline
+                    .submit(item.id, PathBuf::from(&item.metadata.source))
+                    .unwrap();
             }
         }
 
@@ -389,7 +443,7 @@ mod tests {
         let expected_thumb = thumb_dir.join(format!("{}.jpg", wp.id));
 
         // Submit extraction job
-        pipeline.submit(wp.id, video_path);
+        pipeline.submit(wp.id, video_path).unwrap();
 
         // Wait until thumbnail is generated on disk and worker is paused right before metadata write
         sync.extraction_done.wait();

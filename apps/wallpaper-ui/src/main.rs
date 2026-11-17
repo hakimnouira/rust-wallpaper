@@ -9,6 +9,7 @@
 mod desktop {
     use eframe::egui;
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::runtime::Builder;
@@ -181,6 +182,7 @@ mod desktop {
         online_download_status: HashMap<String, String>,
         download_tx: mpsc::Sender<DownloadMessage>,
         download_rx: mpsc::Receiver<DownloadMessage>,
+        download_cancellations: HashMap<String, Arc<AtomicBool>>,
         online_search_tx: mpsc::Sender<OnlineSearchRequest>,
         online_search_rx: mpsc::Receiver<OnlineSearchResponse>,
         online_search_id: u64,
@@ -310,6 +312,7 @@ mod desktop {
                 online_download_status: HashMap::new(),
                 download_tx,
                 download_rx,
+                download_cancellations: HashMap::new(),
                 online_search_tx,
                 online_search_rx,
                 online_search_id: 0,
@@ -1032,6 +1035,9 @@ mod desktop {
             let dest_clone = dest.clone();
             let title_clone = title.clone();
             let id_clone = id.clone();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            self.download_cancellations
+                .insert(id_clone.clone(), Arc::clone(&cancelled));
 
             std::thread::spawn(move || {
                 let _ = tx.send(DownloadMessage::Progress {
@@ -1039,7 +1045,28 @@ mod desktop {
                     status: "Downloading video from URL…".into(),
                 });
 
-                match wallpaper_core::download_online_file(&url, &dest_clone) {
+                let mut last_reported = 0u64;
+                match wallpaper_core::download_online_file_cancellable(
+                    &url,
+                    &dest_clone,
+                    &cancelled,
+                    2 * 1024 * 1024 * 1024,
+                    |received, total| {
+                        if received.saturating_sub(last_reported) >= 1024 * 1024
+                            || total == Some(received)
+                        {
+                            last_reported = received;
+                            let status = total.map_or_else(
+                                || format!("Downloading… {} bytes", received),
+                                |total| format!("Downloading… {} / {} bytes", received, total),
+                            );
+                            let _ = tx.send(DownloadMessage::Progress {
+                                id: id_clone.clone(),
+                                status,
+                            });
+                        }
+                    },
+                ) {
                     Ok(_) => {
                         let _ = tx.send(DownloadMessage::Complete {
                             id: id_clone,
@@ -1057,6 +1084,76 @@ mod desktop {
             });
         }
 
+        fn start_curated_download(&mut self, item: wallpaper_core::OnlineWallpaper, apply: bool) {
+            let local_app_data = std::env::var_os("LOCALAPPDATA").unwrap_or_default();
+            let downloads_dir = std::path::PathBuf::from(local_app_data)
+                .join("RustWallpaper")
+                .join("downloads");
+            let extension = if item.is_video { "mp4" } else { "jpg" };
+            let destination = downloads_dir.join(format!("{}.{}", item.id, extension));
+            if apply {
+                self.pending_apply_source = Some(destination.to_string_lossy().to_string());
+            }
+            let cancelled = Arc::new(AtomicBool::new(false));
+            self.download_cancellations
+                .insert(item.id.clone(), Arc::clone(&cancelled));
+            let tx = self.download_tx.clone();
+            std::thread::spawn(move || {
+                let label = if apply {
+                    "Downloading & Applying…"
+                } else {
+                    "Downloading…"
+                };
+                let _ = tx.send(DownloadMessage::Progress {
+                    id: item.id.clone(),
+                    status: label.into(),
+                });
+                let mut last_reported = 0u64;
+                let result = wallpaper_core::download_online_file_cancellable(
+                    &item.download_url,
+                    &destination,
+                    &cancelled,
+                    2 * 1024 * 1024 * 1024,
+                    |received, total| {
+                        if received.saturating_sub(last_reported) >= 1024 * 1024
+                            || total == Some(received)
+                        {
+                            last_reported = received;
+                            let status = total.map_or_else(
+                                || format!("Downloading… {} bytes", received),
+                                |total| format!("Downloading… {} / {} bytes", received, total),
+                            );
+                            let _ = tx.send(DownloadMessage::Progress {
+                                id: item.id.clone(),
+                                status,
+                            });
+                        }
+                    },
+                );
+                match result {
+                    Ok(_) if item.is_video => {
+                        let _ = tx.send(DownloadMessage::Complete {
+                            id: item.id,
+                            path: destination,
+                            title: item.title,
+                        });
+                    }
+                    Ok(_) => {
+                        let _ = tx.send(DownloadMessage::Failed {
+                            id: item.id,
+                            error: "Static images cannot be imported into video engine".into(),
+                        });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(DownloadMessage::Failed {
+                            id: item.id,
+                            error: error.to_string(),
+                        });
+                    }
+                }
+            });
+        }
+
         fn render_browse(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
             // Process any background download completion messages
             while let Ok(msg) = self.download_rx.try_recv() {
@@ -1065,6 +1162,7 @@ mod desktop {
                         self.online_download_status.insert(id, status);
                     }
                     DownloadMessage::Complete { id, path, title } => {
+                        self.download_cancellations.remove(&id);
                         self.online_download_status
                             .insert(id.clone(), "Downloaded! Adding to library…".into());
                         if id.starts_with("url-") {
@@ -1080,6 +1178,8 @@ mod desktop {
                         );
                     }
                     DownloadMessage::Failed { id, error } => {
+                        self.download_cancellations.remove(&id);
+                        self.pending_apply_source = None;
                         if id.starts_with("url-") {
                             self.direct_url_status = Some(format!("Download failed: {error}"));
                         }
@@ -1555,6 +1655,11 @@ mod desktop {
                                                 egui::Color32::from_rgb(255, 200, 80),
                                                 status_text,
                                             );
+                                            if let Some(cancelled) = self.download_cancellations.get(&item.id) {
+                                                if ui.small_button("Cancel").clicked() {
+                                                    cancelled.store(true, Ordering::Relaxed);
+                                                }
+                                            }
                                         } else if !item.is_video {
                                             ui.add_enabled_ui(false, |ui| {
                                                 ui.button("🖼 Image (Video Only)")
@@ -1563,119 +1668,10 @@ mod desktop {
                                         } else {
                                             ui.horizontal(|ui| {
                                                 if ui.button("⬇ Import").clicked() {
-                                                    let tx = self.download_tx.clone();
-                                                    let it = item.clone();
-                                                    std::thread::spawn(move || {
-                                                        let _ =
-                                                            tx.send(DownloadMessage::Progress {
-                                                                id: it.id.clone(),
-                                                                status: "Downloading…".into(),
-                                                            });
-                                                        let local_app_data =
-                                                            std::env::var_os("LOCALAPPDATA")
-                                                                .unwrap_or_default();
-                                                        let downloads_dir =
-                                                            std::path::PathBuf::from(
-                                                                local_app_data,
-                                                            )
-                                                            .join("RustWallpaper")
-                                                            .join("downloads");
-                                                        let ext =
-                                                            if it.is_video { "mp4" } else { "jpg" };
-                                                        let dest = downloads_dir
-                                                            .join(format!("{}.{}", it.id, ext));
-
-                                                        match wallpaper_core::download_online_file(
-                                                            &it.download_url,
-                                                            &dest,
-                                                        ) {
-                                                            Ok(_) => {
-                                                                if it.is_video {
-                                                                    let _ = tx.send(
-                                                                        DownloadMessage::Complete {
-                                                                            id: it.id,
-                                                                            path: dest,
-                                                                            title: it.title,
-                                                                        },
-                                                                    );
-                                                                } else {
-                                                                    let _ = tx.send(
-                                                                        DownloadMessage::Failed {
-                                                                            id: it.id,
-                                                                            error: "Static images cannot be imported into video engine".into(),
-                                                                        },
-                                                                    );
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                let _ = tx.send(
-                                                                    DownloadMessage::Failed {
-                                                                        id: it.id,
-                                                                        error: e.to_string(),
-                                                                    },
-                                                                );
-                                                            }
-                                                        }
-                                                    });
+                                                    self.start_curated_download(item.clone(), false);
                                                 }
                                                 if ui.button("▶ Apply").clicked() {
-                                                    let tx = self.download_tx.clone();
-                                                    let it = item.clone();
-                                                    let local_app_data =
-                                                        std::env::var_os("LOCALAPPDATA")
-                                                            .unwrap_or_default();
-                                                    let downloads_dir =
-                                                        std::path::PathBuf::from(local_app_data)
-                                                            .join("RustWallpaper")
-                                                            .join("downloads");
-                                                    let ext =
-                                                        if it.is_video { "mp4" } else { "jpg" };
-                                                    let dest = downloads_dir
-                                                        .join(format!("{}.{}", it.id, ext));
-
-                                                    self.pending_apply_source =
-                                                        Some(dest.to_string_lossy().to_string());
-
-                                                    std::thread::spawn(move || {
-                                                        let _ =
-                                                            tx.send(DownloadMessage::Progress {
-                                                                id: it.id.clone(),
-                                                                status: "Downloading & Applying…"
-                                                                    .into(),
-                                                            });
-
-                                                        match wallpaper_core::download_online_file(
-                                                            &it.download_url,
-                                                            &dest,
-                                                        ) {
-                                                            Ok(_) => {
-                                                                if it.is_video {
-                                                                    let _ = tx.send(
-                                                                        DownloadMessage::Complete {
-                                                                            id: it.id,
-                                                                            path: dest,
-                                                                            title: it.title,
-                                                                        },
-                                                                    );
-                                                                } else {
-                                                                    let _ = tx.send(
-                                                                        DownloadMessage::Failed {
-                                                                            id: it.id,
-                                                                            error: "Static images cannot be imported into video engine".into(),
-                                                                        },
-                                                                    );
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                let _ = tx.send(
-                                                                    DownloadMessage::Failed {
-                                                                        id: it.id,
-                                                                        error: e.to_string(),
-                                                                    },
-                                                                );
-                                                            }
-                                                        }
-                                                    });
+                                                    self.start_curated_download(item.clone(), true);
                                                 }
                                             });
                                         }

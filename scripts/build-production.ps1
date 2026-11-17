@@ -62,6 +62,12 @@ if (Test-Path $UserMpvDir) {
     }
 }
 
+# Copy Browser Extension
+$DistExtDir = Join-Path $DistDir "extension"
+New-Item -ItemType Directory -Force -Path $DistExtDir | Out-Null
+Copy-Item (Join-Path $RootDir "extensions\chrome\*") $DistExtDir -Recurse -Force
+Compress-Archive -Path "$DistExtDir\*" -DestinationPath (Join-Path $DistDir "RustWallpaper-Extension.zip") -Force
+
 # 4. Summary and validation
 Write-Host "`n[4/4] Verifying production artifacts..." -ForegroundColor Yellow
 
@@ -75,3 +81,4 @@ foreach ($item in $Artifacts) {
 Write-Host "`nProduction Build Complete!" -ForegroundColor Green
 Write-Host "• Single executable (portable): dist\RustWallpaper.exe" -ForegroundColor Cyan
 Write-Host "• Application Installer:        dist\RustWallpaper-Setup.exe" -ForegroundColor Cyan
+Write-Host "• Browser Extension:            dist\extension\ (or dist\RustWallpaper-Extension.zip)" -ForegroundColor Cyan

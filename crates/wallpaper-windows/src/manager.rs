@@ -587,56 +587,102 @@ impl WallpaperManager {
 
     /// Pauses all active video players.
     pub fn pause_all(&mut self) {
-        for (dev, player) in &mut self.players {
-            if let Err(err) = player.pause() {
-                warn!(device = %dev, %err, "Failed to pause video player");
+        for (dev, player) in &self.players {
+            if let Err(err) = player.queue_state_command(
+                &[
+                    serde_json::json!("set_property"),
+                    serde_json::json!("pause"),
+                    serde_json::json!(true),
+                ],
+                PlaybackState::Paused,
+            ) {
+                warn!(device = %dev, %err, "Failed to queue pause command");
             }
         }
     }
 
     /// Resumes all paused video players.
     pub fn resume_all(&mut self) {
-        for (dev, player) in &mut self.players {
-            if let Err(err) = player.resume() {
-                warn!(device = %dev, %err, "Failed to resume video player");
+        for (dev, player) in &self.players {
+            if let Err(err) = player.queue_state_command(
+                &[
+                    serde_json::json!("set_property"),
+                    serde_json::json!("pause"),
+                    serde_json::json!(false),
+                ],
+                PlaybackState::Playing,
+            ) {
+                warn!(device = %dev, %err, "Failed to queue resume command");
             }
         }
     }
 
     /// Pauses a specific video player.
     pub fn pause_monitor(&mut self, device: &str) {
-        if let Some(player) = self.players.get_mut(device) {
-            if let Err(err) = player.pause() {
-                warn!(device = %device, %err, "Failed to pause video player on monitor");
+        if let Some(player) = self.players.get(device) {
+            if let Err(err) = player.queue_state_command(
+                &[
+                    serde_json::json!("set_property"),
+                    serde_json::json!("pause"),
+                    serde_json::json!(true),
+                ],
+                PlaybackState::Paused,
+            ) {
+                warn!(device = %device, %err, "Failed to queue pause command");
             }
         }
     }
 
     /// Resumes a specific video player.
     pub fn resume_monitor(&mut self, device: &str) {
-        if let Some(player) = self.players.get_mut(device) {
-            if let Err(err) = player.resume() {
-                warn!(device = %device, %err, "Failed to resume video player on monitor");
+        if let Some(player) = self.players.get(device) {
+            if let Err(err) = player.queue_state_command(
+                &[
+                    serde_json::json!("set_property"),
+                    serde_json::json!("pause"),
+                    serde_json::json!(false),
+                ],
+                PlaybackState::Playing,
+            ) {
+                warn!(device = %device, %err, "Failed to queue resume command");
             }
         }
     }
 
-    /// Sets volume (0-100) across all players.
+    /// Queues volume changes for all players without waiting on their IPC pipes.
     pub fn set_volume_all(&mut self, volume: u32) {
-        for (dev, player) in &mut self.players {
-            if let Err(err) = player.set_volume(volume) {
-                warn!(device = %dev, %err, "Failed to set volume");
+        for (dev, player) in &self.players {
+            if let Err(err) =
+                player.queue_property_command("volume", serde_json::json!(volume.min(100)))
+            {
+                warn!(device = %dev, %err, "Failed to queue volume update");
             }
         }
     }
 
-    /// Toggles mute across all players.
+    /// Queues mute changes for all players without waiting on their IPC pipes.
     pub fn set_mute_all(&mut self, muted: bool) {
-        for (dev, player) in &mut self.players {
-            if let Err(err) = player.set_mute(muted) {
-                warn!(device = %dev, %err, "Failed to set mute");
+        for (dev, player) in &self.players {
+            if let Err(err) = player.queue_property_command("mute", serde_json::json!(muted)) {
+                warn!(device = %dev, %err, "Failed to queue mute update");
             }
         }
+    }
+
+    pub fn set_volume_monitor(&mut self, device: &str, volume: u32) -> Result<(), String> {
+        self.players
+            .get(device)
+            .ok_or_else(|| format!("no active player on {device}"))?
+            .queue_property_command("volume", serde_json::json!(volume.min(100)))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn set_mute_monitor(&mut self, device: &str, muted: bool) -> Result<(), String> {
+        self.players
+            .get(device)
+            .ok_or_else(|| format!("no active player on {device}"))?
+            .queue_property_command("mute", serde_json::json!(muted))
+            .map_err(|error| error.to_string())
     }
 
     /// Stops all video players, retaining any failed players in tracking.
@@ -1051,16 +1097,16 @@ impl WallpaperManager {
     /// Performs one bounded MPV IPC health probe per active player.
     pub fn probe_players(&mut self) -> Vec<wallpaper_core::health::ProbeResult> {
         let mut results = Vec::with_capacity(self.players.len());
-        for (device, player) in &mut self.players {
-            let (ipc_responded, video_initialized) = match player.probe_video_output() {
-                Ok(result) => result,
-                Err(_) => (false, false),
-            };
-            results.push(wallpaper_core::health::ProbeResult {
-                device: device.clone(),
-                ipc_responded,
-                video_initialized,
-            });
+        for (device, player) in &self.players {
+            if let Some((ipc_responded, video_initialized)) =
+                player.request_video_probe().ok().flatten()
+            {
+                results.push(wallpaper_core::health::ProbeResult {
+                    device: device.clone(),
+                    ipc_responded,
+                    video_initialized,
+                });
+            }
         }
         results
     }
