@@ -203,35 +203,67 @@ fn fetch_html_content(url: &str) -> Option<String> {
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .build();
 
-    let response = agent
+    const MAX_HTML_BYTES: u64 = 2 * 1024 * 1024;
+    let ureq_attempt = agent
         .get(url)
         .set(
             "Accept",
             "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         )
         .set("Accept-Language", "en-US,en;q=0.9")
-        .call()
-        .ok()?;
+        .call();
 
-    const MAX_HTML_BYTES: u64 = 2 * 1024 * 1024;
-    if response
-        .header("Content-Length")
-        .and_then(|value| value.parse::<u64>().ok())
-        .is_some_and(|length| length > MAX_HTML_BYTES)
+    if let Ok(response) = ureq_attempt {
+        let length_ok = response
+            .header("Content-Length")
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_none_or(|length| length <= MAX_HTML_BYTES);
+
+        if length_ok {
+            let mut html = Vec::new();
+            if response
+                .into_reader()
+                .take(MAX_HTML_BYTES + 1)
+                .read_to_end(&mut html)
+                .is_ok()
+                && (html.len() as u64) <= MAX_HTML_BYTES
+            {
+                if let Ok(s) = String::from_utf8(html) {
+                    return Some(s);
+                }
+            }
+        }
+    }
+
+    // 2. Fallback to system curl (curl.exe on Windows or curl on Unix) if ureq encountered 403 or TLS fingerprinting
+    let curl_bin = if cfg!(windows) { "curl.exe" } else { "curl" };
+    let mut cmd = std::process::Command::new(curl_bin);
+    cmd.args([
+        "-s",
+        "-L",
+        "--max-time",
+        "15",
+        "-H",
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "-H",
+        "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        url,
+    ]);
+    #[cfg(windows)]
     {
-        return None;
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    if let Ok(output) = cmd.output() {
+        if output.status.success() && !output.stdout.is_empty() {
+            if let Ok(s) = String::from_utf8(output.stdout) {
+                return Some(s);
+            }
+        }
     }
 
-    let mut html = Vec::new();
-    response
-        .into_reader()
-        .take(MAX_HTML_BYTES + 1)
-        .read_to_end(&mut html)
-        .ok()?;
-    if html.len() as u64 > MAX_HTML_BYTES {
-        return None;
-    }
-    String::from_utf8(html).ok()
+    None
 }
 
 /// Resolves a video webpage URL (such as Pixabay, Pexels, or open media pages)
@@ -379,9 +411,67 @@ where
             .set("Accept", "*/*")
             .set("Accept-Language", "en-US,en;q=0.9")
             .set("Referer", url);
-        let response = req
-            .call()
-            .map_err(|e| OnlineError::Network(e.to_string()))?;
+        let response = match req.call() {
+            Ok(resp) => resp,
+            Err(ureq_err) => {
+                let curl_bin = if cfg!(windows) { "curl.exe" } else { "curl" };
+                let mut cmd = std::process::Command::new(curl_bin);
+                cmd.args([
+                    "-s",
+                    "-L",
+                    "--fail",
+                    "--connect-timeout",
+                    "30",
+                    "-H",
+                    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "-H",
+                    "Accept: */*",
+                    "-H",
+                ]);
+                let referer_header = format!("Referer: {url}");
+                cmd.arg(referer_header);
+                cmd.args(["-o"]);
+                cmd.arg(&temp_path);
+                cmd.arg(&target_url);
+
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    const CREATE_NO_WINDOW: u32 = 0x08000000;
+                    cmd.creation_flags(CREATE_NO_WINDOW);
+                }
+
+                let mut child = cmd
+                    .spawn()
+                    .map_err(|_| OnlineError::Network(ureq_err.to_string()))?;
+                loop {
+                    if cancelled.load(Ordering::Relaxed) {
+                        let _ = child.kill();
+                        return Err(OnlineError::Cancelled);
+                    }
+                    if let Ok(Some(status)) = child.try_wait() {
+                        if status.success() {
+                            let metadata = fs::metadata(&temp_path)?;
+                            let size = metadata.len();
+                            if size > max_bytes {
+                                return Err(OnlineError::TooLarge(max_bytes));
+                            }
+                            progress(size, Some(size));
+                            publish_download(&temp_path, destination)?;
+                            return Ok(size);
+                        } else {
+                            return Err(OnlineError::Network(format!(
+                                "Download failed: {ureq_err} (curl fallback: {status})"
+                            )));
+                        }
+                    }
+                    if let Ok(meta) = fs::metadata(&temp_path) {
+                        progress(meta.len(), None);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+            }
+        };
         let total = response
             .header("Content-Length")
             .and_then(|value| value.parse::<u64>().ok());
@@ -600,5 +690,14 @@ mod tests {
     fn test_url_encoding() {
         assert_eq!(urlencoding("anime 4k"), "anime+4k");
         assert_eq!(urlencoding("nature/forest"), "nature%2Fforest");
+    }
+
+    #[test]
+    fn test_resolve_pixabay_online() {
+        let input_url = "https://pixabay.com/videos/waves-sea-ocean-storm-water-tide-71122/";
+        let resolved = resolve_direct_video_url(input_url);
+        println!("Resolved URL: {}", resolved);
+        assert!(resolved.starts_with("https://cdn.pixabay.com/video/"));
+        assert!(resolved.ends_with(".mp4"));
     }
 }
