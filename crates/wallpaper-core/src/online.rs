@@ -286,9 +286,30 @@ fn temporary_download_path(destination: &Path) -> PathBuf {
 }
 
 fn publish_download(temp_path: &Path, destination: &Path) -> std::io::Result<()> {
-    if destination.exists() {
-        fs::remove_file(destination)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+
+        let source: Vec<u16> = temp_path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let target: Vec<u16> = destination
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        return unsafe {
+            MoveFileExW(
+                windows::core::PCWSTR(source.as_ptr()),
+                windows::core::PCWSTR(target.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(|error| std::io::Error::other(error.to_string()));
     }
+
+    #[cfg(not(windows))]
     fs::rename(temp_path, destination)
 }
 
@@ -359,6 +380,46 @@ mod tests {
         );
 
         assert!(matches!(result, Err(OnlineError::Cancelled)));
+        assert!(!destination.exists());
+        assert!(fs::read_dir(&temp_dir).map_or(true, |mut entries| entries.next().is_none()));
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn oversized_download_is_rejected_without_publishing_partial_file() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678",
+                )
+                .unwrap();
+        });
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("wallpaper-download-{}", uuid::Uuid::new_v4()));
+        let destination = temp_dir.join("oversized.mp4");
+        let result = download_online_file_cancellable(
+            &format!("http://{address}/video.mp4"),
+            &destination,
+            &AtomicBool::new(false),
+            4,
+            |_, _| {},
+        );
+        server.join().unwrap();
+
+        assert!(
+            matches!(result, Err(OnlineError::TooLarge(4))),
+            "unexpected download result: {result:?}"
+        );
         assert!(!destination.exists());
         assert!(fs::read_dir(&temp_dir).map_or(true, |mut entries| entries.next().is_none()));
         let _ = fs::remove_dir_all(temp_dir);

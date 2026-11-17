@@ -432,6 +432,7 @@ pub struct MpvPlayer {
     command_tx: SyncSender<MpvCommand>,
     probe_in_flight: Arc<AtomicBool>,
     probe_results: Arc<Mutex<VecDeque<(bool, bool)>>>,
+    state_command_in_flight: Arc<AtomicBool>,
     volume: u32,
     muted: bool,
     started_at: Instant,
@@ -443,6 +444,7 @@ struct MpvCommand {
     command: Vec<Value>,
     state_on_success: Option<PlaybackState>,
     probe_result: Option<(Arc<AtomicBool>, Arc<Mutex<VecDeque<(bool, bool)>>>)>,
+    state_command_guard: Option<Arc<AtomicBool>>,
     reply: Option<Sender<Result<Option<Value>, MpvError>>>,
 }
 
@@ -740,6 +742,7 @@ impl MpvPlayer {
         let state = Arc::new(Mutex::new(PlaybackState::Starting));
         let probe_in_flight = Arc::new(AtomicBool::new(false));
         let probe_results = Arc::new(Mutex::new(VecDeque::new()));
+        let state_command_in_flight = Arc::new(AtomicBool::new(false));
         let (command_tx, command_rx) = sync_channel(COMMAND_QUEUE_CAPACITY);
         let command_spawn = std::thread::Builder::new()
             .name("mpv-ipc-command".into())
@@ -770,6 +773,7 @@ impl MpvPlayer {
             command_tx,
             probe_in_flight,
             probe_results,
+            state_command_in_flight,
             volume: launch_cfg.config.volume,
             muted: launch_cfg.config.mute,
             started_at: Instant::now(),
@@ -896,6 +900,9 @@ impl MpvPlayer {
                 results.lock().unwrap().push_back(probe);
                 in_flight.store(false, Ordering::SeqCst);
             }
+            if let Some(in_flight) = request.state_command_guard.as_ref() {
+                in_flight.store(false, Ordering::SeqCst);
+            }
 
             if let (Ok(_), Some(new_state)) = (&result, request.state_on_success) {
                 *state.lock().unwrap() = new_state;
@@ -916,6 +923,7 @@ impl MpvPlayer {
                 command: vec![json!("set_property"), json!(property), value],
                 state_on_success: None,
                 probe_result: None,
+                state_command_guard: None,
                 reply: None,
             })
             .map_err(|error| match error {
@@ -931,19 +939,25 @@ impl MpvPlayer {
         command: &[Value],
         state_on_success: PlaybackState,
     ) -> Result<(), MpvError> {
-        self.command_tx
-            .try_send(MpvCommand {
-                command: command.to_vec(),
-                state_on_success: Some(state_on_success),
-                probe_result: None,
-                reply: None,
-            })
-            .map_err(|error| match error {
+        if self.state_command_in_flight.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        if let Err(error) = self.command_tx.try_send(MpvCommand {
+            command: command.to_vec(),
+            state_on_success: Some(state_on_success),
+            probe_result: None,
+            state_command_guard: Some(Arc::clone(&self.state_command_in_flight)),
+            reply: None,
+        }) {
+            self.state_command_in_flight.store(false, Ordering::SeqCst);
+            return Err(match error {
                 TrySendError::Full(_) => MpvError::Player("MPV command queue is full".into()),
                 TrySendError::Disconnected(_) => {
                     MpvError::IpcConnectionFailed("MPV command worker stopped".into())
                 }
-            })
+            });
+        }
+        Ok(())
     }
 
     /// Sends a JSON command to MPV and waits for a bounded response. This is intended for
@@ -955,6 +969,7 @@ impl MpvPlayer {
                 command: command.to_vec(),
                 state_on_success: None,
                 probe_result: None,
+                state_command_guard: None,
                 reply: Some(reply),
             })
             .map_err(|error| match error {
@@ -1213,6 +1228,7 @@ impl MpvPlayer {
                     Arc::clone(&self.probe_in_flight),
                     Arc::clone(&self.probe_results),
                 )),
+                state_command_guard: None,
                 reply: None,
             }) {
                 self.probe_in_flight.store(false, Ordering::SeqCst);

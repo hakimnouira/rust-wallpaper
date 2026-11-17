@@ -153,6 +153,20 @@ async fn handle_connection(
             let body_str = String::from_utf8_lossy(&body_bytes);
             handle_action(&mut stream, &tx, &body_str).await?;
         }
+        ("GET", "/extension/update.xml") => {
+            handle_extension_update_manifest(&mut stream).await?;
+        }
+        ("GET", "/extension/rust-wallpaper.crx")
+        | ("GET", "/extension/chrome.crx")
+        | ("GET", "/extension/extension.crx") => {
+            handle_extension_crx_download(&mut stream).await?;
+        }
+        ("POST", "/extension/register") | ("POST", "/extension/register/") => {
+            handle_extension_register(&mut stream).await?;
+        }
+        ("GET", "/extension/install") | ("GET", "/extension/install/") => {
+            handle_extension_install_page(&mut stream).await?;
+        }
         _ => {
             let json = serde_json::json!({
                 "error": "Not Found",
@@ -446,6 +460,214 @@ async fn handle_action(
             send_json_response(stream, 200, "OK", &json).await
         }
     }
+}
+
+async fn handle_extension_update_manifest(
+    stream: &mut TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let xml = format!(
+        "<?xml version='1.0' encoding='UTF-8'?>\n\
+<gupdate xmlns='http://www.google.com/update2/response' protocol='2.0'>\n  \
+  <app appid='{}'>\n    \
+    <updatecheck codebase='http://127.0.0.1:24242/extension/rust-wallpaper.crx' version='{}' />\n  \
+  </app>\n\
+</gupdate>\n",
+        wallpaper_windows::EXTENSION_ID,
+        wallpaper_windows::EXTENSION_VERSION
+    );
+
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+Content-Type: application/xml; charset=utf-8\r\n\
+Access-Control-Allow-Origin: *\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n\
+{}",
+        xml.len(),
+        xml
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn handle_extension_crx_download(
+    stream: &mut TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let crx_path = match wallpaper_windows::find_crx_candidate() {
+        Some(p) => p,
+        None => {
+            let json = serde_json::json!({
+                "error": "Not Found",
+                "message": "Packaged chrome.crx file not found on disk"
+            });
+            send_json_response(stream, 404, "Not Found", &json).await?;
+            return Ok(());
+        }
+    };
+
+    let bytes = match std::fs::read(&crx_path) {
+        Ok(b) => b,
+        Err(e) => {
+            let json = serde_json::json!({
+                "error": "Read Error",
+                "message": format!("Failed to read CRX file: {e}")
+            });
+            send_json_response(stream, 500, "Internal Server Error", &json).await?;
+            return Ok(());
+        }
+    };
+
+    let header = format!(
+        "HTTP/1.1 200 OK\r\n\
+Content-Type: application/x-chrome-extension\r\n\
+Content-Disposition: attachment; filename=\"rust-wallpaper.crx\"\r\n\
+Access-Control-Allow-Origin: *\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n",
+        bytes.len()
+    );
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(&bytes).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn handle_extension_register(
+    stream: &mut TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match wallpaper_windows::register_browser_extension(None) {
+        Ok(()) => {
+            let json = serde_json::json!({
+                "success": true,
+                "registered": true,
+                "extension_id": wallpaper_windows::EXTENSION_ID,
+                "message": "Browser extension registered in Windows Registry"
+            });
+            send_json_response(stream, 200, "OK", &json).await?;
+        }
+        Err(e) => {
+            let json = serde_json::json!({
+                "success": false,
+                "error": e
+            });
+            send_json_response(stream, 500, "Internal Server Error", &json).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn handle_extension_install_page(
+    stream: &mut TcpStream,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let is_reg = wallpaper_windows::is_browser_extension_registered();
+    let status_html = if is_reg {
+        r#"<span style="color:#10b981;font-weight:600;">Active & Registered</span>"#
+    } else {
+        r#"<span style="color:#f59e0b;font-weight:600;">Not Registered</span>"#
+    };
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>RustWallpaper Companion Integration</title>
+  <style>
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #0f172a;
+      color: #f8fafc;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      margin: 0;
+      padding: 20px;
+    }}
+    .card {{
+      background: #1e293b;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 12px;
+      padding: 32px;
+      max-width: 520px;
+      width: 100%;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+    }}
+    h1 {{ font-size: 20px; margin-top: 0; display: flex; align-items: center; gap: 10px; }}
+    p {{ font-size: 14px; line-height: 1.6; color: #94a3b8; }}
+    .badge {{
+      background: #0f172a;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 6px;
+      padding: 12px 16px;
+      margin: 16px 0;
+      font-size: 13px;
+    }}
+    .btn {{
+      display: inline-block;
+      padding: 10px 18px;
+      background: #4f46e5;
+      color: #fff;
+      text-decoration: none;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 13px;
+      cursor: pointer;
+      border: none;
+      margin-right: 8px;
+    }}
+    .btn:hover {{ background: #4338ca; }}
+    .btn-secondary {{ background: #334155; }}
+    .btn-secondary:hover {{ background: #475569; }}
+    code {{ background: #0f172a; padding: 2px 6px; border-radius: 4px; font-size: 12px; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>🖼 RustWallpaper Companion</h1>
+    <p>The companion extension allows sending live videos, GIFs, and wallpapers directly from Chrome, Edge, and Brave to your desktop wallpaper engine.</p>
+    <div class="badge">
+      <strong>Registry Status:</strong> {}<br>
+      <strong>Extension ID:</strong> <code>{}</code>
+    </div>
+    <p>When you launch your browser, Chromium will automatically detect the extension and prompt you to enable it.</p>
+    <div style="margin-top: 24px;">
+      <a href="/extension/rust-wallpaper.crx" class="btn">Download .CRX Package</a>
+      <button onclick="register()" class="btn btn-secondary">Re-register in Registry</button>
+    </div>
+  </div>
+  <script>
+    async function register() {{
+      const res = await fetch('/extension/register', {{ method: 'POST' }});
+      const data = await res.json();
+      if (data.success) {{
+        alert('Successfully registered extension in Chrome, Edge, and Brave registry!');
+        location.reload();
+      }} else {{
+        alert('Registration failed: ' + (data.error || 'Unknown error'));
+      }}
+    }}
+  </script>
+</body>
+</html>"#,
+        status_html,
+        wallpaper_windows::EXTENSION_ID
+    );
+
+    let response = format!(
+        "HTTP/1.1 200 OK\r\n\
+Content-Type: text/html; charset=utf-8\r\n\
+Access-Control-Allow-Origin: *\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n\
+{}",
+        html.len(),
+        html
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 async fn dispatch_command(

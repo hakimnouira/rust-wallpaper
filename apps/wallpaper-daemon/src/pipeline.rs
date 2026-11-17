@@ -82,7 +82,7 @@ pub enum SubmitError {
 }
 
 pub struct ExtractionPipeline {
-    sender: Option<SyncSender<ExtractionJob>>,
+    sender: SyncSender<ExtractionJob>,
     thumbnail_dir: PathBuf,
 }
 
@@ -102,13 +102,13 @@ impl ExtractionPipeline {
             .expect("failed to spawn thumbnail worker thread");
 
         Self {
-            sender: Some(sender),
+            sender,
             thumbnail_dir,
         }
     }
 
     #[cfg(test)]
-    fn with_sender(sender: Option<SyncSender<ExtractionJob>>) -> Self {
+    fn with_sender(sender: SyncSender<ExtractionJob>) -> Self {
         Self {
             sender,
             thumbnail_dir: PathBuf::new(),
@@ -117,10 +117,7 @@ impl ExtractionPipeline {
 
     /// Submits a wallpaper for background processing.
     pub fn submit(&self, wallpaper_id: WallpaperId, source: PathBuf) -> Result<(), SubmitError> {
-        let Some(sender) = self.sender.as_ref() else {
-            return Err(SubmitError::Disconnected);
-        };
-        match sender.try_send(ExtractionJob {
+        match self.sender.try_send(ExtractionJob {
             wallpaper_id,
             source,
         }) {
@@ -258,7 +255,7 @@ mod tests {
     #[test]
     fn submit_reports_full_queue() {
         let (sender, _receiver) = sync_channel(0);
-        let pipeline = ExtractionPipeline::with_sender(Some(sender));
+        let pipeline = ExtractionPipeline::with_sender(sender);
         assert_eq!(
             pipeline.submit(WallpaperId::new(), PathBuf::from("pending.mp4")),
             Err(SubmitError::QueueFull)
@@ -269,16 +266,7 @@ mod tests {
     fn submit_reports_disconnected_worker() {
         let (sender, receiver) = sync_channel(1);
         drop(receiver);
-        let pipeline = ExtractionPipeline::with_sender(Some(sender));
-        assert_eq!(
-            pipeline.submit(WallpaperId::new(), PathBuf::from("pending.mp4")),
-            Err(SubmitError::Disconnected)
-        );
-    }
-
-    #[test]
-    fn submit_reports_missing_worker() {
-        let pipeline = ExtractionPipeline::with_sender(None);
+        let pipeline = ExtractionPipeline::with_sender(sender);
         assert_eq!(
             pipeline.submit(WallpaperId::new(), PathBuf::from("pending.mp4")),
             Err(SubmitError::Disconnected)

@@ -102,6 +102,9 @@ fn main() {
                 let _ = windows::Win32::System::Registry::RegCloseKey(hkey_uninstall);
             }
         }
+
+        // Unregister browser extension keys
+        wallpaper_windows::unregister_browser_extension();
     }
 
     // 5. Schedule directory deletion on exit

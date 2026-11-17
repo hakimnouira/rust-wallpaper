@@ -23,8 +23,15 @@ $DistDir = Join-Path $RootDir "dist"
 $DistBinDir = Join-Path $DistDir "bin\mpv"
 $DistAssetsDir = Join-Path $DistDir "assets"
 
+Stop-Process -Name "mpv", "RustWallpaper", "wallpaper-ui", "wallpaper-daemon" -Force -ErrorAction SilentlyContinue
+Start-Sleep -Milliseconds 500
+
 if (Test-Path $DistDir) {
-    Remove-Item -Recurse -Force $DistDir
+    try {
+        Remove-Item -Recurse -Force $DistDir -ErrorAction Stop
+    } catch {
+        Write-Warning "Could not wipe $DistDir completely, continuing with overwrite..."
+    }
 }
 New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 New-Item -ItemType Directory -Force -Path $DistBinDir | Out-Null
@@ -66,6 +73,10 @@ if (Test-Path $UserMpvDir) {
 $DistExtDir = Join-Path $DistDir "extension"
 New-Item -ItemType Directory -Force -Path $DistExtDir | Out-Null
 Copy-Item (Join-Path $RootDir "extensions\chrome\*") $DistExtDir -Recurse -Force
+if (Test-Path (Join-Path $RootDir "extensions\chrome.crx")) {
+    Copy-Item (Join-Path $RootDir "extensions\chrome.crx") (Join-Path $DistExtDir "chrome.crx") -Force
+    Copy-Item (Join-Path $RootDir "extensions\chrome.crx") (Join-Path $DistDir "chrome.crx") -Force
+}
 Compress-Archive -Path "$DistExtDir\*" -DestinationPath (Join-Path $DistDir "RustWallpaper-Extension.zip") -Force
 
 # 4. Summary and validation

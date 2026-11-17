@@ -3,6 +3,7 @@
   "name": "RustWallpaper Companion",
   "version": "1.0.0",
   "description": "One-click send web videos, animated GIFs, and wallpapers directly to your RustWallpaper desktop engine.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsrEISHOlFqIBfwbq/Kg+gz2WfJBayLYSfOtuqJYnRPGGDFGj9hwbi+abKD2djDWGqCVp3X6EKsuKMunC7zeDy+7SeA36Rzd0ZF31gNVJxiyXisE7ycshJtppjcqiZePcXgslWx24kGqAM2/Jq4x3SFh9rKbC6/C1W0RK6xjMz/WS8YKWcoavNexbbmNTq3kUliJIpzGYc51Va00RDnIjIsMjUbsUJD+JPwo/l/u53AjGihHFcxttp0FGOG85XT7MSYQlqqkvGc0de9GiFBe+fy8ymzi/cLndxy7NZjo1l+peIKljHY5/nq3JuEFx+TW1AQ7TzK3y6c1EaO/tE4t6tQIDAQAB",
   "permissions": [
     "contextMenus",
     "notifications",

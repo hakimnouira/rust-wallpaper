@@ -775,7 +775,9 @@ impl WallpaperManager {
                     warn!(device = %dev, attempt = backoff.consecutive_failures + 1, "Player dead or missing. Attempting recovery...");
                     if backoff.record_failure() {
                         if let Some((path, cfg)) = self.active_sources.get(&dev).cloned() {
-                            let _ = self.play_video_on_monitor(&dev, path, cfg);
+                            if let Err(error) = self.play_video_on_monitor(&dev, path, cfg) {
+                                warn!(device = %dev, %error, "Player recovery failed");
+                            }
                         }
                     } else {
                         warn!(device = %dev, "Max retry limit reached. Backing off recovery until manual intervention.");

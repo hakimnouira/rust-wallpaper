@@ -19,6 +19,7 @@ struct InstallerApp {
     create_desktop_shortcut: bool,
     create_start_menu_shortcut: bool,
     start_on_boot: bool,
+    install_browser_extension: bool,
     launch_on_finish: bool,
     progress_status: String,
     progress_pct: f32,
@@ -34,6 +35,7 @@ impl Default for InstallerApp {
             create_desktop_shortcut: true,
             create_start_menu_shortcut: true,
             start_on_boot: true,
+            install_browser_extension: true,
             launch_on_finish: true,
             progress_status: "Ready to install…".into(),
             progress_pct: 0.0,
@@ -203,6 +205,7 @@ fn execute_installation(
     create_desktop: bool,
     create_start_menu: bool,
     start_on_boot: bool,
+    install_browser_extension: bool,
     tx: mpsc::Sender<(f32, String)>,
 ) -> Result<PathBuf, String> {
     let _ = tx.send((0.10, "Creating destination folders…".into()));
@@ -319,6 +322,35 @@ fn execute_installation(
         }
     }
 
+    // 9. Browser Extension Integration (Chrome, Edge, Brave)
+    if install_browser_extension {
+        let _ = tx.send((
+            0.98,
+            "Configuring browser live wallpaper companion (Chrome, Edge, Brave)…".into(),
+        ));
+        let ext_dir = target_dir.join("extension");
+        let _ = std::fs::create_dir_all(&ext_dir);
+
+        // Copy chrome.crx if found
+        if let Some(crx_candidate) = find_file_candidate(&[
+            "extension/chrome.crx",
+            "chrome.crx",
+            "RustWallpaper-Extension.crx",
+            "extensions/chrome.crx",
+            "dist/extension/chrome.crx",
+        ]) {
+            let _ = std::fs::copy(&crx_candidate, ext_dir.join("chrome.crx"));
+        }
+
+        // Register in Windows Registry
+        let target_crx = ext_dir.join("chrome.crx");
+        let _ = wallpaper_windows::register_browser_extension(if target_crx.is_file() {
+            Some(&target_crx)
+        } else {
+            None
+        });
+    }
+
     let _ = tx.send((1.0, "Installation complete!".into()));
     Ok(dest_main_exe)
 }
@@ -407,7 +439,7 @@ impl eframe::App for InstallerApp {
                     ui.separator();
                     ui.add_space(8.0);
 
-                    ui.label(egui::RichText::new("Shortcuts & Startup:").strong());
+                    ui.label(egui::RichText::new("Shortcuts & Integration:").strong());
                     ui.add_space(4.0);
                     ui.checkbox(&mut self.create_desktop_shortcut, "Create a Desktop shortcut");
                     ui.checkbox(
@@ -417,6 +449,10 @@ impl eframe::App for InstallerApp {
                     ui.checkbox(
                         &mut self.start_on_boot,
                         "Start Rust Wallpaper automatically on Windows boot",
+                    );
+                    ui.checkbox(
+                        &mut self.install_browser_extension,
+                        "Integrate with web browsers (Chrome, Edge, Brave) for one-click wallpapers",
                     );
 
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::RIGHT), |ui| {
@@ -436,6 +472,7 @@ impl eframe::App for InstallerApp {
                                 let desktop_sc = self.create_desktop_shortcut;
                                 let start_sc = self.create_start_menu_shortcut;
                                 let boot = self.start_on_boot;
+                                let ext = self.install_browser_extension;
 
                                 let (tx, rx) = mpsc::channel();
                                 self.progress_rx = Some(rx);
@@ -447,6 +484,7 @@ impl eframe::App for InstallerApp {
                                         desktop_sc,
                                         start_sc,
                                         boot,
+                                        ext,
                                         tx.clone(),
                                     ) {
                                         Ok(_) => {}
@@ -551,7 +589,7 @@ fn main() -> eframe::Result<()> {
     if is_silent {
         let (tx, _rx) = mpsc::channel();
         let target_dir = get_default_install_dir();
-        match execute_installation(target_dir, true, true, true, tx) {
+        match execute_installation(target_dir, true, true, true, true, tx) {
             Ok(exe) => {
                 let _ = std::process::Command::new(exe).spawn();
                 std::process::exit(0);
