@@ -634,7 +634,7 @@ mod platform {
                 }
             }
 
-            let mut taskbar_created_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
+            let taskbar_created_msg = RegisterWindowMessageW(w!("TaskbarCreated"));
             if taskbar_created_msg != 0 {
                 registration.mark_active(EventSource::ExplorerRestart);
             } else {
@@ -662,18 +662,29 @@ mod platform {
             let retry_pending = state.registration.has_pending_retries();
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
-            if retry_pending {
-                let timer = SetTimer(hwnd, REGISTRATION_TIMER_ID, REGISTRATION_TIMER_MS, None);
-                if timer == 0 {
-                    error!(
-                        error = %windows::core::Error::from_win32(),
-                        "Could not start event-registration retry timer"
-                    );
+            hwnd_holder.store(hwnd.0 as isize, Ordering::SeqCst);
+
+            // A listener without its retry timer would silently keep failed event sources
+            // unavailable forever. Fail initialization instead: the daemon's existing
+            // listener-restart policy will retry the complete registration sequence.
+            let timer_started = !retry_pending
+                || SetTimer(hwnd, REGISTRATION_TIMER_ID, REGISTRATION_TIMER_MS, None) != 0;
+            if timer_started {
+                let _ = init_tx.send(Ok(()));
+            } else {
+                let error = windows::core::Error::from_win32();
+                error!(
+                    %error,
+                    "Could not start event-registration retry timer; restarting listener is required"
+                );
+                let _ = init_tx.send(Err(format!(
+                    "Could not start event-registration retry timer: {error}"
+                )));
+                if let Err(destroy_error) = DestroyWindow(hwnd) {
+                    error!(%destroy_error, "Could not destroy partially initialized notification window");
+                    PostQuitMessage(0);
                 }
             }
-
-            hwnd_holder.store(hwnd.0 as isize, Ordering::SeqCst);
-            let _ = init_tx.send(Ok(()));
 
             debug!("Notification message loop starting");
             let mut msg = MSG::default();
@@ -785,6 +796,11 @@ mod windows_integration_tests {
         events
     }
 
+    fn drain_initial(l: &SystemEventListener) {
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = l.drain();
+    }
+
     #[repr(C)]
     struct DisplayStateMessage {
         guid: windows::core::GUID,
@@ -823,6 +839,7 @@ mod windows_integration_tests {
     #[test]
     fn session_lock_and_unlock_are_reported_once() {
         let l = SystemEventListener::start().unwrap();
+        drain_initial(&l);
         send(&l, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, 0);
         send(&l, WM_WTSSESSION_CHANGE, WTS_SESSION_LOCK, 0);
         send(&l, WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK, 0);
@@ -839,6 +856,7 @@ mod windows_integration_tests {
     #[test]
     fn suspend_and_every_resume_flavour_are_reported() {
         let l = SystemEventListener::start().unwrap();
+        drain_initial(&l);
         send(&l, WM_POWERBROADCAST, PBT_APMSUSPEND, 0);
         send(&l, WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0);
         send(&l, WM_POWERBROADCAST, PBT_APMRESUMESUSPEND, 0); // same wake: duplicate
@@ -863,6 +881,7 @@ mod windows_integration_tests {
     #[test]
     fn display_power_states_are_decoded() {
         let l = SystemEventListener::start().unwrap();
+        drain_initial(&l);
         send_power_setting(&l, GUID_CONSOLE_DISPLAY_STATE, 0);
         send_power_setting(&l, GUID_CONSOLE_DISPLAY_STATE, 0); // duplicate
         send_power_setting(&l, GUID_CONSOLE_DISPLAY_STATE, 2); // dimmed: no event
@@ -879,6 +898,7 @@ mod windows_integration_tests {
     #[test]
     fn foreign_power_setting_guid_is_ignored() {
         let l = SystemEventListener::start().unwrap();
+        drain_initial(&l);
         let other = windows::core::GUID::from_u128(0x12345678_1234_1234_1234_123456789abc);
         send_power_setting(&l, other, 0);
         assert!(drain(&l).is_empty());
@@ -887,6 +907,7 @@ mod windows_integration_tests {
     #[test]
     fn display_change_and_taskbar_created_are_reported() {
         let l = SystemEventListener::start().unwrap();
+        drain_initial(&l);
         send(&l, WM_DISPLAYCHANGE, 32, 0);
         let taskbar = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
         assert_ne!(taskbar, 0);

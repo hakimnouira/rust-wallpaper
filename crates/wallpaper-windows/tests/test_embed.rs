@@ -174,6 +174,7 @@ mod tests {
             mute: true,
             volume: 0,
             hardware_acceleration: HardwareAcceleration::Auto,
+            ..Default::default()
         };
 
         unsafe {

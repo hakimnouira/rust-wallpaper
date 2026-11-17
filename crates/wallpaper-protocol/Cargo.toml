@@ -6,5 +6,10 @@ license.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
 uuid.workspace = true
 wallpaper-core = { path = "../wallpaper-core" }
+
+[target.'cfg(windows)'.dependencies]
+tokio.workspace = true

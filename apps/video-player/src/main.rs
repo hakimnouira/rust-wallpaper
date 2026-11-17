@@ -141,6 +141,7 @@ fn main() -> Result<()> {
             mute,
             volume,
             hardware_acceleration: hwdec,
+            ..Default::default()
         },
     };
 

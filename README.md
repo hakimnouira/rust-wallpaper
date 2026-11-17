@@ -2,66 +2,97 @@
 
 A Windows-first live wallpaper engine written in Rust, inspired by the architecture and user-facing capabilities of [Lively Wallpaper](https://github.com/rocksdanister/lively).
 
-This project is an independent implementation. It uses Lively as a behavioral and architectural reference; it does not copy Lively source code.
+This is an independent implementation. Lively is used as a behavioral and architectural reference; its source code is not copied.
 
 ## Project status
 
-**Early scaffold — not yet a working wallpaper player.**
+**Windows release candidate.** Core playback, daemon, IPC, library UI, installer, and packaging workflows are implemented. A clean-machine interactive Windows install and runtime validation is still required before calling this a final/stable release.
 
-The first milestone establishes the workspace, project boundaries, and Windows integration entry point. Desktop attachment, video playback, monitor orchestration, and the UI will be implemented and tested in later milestones.
+The current workspace contains a Windows wallpaper daemon, a multi-monitor runtime supervisor, MPV-backed video playback, monitor assignment persistence, fullscreen-aware playback policies, system-event handling, player recovery, a named-pipe IPC service, and an initial egui desktop control panel.
 
-## Goals
+This is an early Windows video-wallpaper application, not a feature-complete replacement for mature wallpaper products. It can browse/import/remove library entries, assign videos, control monitor playback, and change performance profiles. Scene/WebView2 rendering and a polished updater are not included. Real-machine Windows validation remains required.
+
+## Current capabilities
 
 - Native Windows desktop wallpaper integration.
-- Video wallpapers with hardware decoding where supported.
-- Multiple-monitor awareness.
-- Explicit lifecycle management and reliable cleanup.
-- Pause policies for fullscreen applications, lock screen, and battery state.
-- Web wallpapers through WebView2 in an isolated player process.
-- A library and settings UI, kept separate from the wallpaper runtime.
+- MPV-backed video wallpaper playback.
+- Multi-monitor discovery and per-monitor assignment lifecycle.
+- Persistent monitor assignments.
+- Fullscreen-aware pause policies and manual pause state.
+- Session lock, display power, suspend/resume, topology and Explorer-restart notifications.
+- Player process health reporting and automatic recovery.
+- Runtime/core tests and Windows GNU cross-target compilation checks.
+- Initial desktop UI with library search/import, monitor topology visualization, per-monitor playback controls and saved performance profiles.
 
 ## Architecture
 
 ```text
 apps/
-  wallpaper-daemon/   Runtime coordinator and Windows entry point
-  desktop-ui/         Future user interface
+  wallpaper-daemon/   Runtime coordinator, Windows integration and IPC server
+  wallpaper-ui/       Native egui control panel and IPC client
+  video-player/       Player application
 crates/
-  wallpaper-core/     Domain types and orchestration contracts
-  wallpaper-windows/  Windows-specific APIs and monitor discovery
-  wallpaper-protocol/ IPC message types
+  wallpaper-core/     Domain types, policies, lifecycle and supervision
+  wallpaper-windows/  Win32 integration, monitor discovery and MPV management
+  wallpaper-protocol/ Versioned daemon/client IPC contract
 docs/
   architecture.md
 ```
 
-The daemon owns wallpaper lifecycle and native desktop integration. Player implementations will run independently and communicate with the daemon over a versioned IPC protocol. The UI will be a control surface, not the rendering host.
+The daemon owns wallpaper lifecycle, Win32 desktop integration and MPV processes. The desktop UI is a separate IPC client: it never manipulates wallpaper windows or starts players directly.
 
 ## Development
 
 Requirements:
 
 - Rust stable
-- Windows 10/11 for the native integration target
-- A C/C++ build toolchain may be required by future native media dependencies
+- Windows 10/11 for native desktop integration
+- MPV runtime bundled by `scripts/build-production.ps1` from `%USERPROFILE%\.mpv`
+- A C/C++ build toolchain may be required by native dependencies
 
-Run on Windows:
+Useful checks:
 
 ```powershell
-cargo check --workspace
+cargo fmt --all -- --check
 cargo test --workspace
-cargo run -p wallpaper-daemon
+cargo check --workspace
 ```
 
-On non-Windows systems, the workspace can be checked, but the Windows integration executable reports that it is Windows-only.
+For the Windows GNU cross-target check used by CI:
 
-## Milestones
+```powershell
+rustup target add x86_64-pc-windows-gnu
+cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+```
 
-1. Workspace and Windows platform boundary.
-2. Monitor enumeration and desktop host investigation.
-3. Native test window and desktop attachment prototype.
-4. Video player process and playback controls.
-5. Multi-monitor orchestration and performance policies.
-6. Web player, library, settings UI, and packaging.
+Run the daemon on Windows:
+
+```powershell
+cargo run -p wallpaper-daemon
+cargo run -p wallpaper-ui
+```
+
+The daemon stores its SQLite library and monitor assignments under `%LOCALAPPDATA%\RustWallpaper\library.db`. In a packaged install, demo wallpaper assets are resolved beside the installed binaries, independent of the process working directory.
+
+## Building a Windows release candidate
+
+On Windows, install the Rust stable toolchain, Python 3, OpenSSL, and a trusted x64 MPV distribution under `%USERPROFILE%\.mpv`. The package builder fails if required release inputs are missing:
+
+```powershell
+.\scripts\build-production.ps1
+```
+
+Distribute `dist\RustWallpaper-0.1.0-windows-x64.zip` together with its `.sha256` checksum. The ZIP contains the setup program and the companion binaries/assets it needs; users should extract the ZIP and run `RustWallpaper-Setup.exe`, not download the setup EXE alone. MPV and FFmpeg are third-party components: check their licenses and redistribution terms and include the applicable notices before public distribution.
+
+This repository currently has no selected project license, so the project source itself is not yet cleared for public redistribution. A Windows code-signing certificate has also not been configured; unsigned downloads may trigger SmartScreen warnings. Before calling the release stable, perform a clean Windows install/playback/startup/uninstall test using `docs/windows-smoke-tests.md`.
+
+## Current priorities
+
+1. Validate the installer and runtime on a clean Windows machine: install, playback, autostart, uninstall, multi-monitor, sleep/wake, lock/unlock, Explorer restart, MPV crash recovery and fullscreen games.
+2. Select a project license and audit third-party redistribution notices.
+3. Configure release signing and publish reproducible checksums.
+4. Continue polishing library management, tray integration and updater behavior.
+5. Evaluate WebView2 and scene wallpaper support after the video engine and application are stable.
 
 ## License
 

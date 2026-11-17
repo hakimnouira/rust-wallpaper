@@ -1,18 +1,36 @@
 //! Platform-independent domain types for the wallpaper engine.
 
+pub mod filter;
 pub mod health;
 pub mod library;
 pub mod monitors;
+pub mod online;
 pub mod registration;
 pub mod runtime;
 pub mod supervisor;
+pub mod workshop;
 
+pub use filter::{
+    AspectRatioFilter, CodecFilter, LibraryQuery, ResolutionFilter, SortDirection, SortKey,
+    StatusFilter,
+};
 pub use library::{LibraryError, WallpaperLibrary};
+pub use online::{
+    detect_media_extension_from_magic_bytes, download_online_file,
+    download_online_file_cancellable, fetch_thumbnail_bytes, get_curated_video_wallpapers,
+    resolve_direct_video_url, resolve_web_media_info, search_wallhaven, OnlineError,
+    OnlineWallpaper, ResolvedWebMedia,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
+pub use workshop::{
+    detect_steam_and_wallpaper_engine, find_steam_installations, find_steam_library_folders,
+    parse_workshop_directory, scan_wallpaper_engine_items, SteamEngineStatus, WorkshopItem,
+    WALLPAPER_ENGINE_APP_ID,
+};
 
 /// Stable identifier for an imported wallpaper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -54,9 +72,10 @@ pub enum WallpaperKind {
 }
 
 /// Hardware decoding acceleration options.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HardwareAcceleration {
+    #[default]
     Auto,
     D3d11va,
     Dxva2,
@@ -74,9 +93,32 @@ impl HardwareAcceleration {
     }
 }
 
-impl Default for HardwareAcceleration {
-    fn default() -> Self {
-        Self::Auto
+/// Video scaling and post-processing quality profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoQuality {
+    #[default]
+    Fast,
+    Balanced,
+    High,
+}
+
+impl VideoQuality {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fast" | "eco" | "bilinear" => Some(Self::Fast),
+            "balanced" | "spline36" => Some(Self::Balanced),
+            "high" | "lanczos" | "ewa_lanczos" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Balanced => "balanced",
+            Self::High => "high",
+        }
     }
 }
 
@@ -87,6 +129,12 @@ pub struct PlaybackConfig {
     pub mute: bool,
     pub volume: u32,
     pub hardware_acceleration: HardwareAcceleration,
+    #[serde(default)]
+    pub target_fps: Option<u32>,
+    #[serde(default)]
+    pub ram_budget_mb: Option<u32>,
+    #[serde(default)]
+    pub quality: VideoQuality,
 }
 
 impl Default for PlaybackConfig {
@@ -96,7 +144,42 @@ impl Default for PlaybackConfig {
             mute: true,
             volume: 100,
             hardware_acceleration: HardwareAcceleration::Auto,
+            target_fps: None,
+            ram_budget_mb: None,
+            quality: VideoQuality::Fast,
         }
+    }
+}
+
+/// Status of thumbnail generation and video metadata extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessingStatus {
+    Pending,
+    Processing,
+    #[default]
+    Completed,
+    Failed,
+}
+
+/// Helper function to classify video resolution into standard human-friendly categories.
+pub fn categorize_resolution(width: u32, height: u32) -> &'static str {
+    let min_dim = width.min(height);
+    let max_dim = width.max(height);
+    if max_dim >= 7680 || min_dim >= 4320 {
+        "8K UHD"
+    } else if max_dim >= 3840 || min_dim >= 2160 {
+        "4K UHD"
+    } else if max_dim >= 2560 || min_dim >= 1440 {
+        "1440p QHD"
+    } else if max_dim >= 1920 || min_dim >= 1080 {
+        "1080p FHD"
+    } else if max_dim >= 1280 || min_dim >= 720 {
+        "720p HD"
+    } else if max_dim >= 854 || min_dim >= 480 {
+        "480p SD"
+    } else {
+        "SD"
     }
 }
 
@@ -108,7 +191,40 @@ pub struct WallpaperMetadata {
     pub duration_secs: Option<f64>,
     pub width: Option<u32>,
     pub height: Option<u32>,
+    #[serde(default)]
+    pub aspect_ratio: Option<f64>,
+    #[serde(default)]
+    pub fps: Option<f64>,
+    #[serde(default)]
+    pub codec: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+    #[serde(default)]
+    pub resolution_category: Option<String>,
+    #[serde(default)]
+    pub processing_state: ProcessingStatus,
+    #[serde(default)]
+    pub processing_error: Option<String>,
     pub thumbnail_path: Option<String>,
+    #[serde(default)]
+    pub source_mtime: Option<u64>,
+}
+
+impl WallpaperMetadata {
+    pub fn is_ready(&self) -> bool {
+        self.processing_state == ProcessingStatus::Completed
+    }
+
+    pub fn is_failed(&self) -> bool {
+        self.processing_state == ProcessingStatus::Failed
+    }
+
+    pub fn is_processing(&self) -> bool {
+        matches!(
+            self.processing_state,
+            ProcessingStatus::Pending | ProcessingStatus::Processing
+        )
+    }
 }
 
 /// A wallpaper known to the local library.
@@ -133,7 +249,15 @@ impl Wallpaper {
                 duration_secs: None,
                 width: None,
                 height: None,
+                aspect_ratio: None,
+                fps: None,
+                codec: None,
+                file_size: None,
+                resolution_category: None,
+                processing_state: ProcessingStatus::Pending,
+                processing_error: None,
                 thumbnail_path: None,
+                source_mtime: None,
             },
             config: PlaybackConfig::default(),
         }

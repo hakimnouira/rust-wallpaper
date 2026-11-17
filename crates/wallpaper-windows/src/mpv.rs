@@ -15,14 +15,14 @@
 //! terminated by the operating system, preventing orphaned background processes.
 
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 #[cfg(not(windows))]
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -50,13 +50,35 @@ pub enum MpvError {
 
 /// Discovers the path to `mpv.exe` on Windows.
 pub fn find_mpv_executable() -> Result<PathBuf, MpvError> {
-    // 1. Check local bin/mpv
-    let local_path = PathBuf::from("bin").join("mpv").join("mpv.exe");
-    if local_path.is_file() {
-        return Ok(local_path);
+    // 1. Check relative to current running executable
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(exe_dir) = current_exe.parent() {
+            let candidates = [
+                exe_dir.join("mpv.exe"),
+                exe_dir.join("bin").join("mpv.exe"),
+                exe_dir.join("bin").join("mpv").join("mpv.exe"),
+            ];
+            for candidate in candidates {
+                if candidate.is_file() {
+                    return Ok(candidate);
+                }
+            }
+        }
     }
 
-    // 2. Check user profile .mpv
+    // 2. Check local working directory bin/mpv
+    let local_paths = [
+        PathBuf::from("bin").join("mpv").join("mpv.exe"),
+        PathBuf::from("bin").join("mpv.exe"),
+        PathBuf::from("mpv.exe"),
+    ];
+    for local_path in local_paths {
+        if local_path.is_file() {
+            return Ok(local_path);
+        }
+    }
+
+    // 3. Check user profile .mpv
     if let Ok(user_profile) = std::env::var("USERPROFILE") {
         let profile_path = PathBuf::from(user_profile).join(".mpv").join("mpv.exe");
         if profile_path.is_file() {
@@ -64,7 +86,7 @@ pub fn find_mpv_executable() -> Result<PathBuf, MpvError> {
         }
     }
 
-    // 3. Check system PATH
+    // 4. Check system PATH
     if let Ok(paths) = std::env::var("PATH") {
         for dir in std::env::split_paths(&paths) {
             let candidate = dir.join("mpv.exe");
@@ -406,7 +428,11 @@ pub struct MpvPlayer {
     pending_responses: Arc<Mutex<HashMap<u64, Sender<Result<Value, MpvError>>>>>,
     reader_running: Arc<AtomicBool>,
     active_decoder: String,
-    state: PlaybackState,
+    state: Arc<Mutex<PlaybackState>>,
+    command_tx: SyncSender<MpvCommand>,
+    probe_in_flight: Arc<AtomicBool>,
+    probe_results: Arc<Mutex<VecDeque<(bool, bool)>>>,
+    state_command_in_flight: Arc<AtomicBool>,
     volume: u32,
     muted: bool,
     started_at: Instant,
@@ -414,7 +440,17 @@ pub struct MpvPlayer {
     mock_stop_failure: bool,
 }
 
+struct MpvCommand {
+    command: Vec<Value>,
+    state_on_success: Option<PlaybackState>,
+    probe_result: Option<(Arc<AtomicBool>, Arc<Mutex<VecDeque<(bool, bool)>>>)>,
+    state_command_guard: Option<Arc<AtomicBool>>,
+    reply: Option<Sender<Result<Option<Value>, MpvError>>>,
+}
+
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+const COMMAND_QUEUE_CAPACITY: usize = 64;
+const COMMAND_TIMEOUT: Duration = Duration::from_millis(1500);
 
 impl MpvPlayer {
     /// Launches an MPV instance embedded in `wid` and establishes IPC control.
@@ -460,6 +496,7 @@ impl MpvPlayer {
             "--hwdec-codecs=all".to_string(),
             "--hwdec-software-fallback=yes".to_string(),
             format!("--loop-file={}", loop_arg),
+            "--image-display-duration=inf".to_string(),
             format!("--volume={}", launch_cfg.config.volume),
             "--idle=yes".to_string(),
             "--force-window=yes".to_string(),
@@ -475,6 +512,38 @@ impl MpvPlayer {
 
         if launch_cfg.config.mute {
             cmd_args.push("--mute=yes".to_string());
+        }
+
+        // Framerate limit (Wallpaper Engine style)
+        if let Some(target_fps) = launch_cfg.config.target_fps {
+            if target_fps > 0 {
+                cmd_args.push(format!("--vf=fps=fps={target_fps}"));
+            }
+        }
+
+        // Memory budget / RAM limit (Wallpaper Engine style)
+        if let Some(ram_mb) = launch_cfg.config.ram_budget_mb {
+            if ram_mb > 0 {
+                cmd_args.push(format!("--demuxer-max-bytes={ram_mb}M"));
+                cmd_args.push(format!("--demuxer-max-back-bytes={}M", (ram_mb / 2).max(4)));
+            }
+        }
+
+        // Scaling quality preset
+        match launch_cfg.config.quality {
+            wallpaper_core::VideoQuality::Fast => {
+                cmd_args.push("--scale=bilinear".to_string());
+                cmd_args.push("--cscale=bilinear".to_string());
+                cmd_args.push("--dscale=bilinear".to_string());
+            }
+            wallpaper_core::VideoQuality::Balanced => {
+                cmd_args.push("--scale=spline36".to_string());
+                cmd_args.push("--cscale=spline36".to_string());
+            }
+            wallpaper_core::VideoQuality::High => {
+                cmd_args.push("--scale=ewa_lanczos".to_string());
+                cmd_args.push("--cscale=ewa_lanczos".to_string());
+            }
         }
 
         cmd_args.push("--".to_string());
@@ -671,6 +740,29 @@ impl MpvPlayer {
             )));
         }
 
+        let state = Arc::new(Mutex::new(PlaybackState::Starting));
+        let probe_in_flight = Arc::new(AtomicBool::new(false));
+        let probe_results = Arc::new(Mutex::new(VecDeque::new()));
+        let state_command_in_flight = Arc::new(AtomicBool::new(false));
+        let (command_tx, command_rx) = sync_channel(COMMAND_QUEUE_CAPACITY);
+        let command_spawn = std::thread::Builder::new()
+            .name("mpv-ipc-command".into())
+            .spawn({
+                let writer = Arc::clone(&pipe_writer);
+                let pending = Arc::clone(&pending_responses);
+                let worker_state = Arc::clone(&state);
+                move || Self::command_loop(command_rx, writer, pending, worker_state)
+            });
+        if let Err(error) = command_spawn {
+            reader_running.store(false, Ordering::SeqCst);
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(MpvError::Player(format!(
+                "Failed to spawn MPV command worker: {error}"
+            )));
+        }
+
         let mut player = Self {
             child,
             pipe_path,
@@ -678,7 +770,11 @@ impl MpvPlayer {
             pending_responses,
             reader_running,
             active_decoder: "unknown".to_string(),
-            state: PlaybackState::Starting,
+            state,
+            command_tx,
+            probe_in_flight,
+            probe_results,
+            state_command_in_flight,
             volume: launch_cfg.config.volume,
             muted: launch_cfg.config.mute,
             started_at: Instant::now(),
@@ -722,7 +818,7 @@ impl MpvPlayer {
             "Hardware decoding telemetry verified"
         );
         player.active_decoder = detected;
-        player.state = PlaybackState::Playing;
+        *player.state.lock().unwrap() = PlaybackState::Playing;
 
         Ok(player)
     }
@@ -731,122 +827,168 @@ impl MpvPlayer {
         &self.pipe_path
     }
 
-    /// Sends a JSON command to the MPV IPC pipe.
-    pub fn send_command(&mut self, command: &[Value]) -> Result<Option<Value>, MpvError> {
-        let req_id = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let payload = json!({
-            "command": command,
-            "request_id": req_id
-        });
-
-        // 1. Serialize message before inserting into pending map
-        let mut msg = serde_json::to_string(&payload)?;
-        msg.push('\n');
-
-        let (tx, rx) = channel();
-
-        // 2. RAII guard ensures pending_responses entry is always removed on early error
-        struct PendingGuard<'a> {
-            pending: &'a Arc<Mutex<HashMap<u64, Sender<Result<Value, MpvError>>>>>,
-            req_id: u64,
-            completed: bool,
-        }
-        impl<'a> Drop for PendingGuard<'a> {
-            fn drop(&mut self) {
-                if !self.completed {
-                    if let Ok(mut map) = self.pending.lock() {
-                        map.remove(&self.req_id);
+    /// Serializes player commands through a dedicated worker so independent monitors do not
+    /// contend on MPV's pipe writer or response map.
+    fn command_loop(
+        receiver: Receiver<MpvCommand>,
+        writer: Arc<Mutex<Option<File>>>,
+        pending: Arc<Mutex<HashMap<u64, Sender<Result<Value, MpvError>>>>>,
+        state: Arc<Mutex<PlaybackState>>,
+    ) {
+        while let Ok(request) = receiver.recv() {
+            let req_id = REQUEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+            let probe_result = request.probe_result.clone();
+            let result: Result<Option<Value>, MpvError> = (|| {
+                let payload = json!({ "command": request.command, "request_id": req_id });
+                let mut message = serde_json::to_vec(&payload)?;
+                message.push(b'\n');
+                let (tx, rx) = channel();
+                pending.lock().unwrap().insert(req_id, tx);
+                {
+                    let mut writer = writer.lock().unwrap();
+                    let Some(writer) = writer.as_mut() else {
+                        pending.lock().unwrap().remove(&req_id);
+                        return Err(MpvError::IpcConnectionFailed(
+                            "IPC pipe writer not connected".into(),
+                        ));
+                    };
+                    if let Err(error) = writer.write_all(&message).and_then(|_| writer.flush()) {
+                        pending.lock().unwrap().remove(&req_id);
+                        return Err(MpvError::IpcIoError(error));
                     }
                 }
-            }
-        }
-
-        {
-            let mut pending = self.pending_responses.lock().unwrap();
-            pending.insert(req_id, tx);
-        }
-
-        let mut guard = PendingGuard {
-            pending: &self.pending_responses,
-            req_id,
-            completed: false,
-        };
-
-        // 3. Write and flush message to pipe
-        {
-            let mut writer_guard = self.pipe_writer.lock().unwrap();
-            if let Some(writer) = writer_guard.as_mut() {
-                if let Err(e) = writer.write_all(msg.as_bytes()) {
-                    return Err(MpvError::IpcIoError(e));
-                }
-                if let Err(e) = writer.flush() {
-                    return Err(MpvError::IpcIoError(e));
-                }
-            } else {
-                return Err(MpvError::IpcConnectionFailed(
-                    "IPC pipe writer not connected".into(),
-                ));
-            }
-        }
-
-        let deadline = Instant::now() + Duration::from_millis(1500);
-        let mut parsed_result = None;
-
-        while Instant::now() < deadline {
-            #[cfg(windows)]
-            {
-                use windows::Win32::UI::WindowsAndMessaging::{
-                    DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
+                let parsed = match rx.recv_timeout(COMMAND_TIMEOUT) {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) => return Err(error),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        pending.lock().unwrap().remove(&req_id);
+                        return Err(MpvError::IpcConnectionFailed(format!(
+                            "Timed out waiting for response to request_id {req_id}"
+                        )));
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(MpvError::IpcConnectionFailed(
+                            "IPC response channel disconnected".into(),
+                        ));
+                    }
                 };
-                let mut msg = MSG::default();
-                unsafe {
-                    while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                        let _ = TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
-                    }
-                }
-            }
-
-            match rx.try_recv() {
-                Ok(Ok(parsed)) => {
-                    parsed_result = Some(parsed);
-                    break;
-                }
-                Ok(Err(e)) => return Err(e),
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err(MpvError::IpcConnectionFailed(
-                        "IPC response channel disconnected".into(),
-                    ));
-                }
-            }
-        }
-
-        guard.completed = true;
-
-        match parsed_result {
-            Some(parsed) => {
-                if let Some(err) = parsed.get("error").and_then(|e| e.as_str()) {
-                    if err != "success" && err != "property unavailable" {
-                        debug!(
-                            request_id = req_id,
-                            error = err,
-                            "MPV command returned status"
-                        );
+                if let Some(status) = parsed.get("error").and_then(Value::as_str) {
+                    if status != "success" && status != "property unavailable" {
+                        return Err(MpvError::Player(format!("MPV command failed: {status}")));
                     }
                 }
                 Ok(parsed.get("data").cloned())
+            })();
+
+            if let Some((in_flight, results)) = probe_result {
+                let probe = match &result {
+                    Ok(data) => {
+                        let initialized = data.as_ref().is_some_and(|value| {
+                            let width = value
+                                .get("w")
+                                .or_else(|| value.get("dw"))
+                                .and_then(Value::as_u64);
+                            let height = value
+                                .get("h")
+                                .or_else(|| value.get("dh"))
+                                .and_then(Value::as_u64);
+                            matches!((width, height), (Some(w), Some(h)) if w > 0 && h > 0)
+                        });
+                        (true, initialized)
+                    }
+                    Err(_) => (false, false),
+                };
+                results.lock().unwrap().push_back(probe);
+                in_flight.store(false, Ordering::SeqCst);
             }
-            None => {
-                let mut pending = self.pending_responses.lock().unwrap();
-                pending.remove(&req_id);
-                Err(MpvError::IpcConnectionFailed(format!(
-                    "Timed out waiting for response to request_id {req_id}"
-                )))
+            if let Some(in_flight) = request.state_command_guard.as_ref() {
+                in_flight.store(false, Ordering::SeqCst);
+            }
+
+            if let (Ok(_), Some(new_state)) = (&result, request.state_on_success) {
+                *state.lock().unwrap() = new_state;
+            }
+            if let Some(reply) = request.reply {
+                let _ = reply.send(result);
+            } else if let Err(error) = result {
+                warn!(%error, "Queued MPV command failed");
             }
         }
+    }
+
+    /// Queues a playback-state change and returns immediately. The reported state changes only
+    /// after MPV acknowledges the command, so the runtime reconciler can retry failures.
+    pub fn queue_property_command(&self, property: &str, value: Value) -> Result<(), MpvError> {
+        self.command_tx
+            .try_send(MpvCommand {
+                command: vec![json!("set_property"), json!(property), value],
+                state_on_success: None,
+                probe_result: None,
+                state_command_guard: None,
+                reply: None,
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => MpvError::Player("MPV command queue is full".into()),
+                TrySendError::Disconnected(_) => {
+                    MpvError::IpcConnectionFailed("MPV command worker stopped".into())
+                }
+            })
+    }
+
+    pub fn queue_state_command(
+        &self,
+        command: &[Value],
+        state_on_success: PlaybackState,
+    ) -> Result<(), MpvError> {
+        if self.state_command_in_flight.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        if let Err(error) = self.command_tx.try_send(MpvCommand {
+            command: command.to_vec(),
+            state_on_success: Some(state_on_success),
+            probe_result: None,
+            state_command_guard: Some(Arc::clone(&self.state_command_in_flight)),
+            reply: None,
+        }) {
+            self.state_command_in_flight.store(false, Ordering::SeqCst);
+            return Err(match error {
+                TrySendError::Full(_) => MpvError::Player("MPV command queue is full".into()),
+                TrySendError::Disconnected(_) => {
+                    MpvError::IpcConnectionFailed("MPV command worker stopped".into())
+                }
+            });
+        }
+        Ok(())
+    }
+
+    /// Sends a JSON command to MPV and waits for a bounded response. This is intended for
+    /// infrequent setup and telemetry operations; playback reconciliation uses queued commands.
+    pub fn send_command(&mut self, command: &[Value]) -> Result<Option<Value>, MpvError> {
+        let (reply, response) = channel();
+        self.command_tx
+            .try_send(MpvCommand {
+                command: command.to_vec(),
+                state_on_success: None,
+                probe_result: None,
+                state_command_guard: None,
+                reply: Some(reply),
+            })
+            .map_err(|error| match error {
+                TrySendError::Full(_) => MpvError::Player("MPV command queue is full".into()),
+                TrySendError::Disconnected(_) => {
+                    MpvError::IpcConnectionFailed("MPV command worker stopped".into())
+                }
+            })?;
+        response
+            .recv_timeout(COMMAND_TIMEOUT + Duration::from_millis(100))
+            .map_err(|error| match error {
+                std::sync::mpsc::RecvTimeoutError::Timeout => {
+                    MpvError::IpcConnectionFailed("Timed out waiting for MPV command worker".into())
+                }
+                std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                    MpvError::IpcConnectionFailed("MPV command worker stopped".into())
+                }
+            })?
     }
 
     /// Queries the currently active hardware decoder from MPV.
@@ -884,7 +1026,7 @@ impl MpvPlayer {
     /// Pauses playback.
     pub fn pause(&mut self) -> Result<(), MpvError> {
         self.send_command(&[json!("set_property"), json!("pause"), json!(true)])?;
-        self.state = PlaybackState::Paused;
+        *self.state.lock().unwrap() = PlaybackState::Paused;
         info!("Video playback paused");
         Ok(())
     }
@@ -892,7 +1034,7 @@ impl MpvPlayer {
     /// Resumes playback.
     pub fn resume(&mut self) -> Result<(), MpvError> {
         self.send_command(&[json!("set_property"), json!("pause"), json!(false)])?;
-        self.state = PlaybackState::Playing;
+        *self.state.lock().unwrap() = PlaybackState::Playing;
         info!("Video playback resumed");
         Ok(())
     }
@@ -922,7 +1064,7 @@ impl MpvPlayer {
             ));
         }
 
-        if self.state == PlaybackState::Stopped {
+        if self.state() == PlaybackState::Stopped {
             // Repeated stop calls are safe: verify process is actually dead
             match self.child.try_wait() {
                 Ok(Some(_)) => return Ok(()),
@@ -964,7 +1106,7 @@ impl MpvPlayer {
         while Instant::now() < wait_deadline {
             match self.child.try_wait() {
                 Ok(Some(_)) => {
-                    self.state = PlaybackState::Stopped;
+                    *self.state.lock().unwrap() = PlaybackState::Stopped;
                     return Ok(());
                 }
                 Ok(None) => {
@@ -986,7 +1128,7 @@ impl MpvPlayer {
         // 3. Bounded wait after kill (up to 1000ms) to verify termination
         match self.child.wait_timeout(Duration::from_millis(1000)) {
             Ok(Some(_)) => {
-                self.state = PlaybackState::Stopped;
+                *self.state.lock().unwrap() = PlaybackState::Stopped;
                 Ok(())
             }
             Ok(None) => Err(MpvError::Player(
@@ -1075,15 +1217,49 @@ impl MpvPlayer {
         self.started_at.elapsed().as_secs()
     }
 
-    /// One-round-trip health probe; bounded to a single IPC request.
+    /// Requests an asynchronous one-round-trip health probe and returns the previous result, if
+    /// one has completed. A slow or unresponsive player never blocks the daemon polling loop.
+    pub fn request_video_probe(&self) -> Result<Option<(bool, bool)>, MpvError> {
+        let completed = self.probe_results.lock().unwrap().pop_front();
+        if !self.probe_in_flight.swap(true, Ordering::SeqCst) {
+            if let Err(error) = self.command_tx.try_send(MpvCommand {
+                command: vec![json!("get_property"), json!("video-params")],
+                state_on_success: None,
+                probe_result: Some((
+                    Arc::clone(&self.probe_in_flight),
+                    Arc::clone(&self.probe_results),
+                )),
+                state_command_guard: None,
+                reply: None,
+            }) {
+                self.probe_in_flight.store(false, Ordering::SeqCst);
+                return Err(match error {
+                    TrySendError::Full(_) => MpvError::Player("MPV command queue is full".into()),
+                    TrySendError::Disconnected(_) => {
+                        MpvError::IpcConnectionFailed("MPV command worker stopped".into())
+                    }
+                });
+            }
+        }
+        Ok(completed)
+    }
+
+    /// Synchronous compatibility helper for diagnostics and tests. Daemon health checks should
+    /// use `request_video_probe` instead.
     pub fn probe_video_output(&mut self) -> Result<(bool, bool), MpvError> {
         let params = self.send_command(&[json!("get_property"), json!("video-params")])?;
-        let dimensions = params.as_ref().and_then(|value| {
-            let width = value.get("w").or_else(|| value.get("dw"))?.as_u64()?;
-            let height = value.get("h").or_else(|| value.get("dh"))?.as_u64()?;
-            Some(width > 0 && height > 0)
+        let dimensions = params.as_ref().is_some_and(|value| {
+            let width = value
+                .get("w")
+                .or_else(|| value.get("dw"))
+                .and_then(Value::as_u64);
+            let height = value
+                .get("h")
+                .or_else(|| value.get("dh"))
+                .and_then(Value::as_u64);
+            matches!((width, height), (Some(w), Some(h)) if w > 0 && h > 0)
         });
-        Ok((true, dimensions.unwrap_or(false)))
+        Ok((true, dimensions))
     }
 
     /// Queries video rendering details (width, height, fps, gpu context, estimated-vf-fps).
@@ -1127,7 +1303,7 @@ impl MpvPlayer {
 
     /// Returns the current playback state.
     pub fn state(&self) -> PlaybackState {
-        self.state
+        *self.state.lock().unwrap()
     }
 }
 

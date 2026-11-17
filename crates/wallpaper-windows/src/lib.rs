@@ -3,6 +3,8 @@
 //! Provides monitor enumeration, desktop host (`WorkerW`/`Progman`) discovery,
 //! native Win32 wallpaper window orchestration, and embedded MPV video playback.
 
+pub mod autostart;
+pub mod browser_extension;
 pub mod desktop_host;
 pub mod events;
 pub mod fullscreen;
@@ -10,6 +12,12 @@ pub mod manager;
 pub mod mpv;
 pub mod policy;
 pub mod window;
+
+pub use autostart::{get_autostart_command, is_autostart_enabled, set_autostart};
+pub use browser_extension::{
+    find_crx_candidate, is_browser_extension_registered, register_browser_extension,
+    unregister_browser_extension, EXTENSION_ID, EXTENSION_VERSION, UPDATE_URL,
+};
 
 pub use desktop_host::{ensure_desktop_host, DesktopHost, DesktopHostDiagnostics, DesktopHostKind};
 pub use events::{ListenerPoll, SystemEventListener, SystemPlatformEvent};

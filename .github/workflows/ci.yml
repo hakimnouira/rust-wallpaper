@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - agent/runtime-completion
+      - work/application-platform
   pull_request:
     branches:
       - main
@@ -23,8 +24,8 @@ jobs:
           targets: x86_64-pc-windows-gnu
       - name: Check formatting
         run: cargo fmt --all -- --check
-      - name: Run platform-independent core tests
-        run: cargo test -p wallpaper-core
+      - name: Run workspace tests
+        run: cargo test -p wallpaper-core -p wallpaper-protocol
       - name: Install MinGW for bundled SQLite
         run: |
           sudo apt-get update
