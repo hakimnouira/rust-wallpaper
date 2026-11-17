@@ -12,7 +12,7 @@ impl DesktopApp {
             return;
         }
 
-        let url = wallpaper_core::resolve_direct_video_url(&raw_url);
+        let url = raw_url;
 
         // Determine filename & extension from URL
         let parsed_filename = url
@@ -477,87 +477,96 @@ impl DesktopApp {
                             egui::Frame::group(ui.style())
                                 .inner_margin(8.0)
                                 .show(ui, |ui| {
-                                    ui.set_width(card_width - 16.0);
-                                    ui.set_height(208.0);
+                                    ui.vertical(|ui| {
+                                        ui.set_width(card_width - 16.0);
+                                        ui.set_height(208.0);
 
-                                    // Preview thumbnail
-                                    let thumb_size = egui::vec2(card_width - 16.0, 110.0);
-                                    let tex = item
-                                        .preview_path
-                                        .as_deref()
-                                        .and_then(|p| self.get_or_load_texture(p));
+                                        // Preview thumbnail
+                                        let thumb_size = egui::vec2(card_width - 16.0, 110.0);
+                                        let tex = item
+                                            .preview_path
+                                            .as_deref()
+                                            .and_then(|p| self.get_or_load_texture(p));
 
-                                    if let Some(tex_id) = tex {
-                                        ui.image((tex_id, thumb_size));
-                                    } else {
-                                        ui.allocate_ui(thumb_size, |ui| {
-                                            ui.centered_and_justified(|ui| {
-                                                ui.small("No preview");
-                                            });
-                                        });
-                                    }
-
-                                    ui.add_space(4.0);
-                                    let title_resp = ui.add(
-                                        egui::Label::new(egui::RichText::new(&item.title).strong())
-                                            .truncate(),
-                                    );
-                                    title_resp.on_hover_text(&item.title);
-
-                                    ui.add_space(2.0);
-                                    ui.horizontal(|ui| {
-                                        if item.is_compatible_video {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(80, 200, 120),
-                                                "✔ Video",
-                                            );
+                                        if let Some(tex_id) = tex {
+                                            ui.image((tex_id, thumb_size));
                                         } else {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(180, 180, 180),
-                                                &item.item_type,
-                                            );
+                                            ui.allocate_ui(thumb_size, |ui| {
+                                                ui.centered_and_justified(|ui| {
+                                                    ui.small("No preview");
+                                                });
+                                            });
                                         }
-                                        if let Some(size) = item.file_size_bytes {
-                                            ui.small(format_file_size(size));
-                                        }
-                                    });
 
-                                    let in_library_wp = snapshot.wallpapers.iter().find(|w| {
-                                        w.source() == item.file_path.to_string_lossy()
-                                            || std::path::Path::new(w.source()) == item.file_path
-                                    });
+                                        ui.add_space(4.0);
+                                        let title_resp = ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&item.title).strong(),
+                                            )
+                                            .truncate(),
+                                        );
+                                        title_resp.on_hover_text(&item.title);
 
-                                    ui.add_space(4.0);
-                                    if let Some(wp) = in_library_wp {
+                                        ui.add_space(2.0);
                                         ui.horizontal(|ui| {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(100, 180, 255),
-                                                "✔ In Library",
-                                            );
-                                            if ui.button("▶ Apply").clicked() {
-                                                apply_req = Some(wp.id);
+                                            if item.is_compatible_video {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(80, 200, 120),
+                                                    "✔ Video",
+                                                );
+                                            } else {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(180, 180, 180),
+                                                    &item.item_type,
+                                                );
+                                            }
+                                            if let Some(size) = item.file_size_bytes {
+                                                ui.small(format_file_size(size));
                                             }
                                         });
-                                    } else if item.is_compatible_video {
-                                        ui.horizontal(|ui| {
-                                            if ui.button("⬇ Import").clicked() {
-                                                import_req = Some((
-                                                    item.file_path.to_string_lossy().to_string(),
-                                                    item.title.clone(),
-                                                    false,
-                                                ));
-                                            }
-                                            if ui.button("▶ Apply").clicked() {
-                                                import_req = Some((
-                                                    item.file_path.to_string_lossy().to_string(),
-                                                    item.title.clone(),
-                                                    true,
-                                                ));
-                                            }
+
+                                        let in_library_wp = snapshot.wallpapers.iter().find(|w| {
+                                            w.source() == item.file_path.to_string_lossy()
+                                                || std::path::Path::new(w.source())
+                                                    == item.file_path
                                         });
-                                    } else {
-                                        ui.small("(Scene / WE proprietary)");
-                                    }
+
+                                        ui.add_space(4.0);
+                                        if let Some(wp) = in_library_wp {
+                                            ui.horizontal(|ui| {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(100, 180, 255),
+                                                    "✔ In Library",
+                                                );
+                                                if ui.button("▶ Apply").clicked() {
+                                                    apply_req = Some(wp.id);
+                                                }
+                                            });
+                                        } else if item.is_compatible_video {
+                                            ui.horizontal(|ui| {
+                                                if ui.button("⬇ Import").clicked() {
+                                                    import_req = Some((
+                                                        item.file_path
+                                                            .to_string_lossy()
+                                                            .to_string(),
+                                                        item.title.clone(),
+                                                        false,
+                                                    ));
+                                                }
+                                                if ui.button("▶ Apply").clicked() {
+                                                    import_req = Some((
+                                                        item.file_path
+                                                            .to_string_lossy()
+                                                            .to_string(),
+                                                        item.title.clone(),
+                                                        true,
+                                                    ));
+                                                }
+                                            });
+                                        } else {
+                                            ui.small("(Scene / WE proprietary)");
+                                        }
+                                    });
                                 });
                         });
                     }
@@ -669,71 +678,91 @@ impl DesktopApp {
         let items = self.online_items.clone();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
-                    for chunk in items.chunks(cols) {
-                        ui.horizontal(|ui| {
-                            for item in chunk {
-                                ui.allocate_ui(egui::vec2(card_width, 175.0), |ui| {
-                                    egui::Frame::group(ui.style())
-                                        .inner_margin(8.0)
-                                        .show(ui, |ui| {
-                                            ui.set_width(card_width - 16.0);
-                                            ui.set_height(159.0);
+            for chunk in items.chunks(cols) {
+                ui.horizontal(|ui| {
+                    for item in chunk {
+                        ui.allocate_ui(egui::vec2(card_width, 140.0), |ui| {
+                            egui::Frame::group(ui.style())
+                                .inner_margin(10.0)
+                                .show(ui, |ui| {
+                                    ui.vertical(|ui| {
+                                        ui.set_width(card_width - 20.0);
+                                        ui.set_height(120.0);
 
-                                            let title_resp = ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(&item.title).strong(),
-                                                )
-                                                .truncate(),
+                                        let title_resp = ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&item.title)
+                                                    .strong()
+                                                    .size(13.0),
+                                            )
+                                            .truncate(),
+                                        );
+                                        title_resp.on_hover_text(&item.title);
+
+                                        ui.add_space(3.0);
+                                        ui.horizontal(|ui| {
+                                            ui.colored_label(
+                                                if item.is_video {
+                                                    egui::Color32::from_rgb(80, 200, 120)
+                                                } else {
+                                                    egui::Color32::from_rgb(100, 180, 255)
+                                                },
+                                                if item.is_video {
+                                                    "✔ Video Loop"
+                                                } else {
+                                                    "Image"
+                                                },
                                             );
-                                            title_resp.on_hover_text(&item.title);
+                                            ui.label("•");
+                                            ui.small(&item.resolution);
+                                        });
 
-                                            ui.horizontal(|ui| {
-                                                ui.colored_label(
-                                                    if item.is_video {
-                                                        egui::Color32::from_rgb(80, 200, 120)
-                                                    } else {
-                                                        egui::Color32::from_rgb(100, 180, 255)
-                                                    },
-                                                    if item.is_video { "Video Loop" } else { "Image" },
-                                                );
-                                                ui.small(&item.resolution);
-                                            });
-
+                                        ui.add_space(2.0);
+                                        ui.horizontal(|ui| {
                                             ui.small(format!("Source: {}", item.source_platform));
-                                            ui.add_space(4.0);
+                                            if let Some(size) = item.file_size_bytes {
+                                                ui.small(format!("({})", format_file_size(size)));
+                                            }
+                                        });
 
-                                            let status = self.online_download_status.get(&item.id);
-                                            if let Some(status_text) = status {
+                                        ui.add_space(6.0);
+                                        let status = self.online_download_status.get(&item.id);
+                                        if let Some(status_text) = status {
+                                            ui.horizontal(|ui| {
                                                 ui.colored_label(
                                                     egui::Color32::from_rgb(255, 200, 80),
                                                     status_text,
                                                 );
-                                                if let Some(cancelled) = self.download_cancellations.get(&item.id) {
+                                                if let Some(cancelled) =
+                                                    self.download_cancellations.get(&item.id)
+                                                {
                                                     if ui.small_button("Cancel").clicked() {
                                                         cancelled.store(true, Ordering::Relaxed);
                                                     }
                                                 }
-                                            } else if !item.is_video {
-                                                ui.add_enabled_ui(false, |ui| {
-                                                    ui.button("🖼 Image (Video Only)")
-                                                        .on_disabled_hover_text("Static image wallpapers are not supported by the video playback engine yet. Only video wallpapers (.mp4, .webm) are supported.");
-                                                });
-                                            } else {
-                                                ui.horizontal(|ui| {
-                                                    if ui.button("⬇ Import").clicked() {
-                                                        self.start_curated_download(item.clone(), false);
-                                                    }
-                                                    if ui.button("▶ Apply").clicked() {
-                                                        self.start_curated_download(item.clone(), true);
-                                                    }
-                                                });
-                                            }
-                                        });
+                                            });
+                                        } else if !item.is_video {
+                                            ui.add_enabled_ui(false, |ui| {
+                                                ui.button("🖼 Image (Video Only)")
+                                                    .on_disabled_hover_text("Static image wallpapers are not supported by the video playback engine yet. Only video wallpapers (.mp4, .webm) are supported.");
+                                            });
+                                        } else {
+                                            ui.horizontal(|ui| {
+                                                if ui.button("⬇ Import").clicked() {
+                                                    self.start_curated_download(item.clone(), false);
+                                                }
+                                                if ui.button("▶ Apply").clicked() {
+                                                    self.start_curated_download(item.clone(), true);
+                                                }
+                                            });
+                                        }
+                                    });
                                 });
-                            }
                         });
-                        ui.add_space(8.0);
                     }
                 });
+                ui.add_space(8.0);
+            }
+        });
     }
 }

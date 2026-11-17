@@ -77,14 +77,14 @@ async fn handle_connection(
     // Read headers
     let mut headers_end = None;
     while headers_end.is_none() {
-        let n = stream.read(&mut temp).await?;
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut temp)).await??;
         if n == 0 {
             return Ok(());
         }
         buffer.extend_from_slice(&temp[..n]);
 
-        if buffer.len() > 1024 * 1024 {
-            // 1MB request header limit
+        if buffer.len() > 16 * 1024 {
+            // 16KB request header limit
             send_response(&mut stream, 413, "Payload Too Large", "Request too large").await?;
             return Ok(());
         }
@@ -108,6 +108,32 @@ async fn handle_connection(
 
     let method = parts[0];
     let path = parts[1];
+    let host = lines.clone().find_map(|line| {
+        line.split_once(':')
+            .filter(|(name, _)| name.trim().eq_ignore_ascii_case("host"))
+            .map(|(_, value)| value.trim().to_ascii_lowercase())
+    });
+    let expected_port = stream.local_addr()?.port();
+    if !host.is_some_and(|value| {
+        value == format!("127.0.0.1:{expected_port}")
+            || value == format!("localhost:{expected_port}")
+    }) {
+        send_response(&mut stream, 403, "Forbidden", "Host is not allowed").await?;
+        return Ok(());
+    }
+    let origin = lines.clone().find_map(|line| {
+        line.split_once(':')
+            .filter(|(name, _)| name.trim().eq_ignore_ascii_case("origin"))
+            .map(|(_, value)| value.trim().to_owned())
+    });
+
+    if origin
+        .as_deref()
+        .is_some_and(|value| !is_allowed_origin(value))
+    {
+        send_response(&mut stream, 403, "Forbidden", "Origin is not allowed").await?;
+        return Ok(());
+    }
 
     // Handle CORS preflight
     if method == "OPTIONS" {
@@ -125,11 +151,22 @@ async fn handle_connection(
         }
     }
 
+    if content_length > 1024 * 1024 {
+        send_response(
+            &mut stream,
+            413,
+            "Payload Too Large",
+            "Request body too large",
+        )
+        .await?;
+        return Ok(());
+    }
+
     // Read remaining body if necessary
     let body_start = headers_pos + 4;
     let mut body_bytes = buffer[body_start..].to_vec();
     while body_bytes.len() < content_length {
-        let n = stream.read(&mut temp).await?;
+        let n = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut temp)).await??;
         if n == 0 {
             break;
         }
@@ -481,7 +518,6 @@ async fn handle_extension_update_manifest(
     let response = format!(
         "HTTP/1.1 200 OK\r\n\
 Content-Type: application/xml; charset=utf-8\r\n\
-Access-Control-Allow-Origin: *\r\n\
 Content-Length: {}\r\n\
 Connection: close\r\n\r\n\
 {}",
@@ -524,7 +560,6 @@ async fn handle_extension_crx_download(
         "HTTP/1.1 200 OK\r\n\
 Content-Type: application/x-chrome-extension\r\n\
 Content-Disposition: attachment; filename=\"rust-wallpaper.crx\"\r\n\
-Access-Control-Allow-Origin: *\r\n\
 Content-Length: {}\r\n\
 Connection: close\r\n\r\n",
         bytes.len()
@@ -660,7 +695,6 @@ async fn handle_extension_install_page(
     let response = format!(
         "HTTP/1.1 200 OK\r\n\
 Content-Type: text/html; charset=utf-8\r\n\
-Access-Control-Allow-Origin: *\r\n\
 Content-Length: {}\r\n\
 Connection: close\r\n\r\n\
 {}",
@@ -691,19 +725,51 @@ async fn dispatch_command(
     }
 }
 
+fn is_allowed_origin(origin: &str) -> bool {
+    origin == format!("chrome-extension://{}", wallpaper_windows::EXTENSION_ID)
+        || origin == format!("http://127.0.0.1:{DEFAULT_PORT}")
+        || origin == format!("http://localhost:{DEFAULT_PORT}")
+}
+
 async fn send_cors_preflight(
     stream: &mut TcpStream,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let response = "HTTP/1.1 204 No Content\r\n\
-Access-Control-Allow-Origin: *\r\n\
+    let response = format!(
+        "HTTP/1.1 204 No Content\r\n\
+Access-Control-Allow-Origin: chrome-extension://{}\r\n\
 Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
 Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
 Access-Control-Max-Age: 86400\r\n\
+Vary: Origin\r\n\
 Content-Length: 0\r\n\
-Connection: close\r\n\r\n";
+Connection: close\r\n\r\n",
+        wallpaper_windows::EXTENSION_ID
+    );
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn only_extension_and_loopback_origins_are_allowed() {
+        assert!(is_allowed_origin(&format!(
+            "chrome-extension://{}",
+            wallpaper_windows::EXTENSION_ID
+        )));
+        assert!(is_allowed_origin("http://127.0.0.1:24242"));
+        assert!(is_allowed_origin("http://localhost:24242"));
+        for origin in [
+            "https://evil.example",
+            "null",
+            "http://127.0.0.1.evil.example:24242",
+        ] {
+            assert!(!is_allowed_origin(origin), "allowed {origin}");
+        }
+    }
 }
 
 async fn send_json_response(
@@ -716,12 +782,14 @@ async fn send_json_response(
     let response = format!(
         "HTTP/1.1 {status_code} {status_text}\r\n\
 Content-Type: application/json; charset=utf-8\r\n\
-Access-Control-Allow-Origin: *\r\n\
+Access-Control-Allow-Origin: chrome-extension://{}\r\n\
 Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
 Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
+Vary: Origin\r\n\
 Content-Length: {}\r\n\
 Connection: close\r\n\r\n\
 {}",
+        wallpaper_windows::EXTENSION_ID,
         body.len(),
         body
     );

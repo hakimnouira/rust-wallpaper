@@ -17,7 +17,7 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 
-pub const EXTENSION_ID: &str = "lobmbbgchbehnkpnoljbllnnngbchjgk";
+pub const EXTENSION_ID: &str = "gemjknbkapmdcopknokbikcneknbpoij";
 pub const EXTENSION_VERSION: &str = "1.0.0";
 pub const UPDATE_URL: &str = "http://127.0.0.1:24242/extension/update.xml";
 

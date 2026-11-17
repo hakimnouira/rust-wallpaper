@@ -69,7 +69,11 @@ if (Test-Path $UserMpvDir) {
     }
 }
 
-# Copy Browser Extension
+# Package Browser Extension with the locally protected signing key
+python (Join-Path $PSScriptRoot "package-extension.py")
+if ($LASTEXITCODE -ne 0) {
+    throw "Browser extension packaging failed."
+}
 $DistExtDir = Join-Path $DistDir "extension"
 New-Item -ItemType Directory -Force -Path $DistExtDir | Out-Null
 Copy-Item (Join-Path $RootDir "extensions\chrome\*") $DistExtDir -Recurse -Force
