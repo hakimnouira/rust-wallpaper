@@ -33,15 +33,27 @@ def field_bytes(number: int, value: bytes) -> bytes:
     return varint((number << 3) | 2) + varint(len(value)) + value
 
 
+def find_openssl() -> str:
+    found = shutil.which("openssl")
+    if found:
+        return found
+    git_openssl = Path("C:/Program Files/Git/usr/bin/openssl.exe")
+    if git_openssl.is_file():
+        return str(git_openssl)
+    raise SystemExit("openssl executable not found. Install openssl or ensure Git is in PATH.")
+
+
 def main() -> None:
     if not KEY_PATH.is_file():
         raise SystemExit(f"Signing key not found: {KEY_PATH}. Set RUST_WALLPAPER_EXTENSION_KEY to a protected private key path.")
+
+    openssl_bin = find_openssl()
 
     with tempfile.TemporaryDirectory(prefix="rw-extension-") as temp_dir:
         temp = Path(temp_dir)
         public_der = temp / "public.der"
         subprocess.run(
-            ["openssl", "pkey", "-in", str(KEY_PATH), "-pubout", "-outform", "DER", "-out", str(public_der)],
+            [openssl_bin, "pkey", "-in", str(KEY_PATH), "-pubout", "-outform", "DER", "-out", str(public_der)],
             check=True,
             stdout=subprocess.DEVNULL,
         )
@@ -70,12 +82,12 @@ def main() -> None:
         signature_path = temp / "signature.bin"
         signed_data_path.write_bytes(signed_data)
         subprocess.run(
-            ["openssl", "dgst", "-sha256", "-sign", str(KEY_PATH), "-out", str(signature_path), str(signed_data_path)],
+            [openssl_bin, "dgst", "-sha256", "-sign", str(KEY_PATH), "-out", str(signature_path), str(signed_data_path)],
             check=True,
             stdout=subprocess.DEVNULL,
         )
         proof = field_bytes(1, public_key) + field_bytes(2, signature_path.read_bytes())
-        crx_header = field_bytes(1, proof) + field_bytes(0x10000, signed_header_data)
+        crx_header = field_bytes(1, proof) + field_bytes(10_000, signed_header_data)
         CRX_PATH.write_bytes(b"Cr24" + struct.pack("<II", 3, len(crx_header)) + crx_header + zip_bytes)
 
         extension_id = "".join(chr(ord("a") + nibble) for byte in crx_id for nibble in (byte >> 4, byte & 0x0F))

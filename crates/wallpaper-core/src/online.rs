@@ -198,6 +198,7 @@ pub fn get_curated_video_wallpapers() -> Vec<OnlineWallpaper> {
     ]
 }
 
+#[allow(dead_code)]
 fn validate_remote_url(input: &str) -> Result<Url, OnlineError> {
     validate_remote_url_with_policy(input, false)
 }
@@ -285,7 +286,9 @@ fn safe_get_with_policy(
     allow_local: bool,
 ) -> Result<ureq::Response, OnlineError> {
     let agent = ureq::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(60))
+        .timeout_write(Duration::from_secs(30))
         .redirects(0)
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
         .build();
@@ -315,6 +318,7 @@ fn safe_get_with_policy(
     Err(OnlineError::Network("Too many redirects".into()))
 }
 
+#[allow(dead_code)]
 fn fetch_html_content(url: &str, cancelled: Option<&AtomicBool>) -> Option<String> {
     fetch_html_content_with_policy(url, cancelled, false)
 }
@@ -599,6 +603,92 @@ where
     download_online_file_with_policy(url, destination, cancelled, max_bytes, progress, false)
 }
 
+fn download_via_curl<F>(
+    target_url: &str,
+    referer_url: &str,
+    temp_path: &Path,
+    destination: &Path,
+    cancelled: &AtomicBool,
+    max_bytes: u64,
+    mut progress: F,
+) -> Result<u64, OnlineError>
+where
+    F: FnMut(u64, Option<u64>),
+{
+    let curl_bin = if cfg!(windows) { "curl.exe" } else { "curl" };
+    let mut cmd = std::process::Command::new(curl_bin);
+    cmd.args([
+        "-s",
+        "-L",
+        "--fail",
+        "--max-filesize",
+        &max_bytes.to_string(),
+        "--max-time",
+        "600",
+        "--connect-timeout",
+        "30",
+        "-H",
+        "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "-H",
+        "Accept: */*",
+    ]);
+    let referer_header = format!("Referer: {referer_url}");
+    cmd.args(["-H", &referer_header]);
+    cmd.args(["-o"]);
+    cmd.arg(temp_path);
+    cmd.arg(target_url);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| OnlineError::Network(format!("Failed to spawn curl fallback: {e}")))?;
+    let started = Instant::now();
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(OnlineError::Cancelled);
+        }
+        if started.elapsed() > Duration::from_secs(600) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(OnlineError::Network("Download timed out".into()));
+        }
+        if let Ok(meta) = fs::metadata(temp_path) {
+            if meta.len() > max_bytes {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(OnlineError::TooLarge(max_bytes));
+            }
+            progress(meta.len(), None);
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            if status.success() {
+                let metadata = fs::metadata(temp_path)?;
+                let size = metadata.len();
+                if size > max_bytes {
+                    return Err(OnlineError::TooLarge(max_bytes));
+                }
+                validate_downloaded_media(temp_path)?;
+                progress(size, Some(size));
+                publish_download(temp_path, destination)?;
+                return Ok(size);
+            } else {
+                return Err(OnlineError::Network(format!(
+                    "Download failed: curl exited with code {status}"
+                )));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn download_online_file_with_policy<F>(
     url: &str,
     destination: &Path,
@@ -614,6 +704,7 @@ where
         fs::create_dir_all(parent)?;
     }
     let temp_path = temporary_download_path(destination);
+
     let result = (|| {
         if cancelled.load(Ordering::Relaxed) {
             return Err(OnlineError::Cancelled);
@@ -621,129 +712,74 @@ where
         validate_remote_url_with_policy(url, allow_local)?;
         let target_url = resolve_direct_video_url_with_policy(url, cancelled, allow_local)?;
         validate_remote_url_with_policy(&target_url, allow_local)?;
-        let response = match safe_get_with_policy(&target_url, Some(url), allow_local) {
-            Ok(resp) => resp,
-            Err(ureq_error) => {
-                let ureq_err = ureq_error;
-                let curl_bin = if cfg!(windows) { "curl.exe" } else { "curl" };
-                let mut cmd = std::process::Command::new(curl_bin);
-                cmd.args([
-                    "-s",
-                    "--fail",
-                    "--max-filesize",
-                    &max_bytes.to_string(),
-                    "--max-time",
-                    "300",
-                    "--max-redirs",
-                    "0",
-                    "--connect-timeout",
-                    "30",
-                    "-H",
-                    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                    "-H",
-                    "Accept: */*",
-                    "-H",
-                ]);
-                let referer_header = format!("Referer: {url}");
-                cmd.arg(referer_header);
-                cmd.args(["-o"]);
-                cmd.arg(&temp_path);
-                cmd.arg(&target_url);
 
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    const CREATE_NO_WINDOW: u32 = 0x08000000;
-                    cmd.creation_flags(CREATE_NO_WINDOW);
-                }
-
-                let mut child = cmd
-                    .spawn()
-                    .map_err(|_| OnlineError::Network(ureq_err.to_string()))?;
-                let started = Instant::now();
-                loop {
-                    if cancelled.load(Ordering::Relaxed)
-                        || started.elapsed() > Duration::from_secs(300)
-                    {
-                        let was_cancelled = cancelled.load(Ordering::Relaxed);
-                        let _ = child.kill();
-                        return if was_cancelled {
-                            Err(OnlineError::Cancelled)
-                        } else {
-                            Err(OnlineError::Network("Download timed out".into()))
-                        };
-                    }
-                    if let Ok(meta) = fs::metadata(&temp_path) {
-                        if meta.len() > max_bytes {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return Err(OnlineError::TooLarge(max_bytes));
-                        }
-                        progress(meta.len(), None);
-                    }
-                    if let Ok(Some(status)) = child.try_wait() {
-                        if status.success() {
-                            let metadata = fs::metadata(&temp_path)?;
-                            let size = metadata.len();
-                            if size > max_bytes {
-                                return Err(OnlineError::TooLarge(max_bytes));
-                            }
-                            validate_downloaded_media(&temp_path)?;
-                            progress(size, Some(size));
-                            publish_download(&temp_path, destination)?;
-                            return Ok(size);
-                        } else {
-                            return Err(OnlineError::Network(format!(
-                                "Download failed: {ureq_err} (curl fallback: {status})"
-                            )));
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(50));
+        // First attempt: ureq fast in-process download
+        let ureq_result: Result<u64, OnlineError> = (|| {
+            let response = safe_get_with_policy(&target_url, Some(url), allow_local)?;
+            let total = response
+                .header("Content-Length")
+                .and_then(|value| value.parse::<u64>().ok());
+            if total.is_some_and(|bytes| bytes > max_bytes) {
+                return Err(OnlineError::TooLarge(max_bytes));
+            }
+            if let Some(content_type) = response.header("Content-Type") {
+                if content_type.starts_with("text/html") {
+                    return Err(OnlineError::Network(
+                        "Remote server returned an HTML webpage or captcha page instead of a video"
+                            .into(),
+                    ));
                 }
             }
-        };
-        let total = response
-            .header("Content-Length")
-            .and_then(|value| value.parse::<u64>().ok());
-        if total.is_some_and(|bytes| bytes > max_bytes) {
-            return Err(OnlineError::TooLarge(max_bytes));
-        }
-        if let Some(content_type) = response.header("Content-Type") {
-            if content_type.starts_with("text/html") {
-                return Err(OnlineError::Network(
-                    "Remote server returned an HTML webpage or captcha page instead of a video"
-                        .into(),
-                ));
+            let mut reader = response.into_reader();
+            let mut file = File::create(&temp_path)?;
+            let mut buffer = [0u8; 64 * 1024];
+            let mut copied = 0u64;
+            loop {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(OnlineError::Cancelled);
+                }
+                let bytes = reader.read(&mut buffer)?;
+                if bytes == 0 {
+                    break;
+                }
+                copied = copied.saturating_add(bytes as u64);
+                if copied > max_bytes {
+                    return Err(OnlineError::TooLarge(max_bytes));
+                }
+                file.write_all(&buffer[..bytes])?;
+                progress(copied, total);
             }
-        }
-        let mut reader = response.into_reader();
-        let mut file = File::create(&temp_path)?;
-        let mut buffer = [0u8; 64 * 1024];
-        let mut copied = 0u64;
-        loop {
+            file.sync_all()?;
+            drop(file);
             if cancelled.load(Ordering::Relaxed) {
                 return Err(OnlineError::Cancelled);
             }
-            let bytes = reader.read(&mut buffer)?;
-            if bytes == 0 {
-                break;
+            validate_downloaded_media(&temp_path)?;
+            publish_download(&temp_path, destination)?;
+            Ok(copied)
+        })();
+
+        match ureq_result {
+            Ok(copied) => Ok(copied),
+            Err(OnlineError::Cancelled) => Err(OnlineError::Cancelled),
+            Err(OnlineError::TooLarge(max)) => Err(OnlineError::TooLarge(max)),
+            Err(_) => {
+                // ureq hit an error (e.g. read timeout, 403, Cloudflare/TLS quirk).
+                // Clean up partial temp file and fallback seamlessly to system curl!
+                let _ = fs::remove_file(&temp_path);
+                download_via_curl(
+                    &target_url,
+                    url,
+                    &temp_path,
+                    destination,
+                    cancelled,
+                    max_bytes,
+                    &mut progress,
+                )
             }
-            copied = copied.saturating_add(bytes as u64);
-            if copied > max_bytes {
-                return Err(OnlineError::TooLarge(max_bytes));
-            }
-            file.write_all(&buffer[..bytes])?;
-            progress(copied, total);
         }
-        file.sync_all()?;
-        drop(file);
-        if cancelled.load(Ordering::Relaxed) {
-            return Err(OnlineError::Cancelled);
-        }
-        validate_downloaded_media(&temp_path)?;
-        publish_download(&temp_path, destination)?;
-        Ok(copied)
     })();
+
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
     }
@@ -972,20 +1008,18 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::thread;
-
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0u8; 1024];
             let _ = stream.read(&mut request);
-            stream.write_all(b"HTTP/1.1 200 OK\\
-Content-Length: 8\\
-Connection: close\\
-\\
-12345678").unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n12345678",
+                )
+                .unwrap();
         });
-
         let temp_dir =
             std::env::temp_dir().join(format!("wallpaper-download-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
@@ -1007,25 +1041,52 @@ Connection: close\\
     }
 
     #[test]
-    fn download_reports_progress_and_atomically_replaces_destination() {
+    fn test_download_via_curl_fallback() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::thread;
-
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0u8; 1024];
             let _ = stream.read(&mut request);
-            stream.write_all(b"HTTP/1.1 200 OK\\
-Content-Length: 8\\
-Content-Type: video/mp4\\
-Connection: close\\
-\\
-12345678").unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nContent-Type: video/mp4\r\nConnection: close\r\n\r\n0123456789").unwrap();
         });
+        let temp_dir =
+            std::env::temp_dir().join(format!("wallpaper-curl-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let destination = temp_dir.join("curl_dest.mp4");
+        let temp_file = temp_dir.join("curl_dest.mp4.part");
+        let mut reports = Vec::new();
+        let result = download_via_curl(
+            &format!("http://{address}/video.mp4"),
+            "http://example.com",
+            &temp_file,
+            &destination,
+            &AtomicBool::new(false),
+            1024,
+            |received, total| reports.push((received, total)),
+        );
+        server.join().unwrap();
+        assert_eq!(result.unwrap(), 10);
+        assert_eq!(fs::read(&destination).unwrap(), b"0123456789");
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
 
+    #[test]
+    fn download_reports_progress_and_atomically_replaces_destination() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nContent-Type: video/mp4\r\nConnection: close\r\n\r\n12345678").unwrap();
+        });
         let temp_dir =
             std::env::temp_dir().join(format!("wallpaper-download-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
@@ -1053,19 +1114,13 @@ Connection: close\\
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::thread;
-
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = [0u8; 1024];
             let _ = stream.read(&mut request);
-            write!(stream, "HTTP/1.1 302 Found\\
-Location: http://127.0.0.1:9/secret\\
-Content-Length: 0\\
-Connection: close\\
-\\
-").unwrap();
+            write!(stream, "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
         });
         let result = safe_get_with_policy(&format!("http://{address}/redirect"), None, true);
         server.join().unwrap();

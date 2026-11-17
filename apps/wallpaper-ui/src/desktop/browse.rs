@@ -673,7 +673,7 @@ impl DesktopApp {
         ui.add_space(4.0);
 
         let available_width = ui.available_width();
-        let card_width = 240.0;
+        let card_width = 280.0;
         let cols = ((available_width / (card_width + 16.0)).floor() as usize).max(1);
         let items = self.online_items.clone();
 
@@ -681,13 +681,13 @@ impl DesktopApp {
             for chunk in items.chunks(cols) {
                 ui.horizontal(|ui| {
                     for item in chunk {
-                        ui.allocate_ui(egui::vec2(card_width, 140.0), |ui| {
+                        ui.allocate_ui(egui::vec2(card_width, 145.0), |ui| {
                             egui::Frame::group(ui.style())
                                 .inner_margin(10.0)
                                 .show(ui, |ui| {
                                     ui.vertical(|ui| {
                                         ui.set_width(card_width - 20.0);
-                                        ui.set_height(120.0);
+                                        ui.set_min_height(125.0);
 
                                         let title_resp = ui.add(
                                             egui::Label::new(
