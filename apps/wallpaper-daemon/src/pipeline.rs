@@ -415,7 +415,7 @@ mod tests {
                     .metadata
                     .thumbnail_path
                     .as_ref()
-                    .map_or(true, |p| !std::path::Path::new(p).exists())
+                    .is_none_or(|p| !std::path::Path::new(p).exists())
             {
                 pipeline
                     .submit(item.id, PathBuf::from(&item.metadata.source))

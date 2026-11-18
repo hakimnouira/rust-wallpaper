@@ -172,6 +172,7 @@ mod platform {
 
     impl WallpaperWindow {
         /// Creates and attaches a borderless wallpaper window directly into `host_hwnd`.
+        #[allow(clippy::too_many_arguments)] // Mirrors Win32 window geometry and host parameters.
         pub fn create(
             host_hwnd: HWND,
             device_name: String,

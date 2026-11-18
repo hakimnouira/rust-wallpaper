@@ -493,6 +493,117 @@ impl PlaybackPolicy {
     }
 }
 
+/// How aggressively foreground windows suspend wallpaper playback.
+///
+/// This is a user-facing override layered on top of a performance profile: the
+/// profile still controls debounce timing and polling, while this decides which
+/// foreground windows are "important enough" to pause for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FullscreenPauseMode {
+    /// Never pause because of foreground windows.
+    Never,
+    /// Pause only for exclusive/Direct3D fullscreen windows.
+    ExclusiveOnly,
+    /// Pause for borderless and exclusive fullscreen. Default for Balanced.
+    #[default]
+    Fullscreen,
+    /// Also pause for ordinary maximized windows. Default for Eco.
+    MaximizedAndFullscreen,
+}
+
+impl FullscreenPauseMode {
+    pub const ALL: [Self; 4] = [
+        Self::Never,
+        Self::ExclusiveOnly,
+        Self::Fullscreen,
+        Self::MaximizedAndFullscreen,
+    ];
+
+    /// Threshold used by [`PlaybackPolicy::pauses_for`].
+    pub fn threshold(self) -> Option<ForegroundKind> {
+        match self {
+            Self::Never => None,
+            Self::ExclusiveOnly => Some(ForegroundKind::ExclusiveFullscreen),
+            Self::Fullscreen => Some(ForegroundKind::BorderlessFullscreen),
+            Self::MaximizedAndFullscreen => Some(ForegroundKind::Maximized),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Never => "never",
+            Self::ExclusiveOnly => "exclusive_only",
+            Self::Fullscreen => "fullscreen",
+            Self::MaximizedAndFullscreen => "maximized_and_fullscreen",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "never" | "off" | "none" => Some(Self::Never),
+            "exclusive" | "exclusive_only" => Some(Self::ExclusiveOnly),
+            "fullscreen" | "borderless" | "default" => Some(Self::Fullscreen),
+            "maximized" | "maximized_and_fullscreen" | "aggressive" => {
+                Some(Self::MaximizedAndFullscreen)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Explicit, persistent playback automation settings.
+///
+/// These are deliberately separate from [`PerformanceProfile`]: a profile picks
+/// sane debounce/poll timings, while these settings let a user say "never pause
+/// for fullscreen" or "keep playing while the display is off" without giving up
+/// the rest of the profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaybackSettings {
+    pub fullscreen_pause: FullscreenPauseMode,
+    pub pause_on_lock: bool,
+    pub pause_on_display_off: bool,
+    pub pause_on_suspend: bool,
+}
+
+impl Default for PlaybackSettings {
+    fn default() -> Self {
+        Self {
+            fullscreen_pause: FullscreenPauseMode::Fullscreen,
+            pause_on_lock: true,
+            pause_on_display_off: true,
+            pause_on_suspend: true,
+        }
+    }
+}
+
+impl PlaybackSettings {
+    /// Reads the effective settings back out of a policy, so custom policies keep
+    /// their behavior when a profile is switched later.
+    pub fn from_policy(policy: &PlaybackPolicy) -> Self {
+        let fullscreen_pause = match policy.foreground_pause_threshold {
+            None => FullscreenPauseMode::Never,
+            Some(ForegroundKind::ExclusiveFullscreen) => FullscreenPauseMode::ExclusiveOnly,
+            Some(ForegroundKind::Maximized) => FullscreenPauseMode::MaximizedAndFullscreen,
+            Some(_) => FullscreenPauseMode::Fullscreen,
+        };
+        Self {
+            fullscreen_pause,
+            pause_on_lock: policy.pause_on_lock,
+            pause_on_display_off: policy.pause_on_display_power_off,
+            pause_on_suspend: policy.pause_on_system_suspend,
+        }
+    }
+
+    /// Applies these overrides to a policy without changing its timing knobs.
+    pub fn apply_to(self, policy: &mut PlaybackPolicy) {
+        policy.foreground_pause_threshold = self.fullscreen_pause.threshold();
+        policy.pause_on_lock = self.pause_on_lock;
+        policy.pause_on_display_power_off = self.pause_on_display_off;
+        policy.pause_on_system_suspend = self.pause_on_suspend;
+    }
+}
+
 /// Runtime telemetry captured for an active player.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlayerTelemetry {

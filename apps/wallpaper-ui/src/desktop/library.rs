@@ -10,7 +10,7 @@ impl DesktopApp {
         ui.add_space(8.0);
 
         // Import Box
-        ui.group(|ui| {
+        card_frame(&self.theme).show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.strong("Import:");
                 ui.add(
@@ -53,128 +53,132 @@ impl DesktopApp {
         ui.add_space(6.0);
 
         // Row 1: Search bar + View Mode + Thumb Scale
-        ui.horizontal(|ui| {
-            ui.label("🔍");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.query.search)
-                    .hint_text("Search title, file, codec, resolution…")
-                    .desired_width(260.0),
-            );
-            if !self.query.search.is_empty() && ui.small_button("✖").clicked() {
-                self.query.search.clear();
-            }
+        subtle_frame(&self.theme).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("🔍");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.query.search)
+                        .hint_text("Search title, file, codec, resolution…")
+                        .desired_width(260.0),
+                );
+                if !self.query.search.is_empty() && ui.small_button("✖").clicked() {
+                    self.query.search.clear();
+                }
 
-            ui.separator();
+                ui.separator();
 
-            // View Mode
-            if ui
-                .selectable_label(self.view_mode == ViewMode::Grid, "⊞ Grid")
-                .clicked()
-            {
-                self.view_mode = ViewMode::Grid;
-            }
-            if ui
-                .selectable_label(self.view_mode == ViewMode::List, "☰ List")
-                .clicked()
-            {
-                self.view_mode = ViewMode::List;
-            }
+                // View Mode
+                if ui
+                    .selectable_label(self.view_mode == ViewMode::Grid, "⊞ Grid")
+                    .clicked()
+                {
+                    self.view_mode = ViewMode::Grid;
+                }
+                if ui
+                    .selectable_label(self.view_mode == ViewMode::List, "☰ List")
+                    .clicked()
+                {
+                    self.view_mode = ViewMode::List;
+                }
 
-            ui.separator();
+                ui.separator();
 
-            // Thumbnail scale
-            if self.view_mode == ViewMode::Grid {
-                egui::ComboBox::from_id_salt("thumb_scale_combo")
-                    .selected_text(match self.thumb_scale {
-                        ThumbnailScale::Small => "Thumb: Small",
-                        ThumbnailScale::Medium => "Thumb: Medium",
-                        ThumbnailScale::Large => "Thumb: Large",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.thumb_scale,
-                            ThumbnailScale::Small,
-                            "Small (140px)",
-                        );
-                        ui.selectable_value(
-                            &mut self.thumb_scale,
-                            ThumbnailScale::Medium,
-                            "Medium (200px)",
-                        );
-                        ui.selectable_value(
-                            &mut self.thumb_scale,
-                            ThumbnailScale::Large,
-                            "Large (280px)",
-                        );
-                    });
-            }
+                // Thumbnail scale
+                if self.view_mode == ViewMode::Grid {
+                    egui::ComboBox::from_id_salt("thumb_scale_combo")
+                        .selected_text(match self.thumb_scale {
+                            ThumbnailScale::Small => "Thumb: Small",
+                            ThumbnailScale::Medium => "Thumb: Medium",
+                            ThumbnailScale::Large => "Thumb: Large",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.thumb_scale,
+                                ThumbnailScale::Small,
+                                "Small (140px)",
+                            );
+                            ui.selectable_value(
+                                &mut self.thumb_scale,
+                                ThumbnailScale::Medium,
+                                "Medium (200px)",
+                            );
+                            ui.selectable_value(
+                                &mut self.thumb_scale,
+                                ThumbnailScale::Large,
+                                "Large (280px)",
+                            );
+                        });
+                }
+            });
         });
 
         ui.add_space(4.0);
 
         // Row 2: Sort and Filters
-        ui.horizontal_wrapped(|ui| {
-            // Sort Key
-            egui::ComboBox::from_id_salt("sort_key_combo")
-                .selected_text(format!("Sort: {}", self.query.sort_key.label()))
-                .show_ui(ui, |ui| {
-                    for key in SortKey::ALL {
-                        ui.selectable_value(&mut self.query.sort_key, key, key.label());
-                    }
-                });
+        subtle_frame(&self.theme).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                // Sort Key
+                egui::ComboBox::from_id_salt("sort_key_combo")
+                    .selected_text(format!("Sort: {}", self.query.sort_key.label()))
+                    .show_ui(ui, |ui| {
+                        for key in SortKey::ALL {
+                            ui.selectable_value(&mut self.query.sort_key, key, key.label());
+                        }
+                    });
 
-            let dir_text = match self.query.sort_direction {
-                SortDirection::Ascending => "▲ Asc",
-                SortDirection::Descending => "▼ Desc",
-            };
-            if ui.button(dir_text).clicked() {
-                self.query.sort_direction = match self.query.sort_direction {
-                    SortDirection::Ascending => SortDirection::Descending,
-                    SortDirection::Descending => SortDirection::Ascending,
+                let dir_text = match self.query.sort_direction {
+                    SortDirection::Ascending => "▲ Asc",
+                    SortDirection::Descending => "▼ Desc",
                 };
-            }
+                if ui.button(dir_text).clicked() {
+                    self.query.sort_direction = match self.query.sort_direction {
+                        SortDirection::Ascending => SortDirection::Descending,
+                        SortDirection::Descending => SortDirection::Ascending,
+                    };
+                }
 
-            ui.separator();
+                ui.separator();
 
-            // Resolution
-            egui::ComboBox::from_id_salt("res_filter_combo")
-                .selected_text(self.query.resolution.label())
-                .show_ui(ui, |ui| {
-                    for item in ResolutionFilter::ALL {
-                        ui.selectable_value(&mut self.query.resolution, item, item.label());
-                    }
-                });
+                // Resolution
+                egui::ComboBox::from_id_salt("res_filter_combo")
+                    .selected_text(self.query.resolution.label())
+                    .show_ui(ui, |ui| {
+                        for item in ResolutionFilter::ALL {
+                            ui.selectable_value(&mut self.query.resolution, item, item.label());
+                        }
+                    });
 
-            // Aspect ratio
-            egui::ComboBox::from_id_salt("aspect_filter_combo")
-                .selected_text(self.query.aspect_ratio.label())
-                .show_ui(ui, |ui| {
-                    for item in AspectRatioFilter::ALL {
-                        ui.selectable_value(&mut self.query.aspect_ratio, item, item.label());
-                    }
-                });
+                // Aspect ratio
+                egui::ComboBox::from_id_salt("aspect_filter_combo")
+                    .selected_text(self.query.aspect_ratio.label())
+                    .show_ui(ui, |ui| {
+                        for item in AspectRatioFilter::ALL {
+                            ui.selectable_value(&mut self.query.aspect_ratio, item, item.label());
+                        }
+                    });
 
-            // Codec
-            egui::ComboBox::from_id_salt("codec_filter_combo")
-                .selected_text(self.query.codec.label())
-                .show_ui(ui, |ui| {
-                    for item in CodecFilter::ALL {
-                        ui.selectable_value(&mut self.query.codec, item, item.label());
-                    }
-                });
+                // Codec
+                egui::ComboBox::from_id_salt("codec_filter_combo")
+                    .selected_text(self.query.codec.label())
+                    .show_ui(ui, |ui| {
+                        for item in CodecFilter::ALL {
+                            ui.selectable_value(&mut self.query.codec, item, item.label());
+                        }
+                    });
 
-            // Status
-            egui::ComboBox::from_id_salt("status_filter_combo")
-                .selected_text(self.query.status.label())
-                .show_ui(ui, |ui| {
-                    for item in StatusFilter::ALL {
-                        ui.selectable_value(&mut self.query.status, item, item.label());
-                    }
-                });
+                // Status
+                egui::ComboBox::from_id_salt("status_filter_combo")
+                    .selected_text(self.query.status.label())
+                    .show_ui(ui, |ui| {
+                        for item in StatusFilter::ALL {
+                            ui.selectable_value(&mut self.query.status, item, item.label());
+                        }
+                    });
 
-            if self.query.is_filtered() && ui.button("✖ Reset Filters").clicked() {
-                self.query.reset_filters();
-            }
+                if self.query.is_filtered() && ui.button("✖ Reset Filters").clicked() {
+                    self.query.reset_filters();
+                }
+            });
         });
 
         ui.add_space(6.0);
@@ -445,12 +449,18 @@ impl DesktopApp {
                                                     ui.allocate_ui(thumb_dim, |ui| {
                                                         ui.centered_and_justified(|ui| {
                                                             ui.vertical_centered(|ui| {
-                                                                ui.colored_label(
+                                                                let err_label = ui.colored_label(
                                                                     egui::Color32::from_rgb(
                                                                         230, 80, 80,
                                                                     ),
                                                                     "⚠ Error",
                                                                 );
+                                                                if let Some(ref err) = wallpaper.metadata.processing_error {
+                                                                    err_label.on_hover_text(err.as_str());
+                                                                } else {
+                                                                    err_label.on_hover_text("Processing failed. Click Retry to try again.");
+                                                                }
+                                                                ui.small("(hover for details)");
                                                             });
                                                         });
                                                     });

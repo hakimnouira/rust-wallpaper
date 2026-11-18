@@ -369,8 +369,13 @@ fn execute_installation(
             "Disabling Windows startup launch…"
         };
         let _ = tx.send((0.96, status.into()));
-        wallpaper_windows::set_autostart(start_on_boot)
-            .map_err(|error| format!("Could not update Windows startup setting: {error}"))?;
+        if start_on_boot {
+            wallpaper_windows::set_autostart_for(&dest_main_exe)
+                .map_err(|error| format!("Could not enable Windows startup: {error}"))?;
+        } else {
+            wallpaper_windows::set_autostart(false)
+                .map_err(|error| format!("Could not disable Windows startup: {error}"))?;
+        }
     }
 
     // 9. Browser Extension Integration (Chrome, Edge, Brave)

@@ -19,10 +19,13 @@ This is an early Windows video-wallpaper application, not a feature-complete rep
 - Multi-monitor discovery and per-monitor assignment lifecycle.
 - Persistent monitor assignments.
 - Fullscreen-aware pause policies and manual pause state.
-- Session lock, display power, suspend/resume, topology and Explorer-restart notifications.
+- Single-instance enforcement for both the control panel and the daemon; launching the panel again restores and focuses the existing window instead of opening a duplicate.
+- Persistent daily logs under `%LOCALAPPDATA%\RustWallpaper\logs`; the Settings page can open the logs and application-data folders.
 - Player process health reporting and automatic recovery.
 - Runtime/core tests and Windows GNU cross-target compilation checks.
-- Initial desktop UI with library search/import, monitor topology visualization, per-monitor playback controls and saved performance profiles.
+- Redesigned control panel with an Overview dashboard, dedicated Appearance page, themed cards, and clearer navigation, alongside library search/import, monitor topology visualization, per-monitor playback controls, saved performance profiles, and persistent playback automation settings (fullscreen pause mode, lock/display/suspend policies, FPS limit).
+- Wallpaper Engine-style playback settings: configurable framerate limit, RAM budget and scaling filter applied to active players, plus explicit fullscreen pause behavior that survives profile changes and restarts.
+- Windows notification-area icon: closing the window keeps the app running; the tray menu can show the window or fully quit the UI and daemon. Windows autostart launches the UI hidden in the notification area.
 
 ## Architecture
 

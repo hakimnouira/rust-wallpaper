@@ -8,9 +8,11 @@
     "contextMenus",
     "notifications",
     "storage",
-    "activeTab"
+    "activeTab",
+    "webRequest"
   ],
   "host_permissions": [
+    "<all_urls>",
     "http://127.0.0.1:24242/*"
   ],
   "action": {

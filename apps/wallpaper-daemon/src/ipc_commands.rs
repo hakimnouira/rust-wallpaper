@@ -1,6 +1,77 @@
 #![cfg(windows)]
 
 use super::*;
+use wallpaper_core::{FullscreenPauseMode, PlaybackSettings};
+
+const FULLSCREEN_PAUSE_KEY: &str = "fullscreen_pause_mode";
+const PAUSE_ON_LOCK_KEY: &str = "pause_on_lock";
+const PAUSE_ON_DISPLAY_OFF_KEY: &str = "pause_on_display_off";
+const PAUSE_ON_SUSPEND_KEY: &str = "pause_on_suspend";
+
+fn load_bool(library: &WallpaperLibrary, key: &str, default: bool) -> bool {
+    match library.get_setting(key) {
+        Ok(Some(value)) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        _ => default,
+    }
+}
+
+/// Reads persistent playback automation settings. Missing or corrupt values fall
+/// back to the Balanced profile defaults rather than failing daemon startup.
+pub(super) fn load_playback_settings(library: &WallpaperLibrary) -> PlaybackSettings {
+    let default = PlaybackSettings::default();
+    PlaybackSettings {
+        fullscreen_pause: library
+            .get_setting(FULLSCREEN_PAUSE_KEY)
+            .ok()
+            .flatten()
+            .and_then(|value| FullscreenPauseMode::parse(&value))
+            .unwrap_or(default.fullscreen_pause),
+        pause_on_lock: load_bool(library, PAUSE_ON_LOCK_KEY, default.pause_on_lock),
+        pause_on_display_off: load_bool(
+            library,
+            PAUSE_ON_DISPLAY_OFF_KEY,
+            default.pause_on_display_off,
+        ),
+        pause_on_suspend: load_bool(library, PAUSE_ON_SUSPEND_KEY, default.pause_on_suspend),
+    }
+}
+
+fn persist_playback_settings(library: &WallpaperLibrary, settings: PlaybackSettings) {
+    let _ = library.set_setting(FULLSCREEN_PAUSE_KEY, settings.fullscreen_pause.as_str());
+    for (key, value) in [
+        (PAUSE_ON_LOCK_KEY, settings.pause_on_lock),
+        (PAUSE_ON_DISPLAY_OFF_KEY, settings.pause_on_display_off),
+        (PAUSE_ON_SUSPEND_KEY, settings.pause_on_suspend),
+    ] {
+        let _ = library.set_setting(key, if value { "1" } else { "0" });
+    }
+}
+
+/// Shared reader for the persisted global FPS/RAM/quality settings.
+pub(super) fn load_performance_settings(
+    library: &WallpaperLibrary,
+) -> (Option<u32>, Option<u32>, wallpaper_core::VideoQuality) {
+    let target_fps = match library.get_setting("target_fps") {
+        Ok(Some(value)) if value.is_empty() => None,
+        Ok(Some(value)) => value.parse().ok(),
+        _ => Some(30),
+    };
+    let ram_budget_mb = match library.get_setting("ram_budget_mb") {
+        Ok(Some(value)) if value.is_empty() => None,
+        Ok(Some(value)) => value.parse().ok(),
+        _ => Some(64),
+    };
+    let quality = library
+        .get_setting("quality")
+        .ok()
+        .flatten()
+        .and_then(|value| wallpaper_core::VideoQuality::parse(&value))
+        .unwrap_or_default();
+    (target_fps, ram_budget_mb, quality)
+}
 
 pub(super) fn dispatch_ipc(
     request: wallpaper_protocol::RequestEnvelope,
@@ -24,6 +95,10 @@ pub(super) fn dispatch_ipc(
 
     let result = match request.command {
         Command::Ping => Response::Pong,
+        Command::Quit => {
+            crate::request_shutdown();
+            Response::Accepted
+        }
         Command::ListWallpapers => match library.list() {
             Ok(items) => Response::WallpaperList(items),
             Err(error) => return failure(ErrorCode::Internal, error.to_string()),
@@ -177,26 +252,14 @@ pub(super) fn dispatch_ipc(
                 );
             }
             let mut play_config = wallpaper.config.clone();
+            let (default_fps, default_ram, global_quality) = load_performance_settings(library);
             if play_config.target_fps.is_none() {
-                play_config.target_fps = match library.get_setting("target_fps") {
-                    Ok(Some(value)) if value.is_empty() => None,
-                    Ok(Some(value)) => value.parse().ok(),
-                    _ => Some(30),
-                };
+                play_config.target_fps = default_fps;
             }
             if play_config.ram_budget_mb.is_none() {
-                play_config.ram_budget_mb = match library.get_setting("ram_budget_mb") {
-                    Ok(Some(value)) if value.is_empty() => None,
-                    Ok(Some(value)) => value.parse().ok(),
-                    _ => Some(64),
-                };
+                play_config.ram_budget_mb = default_ram;
             }
-            play_config.quality = library
-                .get_setting("quality")
-                .ok()
-                .flatten()
-                .and_then(|value| wallpaper_core::VideoQuality::parse(&value))
-                .unwrap_or(wallpaper_core::VideoQuality::Fast);
+            play_config.quality = global_quality;
             let assignment = Assignment {
                 video_path: PathBuf::from(&wallpaper.metadata.source),
                 config: play_config,
@@ -304,6 +367,14 @@ pub(super) fn dispatch_ipc(
             Response::Accepted
         }
         Command::GetProfile => Response::Profile(runtime.runtime.policy().profile),
+        Command::GetPlaybackSettings => {
+            Response::PlaybackSettings(runtime.runtime.playback_settings())
+        }
+        Command::SetPlaybackSettings(settings) => {
+            persist_playback_settings(library, settings);
+            runtime.runtime.set_playback_settings(settings);
+            Response::PlaybackSettings(settings)
+        }
         Command::GetStatus { monitor } => {
             let selected: Option<String> = match monitor {
                 Some(name) => match resolve_device(&name, known) {
@@ -378,22 +449,7 @@ pub(super) fn dispatch_ipc(
             Response::Accepted
         }
         Command::GetPerformanceSettings => {
-            let target_fps = match library.get_setting("target_fps") {
-                Ok(Some(value)) if value.is_empty() => None,
-                Ok(Some(value)) => value.parse().ok(),
-                _ => Some(30),
-            };
-            let ram_budget_mb = match library.get_setting("ram_budget_mb") {
-                Ok(Some(value)) if value.is_empty() => None,
-                Ok(Some(value)) => value.parse().ok(),
-                _ => Some(64),
-            };
-            let quality = library
-                .get_setting("quality")
-                .ok()
-                .flatten()
-                .and_then(|s| wallpaper_core::VideoQuality::parse(&s))
-                .unwrap_or_default();
+            let (target_fps, ram_budget_mb, quality) = load_performance_settings(library);
             Response::PerformanceSettings {
                 target_fps,
                 ram_budget_mb,

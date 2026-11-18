@@ -11,12 +11,18 @@ pub mod fullscreen;
 pub mod manager;
 pub mod mpv;
 pub mod policy;
+pub mod single_instance;
 pub mod window;
 
-pub use autostart::{get_autostart_command, is_autostart_enabled, set_autostart};
+pub use autostart::{
+    get_autostart_command, is_autostart_enabled, set_autostart, set_autostart_for,
+};
 pub use browser_extension::{
-    find_crx_candidate, is_browser_extension_registered, register_browser_extension,
-    unregister_browser_extension, EXTENSION_ID, EXTENSION_VERSION, UPDATE_URL,
+    enable_browser_shortcut_integration, ensure_canonical_crx, ensure_canonical_unpacked,
+    find_crx_candidate, find_installed_browser, find_unpacked_candidate,
+    is_browser_extension_registered, launch_browser_with_extension, register_browser_extension,
+    register_browser_extension_elevated, unregister_browser_extension, EXTENSION_ID,
+    EXTENSION_VERSION, UPDATE_URL,
 };
 
 pub use desktop_host::{ensure_desktop_host, DesktopHost, DesktopHostDiagnostics, DesktopHostKind};
@@ -30,6 +36,9 @@ pub use policy::{
     ActualPlayback, ControlCommand, ForegroundObservation, MonitorStatus, PendingWork,
     PlaybackSink, PlaybackSupervisor, PlayerCommand, PlayerSuspensionManager, ProcessBackoff,
     RuntimeEvent, StateDebouncer,
+};
+pub use single_instance::{
+    focus_existing_ui_window, SingleInstanceGuard, SingleInstanceRole, UI_WINDOW_TITLE,
 };
 pub use window::WallpaperWindow;
 

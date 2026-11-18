@@ -39,13 +39,12 @@ impl DesktopApp {
                 media_url
                     .split('?')
                     .next()
-                    .and_then(|u| u.split('/').filter(|s| !s.is_empty()).last())
+                    .and_then(|u| u.split('/').rfind(|s| !s.is_empty()))
                     .map(|s| {
                         s.rsplit_once('.')
                             .map(|(base, _)| base)
                             .unwrap_or(s)
-                            .replace('_', " ")
-                            .replace('-', " ")
+                            .replace(['_', '-'], " ")
                     })
                     .unwrap_or_else(|| "Web Wallpaper".into())
             });
@@ -662,6 +661,27 @@ impl DesktopApp {
                                     ui.vertical(|ui| {
                                         ui.set_width(card_width - 20.0);
                                         ui.set_min_height(125.0);
+
+                                        // Category color header bar
+                                        let header_color = match item.category.as_str() {
+                                            "Animation" => egui::Color32::from_rgb(80, 60, 160),
+                                            "Sci-Fi" => egui::Color32::from_rgb(40, 100, 160),
+                                            "Urban" | "Motion" => egui::Color32::from_rgb(50, 120, 80),
+                                            "Nature" => egui::Color32::from_rgb(40, 130, 60),
+                                            "Space" => egui::Color32::from_rgb(20, 40, 100),
+                                            _ => egui::Color32::from_rgb(60, 60, 80),
+                                        };
+                                        egui::Frame::none()
+                                            .fill(header_color)
+                                            .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                                            .show(ui, |ui| {
+                                                ui.set_width(card_width - 20.0);
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(220, 220, 240),
+                                                    egui::RichText::new(&item.category).small(),
+                                                );
+                                            });
+                                        ui.add_space(4.0);
 
                                         let title_resp = ui.add(
                                             egui::Label::new(

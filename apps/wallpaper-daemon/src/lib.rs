@@ -22,6 +22,8 @@ use wallpaper_windows::{
     SystemEventListener, WallpaperManager,
 };
 
+pub mod logging;
+
 #[cfg(windows)]
 mod ipc;
 #[cfg(windows)]
@@ -34,6 +36,11 @@ pub mod pipeline;
 pub mod web_api;
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
+
+/// Requests that the daemon stop its supervision loop and release players.
+pub(crate) fn request_shutdown() {
+    RUNNING.store(false, Ordering::SeqCst);
+}
 
 #[cfg(windows)]
 unsafe extern "system" fn ctrl_handler(_: u32) -> windows::Win32::Foundation::BOOL {
@@ -91,13 +98,22 @@ pub fn run_daemon_with_options(
     requested_profile: Option<PerformanceProfile>,
     external_running: Option<std::sync::Arc<AtomicBool>>,
 ) -> anyhow::Result<()> {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init();
+    logging::init("daemon", true);
 
+    #[cfg(windows)]
+    let _instance_guard = match wallpaper_windows::SingleInstanceGuard::acquire_daemon() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            info!("Rust Wallpaper daemon is already running; exiting");
+            return Ok(());
+        }
+        Err(error) => {
+            warn!(%error, "Could not acquire the daemon single-instance lock");
+            return Ok(());
+        }
+    };
+
+    RUNNING.store(true, Ordering::SeqCst);
     info!("Rust Wallpaper daemon starting");
     info!(?requested_profile, "RuntimeSupervisor orchestration active");
 
@@ -200,10 +216,18 @@ pub fn run_daemon_with_options(
             .context("failed to initialize persistent monitor assignments")?;
         let registry = MonitorRegistry::new(Box::new(assignment_store), fallback);
         let lifecycle = MonitorLifecycle::new(registry);
-        let mut runtime = RuntimeSupervisor::new(
-            RuntimeState::new(PlaybackPolicy::for_profile(profile)),
-            lifecycle,
-            HealthPolicy::default(),
+        let playback_settings = ipc_commands::load_playback_settings(&library);
+        let mut runtime_state = RuntimeState::new(PlaybackPolicy::for_profile(profile));
+        runtime_state.set_playback_settings(playback_settings);
+        let mut runtime = RuntimeSupervisor::new(runtime_state, lifecycle, HealthPolicy::default());
+        // Persisted global performance settings must reach wallpapers restored from
+        // the database before the first player launch, not only newly applied ones.
+        let (target_fps, ram_budget_mb, quality) =
+            ipc_commands::load_performance_settings(&library);
+        runtime.lifecycle.registry_mut().apply_playback_defaults(
+            target_fps,
+            ram_budget_mb,
+            quality,
         );
 
         let mut manager =

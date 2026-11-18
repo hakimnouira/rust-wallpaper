@@ -82,28 +82,34 @@ fn benchmark_library_scaling_100_500_1000_5000() {
         assert_eq!(library.len(), size);
 
         // 1. Benchmark: Full multi-token search
-        let mut query = LibraryQuery::default();
-        query.search = "cyberpunk 4k".to_string();
+        let query = LibraryQuery {
+            search: "cyberpunk 4k".to_string(),
+            ..Default::default()
+        };
 
         let start = Instant::now();
         let search_results = query.apply(&library);
         let search_duration = start.elapsed();
 
         // 2. Benchmark: Filtering (Resolution + Aspect + Codec)
-        let mut filter_query = LibraryQuery::default();
-        filter_query.resolution = ResolutionFilter::Uhd4k;
-        filter_query.aspect_ratio = AspectRatioFilter::Wide16x9;
-        filter_query.codec = CodecFilter::Hevc;
-        filter_query.status = StatusFilter::Ready;
+        let filter_query = LibraryQuery {
+            resolution: ResolutionFilter::Uhd4k,
+            aspect_ratio: AspectRatioFilter::Wide16x9,
+            codec: CodecFilter::Hevc,
+            status: StatusFilter::Ready,
+            ..Default::default()
+        };
 
         let start = Instant::now();
         let filtered_results = filter_query.apply(&library);
         let filter_duration = start.elapsed();
 
         // 3. Benchmark: Sorting (Sort by Resolution Descending)
-        let mut sort_query = LibraryQuery::default();
-        sort_query.sort_key = SortKey::Resolution;
-        sort_query.sort_direction = SortDirection::Descending;
+        let sort_query = LibraryQuery {
+            sort_key: SortKey::Resolution,
+            sort_direction: SortDirection::Descending,
+            ..Default::default()
+        };
 
         let start = Instant::now();
         let sorted_results = sort_query.apply(&library);
@@ -113,7 +119,7 @@ fn benchmark_library_scaling_100_500_1000_5000() {
         let start = Instant::now();
         let mut selected: HashSet<WallpaperId> = HashSet::new();
         for wp in &sorted_results {
-            selected.insert(wp.id.clone());
+            selected.insert(wp.id);
         }
         let select_all_duration = start.elapsed();
         assert_eq!(selected.len(), size);

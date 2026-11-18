@@ -5,6 +5,69 @@
 
 const API_BASE = "http://127.0.0.1:24242";
 
+// --- IDM-Style Network Media Sniffing ---
+// Captures video stream URLs from Pinterest (v1.pinimg.com), direct .mp4/.webm, etc.
+const tabMediaStreams = new Map(); // tabId -> Array of { url: string, isPinterest: boolean, timestamp: number }
+
+if (chrome.webRequest && chrome.webRequest.onBeforeRequest) {
+  chrome.webRequest.onBeforeRequest.addListener(
+    (details) => {
+      if (!details.url || details.tabId < 0) return;
+      const url = details.url;
+      const lower = url.toLowerCase();
+
+      // Filter for Pinterest video CDNs or direct video streams
+      const isPinterest = lower.includes("pinimg.com/videos/");
+      const isVideoFormat =
+        lower.includes(".mp4") || lower.includes(".webm") || lower.includes(".m3u8");
+
+      if (isPinterest || isVideoFormat) {
+        let cleanUrl = url;
+        // Convert Pinterest HLS playlist to direct 720p MP4 if possible
+        if (cleanUrl.includes("/hls/") && cleanUrl.includes(".m3u8")) {
+          cleanUrl = cleanUrl.replace("/hls/", "/mc/720p/").replace(".m3u8", ".mp4");
+        }
+
+        let streams = tabMediaStreams.get(details.tabId);
+        if (!streams) {
+          streams = [];
+          tabMediaStreams.set(details.tabId, streams);
+        }
+
+        // Avoid duplicates
+        if (!streams.some((item) => item.url === cleanUrl)) {
+          streams.unshift({ url: cleanUrl, isPinterest, timestamp: Date.now() });
+          if (streams.length > 25) streams.pop();
+
+          // Notify the active content script in this tab
+          chrome.tabs
+            .sendMessage(details.tabId, {
+              action: "MEDIA_STREAM_DETECTED",
+              mediaUrl: cleanUrl,
+              isPinterest,
+            })
+            .catch(() => {});
+        }
+      }
+    },
+    {
+      urls: [
+        "*://*.pinimg.com/videos/*",
+        "*://*.tiktokcdn.com/*",
+        "*://*.cdninstagram.com/*",
+        "*://v.redd.it/*",
+        "*://*/*.mp4*",
+        "*://*/*.webm*",
+        "*://*/*.m3u8*",
+      ],
+    }
+  );
+
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    tabMediaStreams.delete(tabId);
+  });
+}
+
 // Setup context menus
 chrome.runtime.onInstalled.addListener(() => {
   setupContextMenus();
@@ -65,6 +128,13 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
 // Handle incoming messages from content scripts and popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.action === "GET_CAPTURED_MEDIA") {
+    const tabId = sender.tab ? sender.tab.id : null;
+    const media = tabId ? (tabMediaStreams.get(tabId) || []) : [];
+    sendResponse({ success: true, media });
+    return false;
+  }
+
   if (message.action === "SET_WALLPAPER") {
     (async () => {
       const stored = await chrome.storage.local.get(["targetMonitor"]);

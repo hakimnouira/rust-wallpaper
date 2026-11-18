@@ -30,6 +30,10 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 use wallpaper_core::{PlaybackConfig, PlaybackState};
 
+type MpvResponse = Result<Value, MpvError>;
+type PendingResponses = Arc<Mutex<HashMap<u64, Sender<MpvResponse>>>>;
+type ProbeResults = Arc<Mutex<VecDeque<(bool, bool)>>>;
+
 #[derive(Debug, Error)]
 pub enum MpvError {
     #[error("MPV executable not found on system")]
@@ -165,7 +169,7 @@ impl MpvProcess {
             if let Ok(hdesk) = hdesk {
                 let mut buf = [0u16; 256];
                 let mut len = 0u32;
-                let handle = windows::Win32::Foundation::HANDLE(hdesk.0 as *mut core::ffi::c_void);
+                let handle = windows::Win32::Foundation::HANDLE(hdesk.0);
                 if GetUserObjectInformationW(
                     handle,
                     UOI_NAME,
@@ -187,11 +191,13 @@ impl MpvProcess {
         let mut desktop_wide: Vec<u16> = desk_name.encode_utf16().collect();
         let mut cmd_wide: Vec<u16> = cmd_line.encode_utf16().chain(std::iter::once(0)).collect();
 
-        let mut si = STARTUPINFOW::default();
-        si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-        si.lpDesktop = PWSTR(desktop_wide.as_mut_ptr());
-        si.dwFlags = STARTF_USESHOWWINDOW;
-        si.wShowWindow = SW_HIDE.0 as u16;
+        let si = STARTUPINFOW {
+            cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+            lpDesktop: PWSTR(desktop_wide.as_mut_ptr()),
+            dwFlags: STARTF_USESHOWWINDOW,
+            wShowWindow: SW_HIDE.0 as u16,
+            ..Default::default()
+        };
 
         let mut pi = PROCESS_INFORMATION::default();
 
@@ -425,13 +431,13 @@ pub struct MpvPlayer {
     child: MpvProcess,
     pipe_path: String,
     pipe_writer: Arc<Mutex<Option<File>>>,
-    pending_responses: Arc<Mutex<HashMap<u64, Sender<Result<Value, MpvError>>>>>,
+    pending_responses: PendingResponses,
     reader_running: Arc<AtomicBool>,
     active_decoder: String,
     state: Arc<Mutex<PlaybackState>>,
     command_tx: SyncSender<MpvCommand>,
     probe_in_flight: Arc<AtomicBool>,
-    probe_results: Arc<Mutex<VecDeque<(bool, bool)>>>,
+    probe_results: ProbeResults,
     state_command_in_flight: Arc<AtomicBool>,
     volume: u32,
     muted: bool,
@@ -443,7 +449,7 @@ pub struct MpvPlayer {
 struct MpvCommand {
     command: Vec<Value>,
     state_on_success: Option<PlaybackState>,
-    probe_result: Option<(Arc<AtomicBool>, Arc<Mutex<VecDeque<(bool, bool)>>>)>,
+    probe_result: Option<(Arc<AtomicBool>, ProbeResults)>,
     state_command_guard: Option<Arc<AtomicBool>>,
     reply: Option<Sender<Result<Option<Value>, MpvError>>>,
 }
@@ -626,8 +632,7 @@ impl MpvPlayer {
             }
         };
 
-        let pending_responses: Arc<Mutex<HashMap<u64, Sender<Result<Value, MpvError>>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending_responses: PendingResponses = Arc::new(Mutex::new(HashMap::new()));
         let reader_running = Arc::new(AtomicBool::new(true));
         let pipe_writer = Arc::new(Mutex::new(Some(writer_clone)));
 
@@ -832,7 +837,7 @@ impl MpvPlayer {
     fn command_loop(
         receiver: Receiver<MpvCommand>,
         writer: Arc<Mutex<Option<File>>>,
-        pending: Arc<Mutex<HashMap<u64, Sender<Result<Value, MpvError>>>>>,
+        pending: PendingResponses,
         state: Arc<Mutex<PlaybackState>>,
     ) {
         while let Ok(request) = receiver.recv() {
@@ -1150,8 +1155,10 @@ impl MpvPlayer {
 
             unsafe {
                 let proc_handle = self.child.raw_handle();
-                let mut counters = PROCESS_MEMORY_COUNTERS::default();
-                counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+                let mut counters = PROCESS_MEMORY_COUNTERS {
+                    cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+                    ..Default::default()
+                };
 
                 if GetProcessMemoryInfo(proc_handle, &mut counters, counters.cb).is_ok() {
                     return counters.WorkingSetSize as u64;

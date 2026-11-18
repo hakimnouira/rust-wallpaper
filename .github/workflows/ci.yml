@@ -34,3 +34,21 @@ jobs:
         env:
           CC_x86_64_pc_windows_gnu: x86_64-w64-mingw32-gcc
         run: cargo check --workspace --all-targets --target x86_64-pc-windows-gnu
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run portable tests
+        run: cargo test -p wallpaper-core -p wallpaper-protocol
+      - name: Check all Windows targets
+        run: cargo check --workspace --all-targets
+      - name: Build release binaries
+        run: cargo build --release -p wallpaper-ui -p wallpaper-daemon -p wallpaper-installer

@@ -1,9 +1,27 @@
 use super::*;
 
+fn open_folder(path: Option<std::path::PathBuf>) {
+    let Some(path) = path else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&path);
+    let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
+}
+
+fn fullscreen_label(mode: FullscreenPauseMode) -> &'static str {
+    match mode {
+        FullscreenPauseMode::Never => "Never pause for windows",
+        FullscreenPauseMode::ExclusiveOnly => "Exclusive fullscreen only",
+        FullscreenPauseMode::Fullscreen => "Borderless + exclusive fullscreen",
+        FullscreenPauseMode::MaximizedAndFullscreen => "Maximized windows + fullscreen",
+    }
+}
+
 impl DesktopApp {
     pub(super) fn render_settings(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         ui.heading("Settings & diagnostics");
-        ui.add_space(12.0);
+        ui.add_space(8.0);
+
         ui.label("Connection");
         ui.label(if snapshot.connected {
             "Connected to local wallpaper daemon"
@@ -12,6 +30,18 @@ impl DesktopApp {
         });
         if let Some(error) = &snapshot.last_error {
             ui.colored_label(egui::Color32::LIGHT_RED, error);
+        }
+        ui.small("Closing the window keeps Rust Wallpaper running in the notification area. Right-click its tray icon to show the app or fully quit.");
+        ui.horizontal(|ui| {
+            if ui.button("Open logs").clicked() {
+                open_folder(wallpaper_daemon::logging::logs_dir());
+            }
+            if ui.button("Open data folder").clicked() {
+                open_folder(wallpaper_daemon::logging::data_dir());
+            }
+        });
+        if let Some(logs) = wallpaper_daemon::logging::logs_dir() {
+            ui.small(format!("Logs: {}", logs.display()));
         }
         ui.separator();
         ui.label("Performance profile (Fullscreen & Power Saving)");
@@ -32,6 +62,57 @@ impl DesktopApp {
                 }
             }
         });
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label("Playback automation");
+        ui.small("Choose which situations pause your wallpapers. Changes apply to all monitors immediately.");
+        ui.add_space(4.0);
+
+        let mut automation = snapshot.playback_settings;
+        ui.horizontal(|ui| {
+            ui.label("Fullscreen policy:");
+            egui::ComboBox::from_id_salt("fullscreen_pause_mode")
+                .selected_text(fullscreen_label(automation.fullscreen_pause))
+                .show_ui(ui, |ui| {
+                    for mode in FullscreenPauseMode::ALL {
+                        if ui
+                            .selectable_label(
+                                automation.fullscreen_pause == mode,
+                                fullscreen_label(mode),
+                            )
+                            .clicked()
+                        {
+                            automation.fullscreen_pause = mode;
+                        }
+                    }
+                });
+        });
+        let mut automation_changed = automation != snapshot.playback_settings;
+        automation_changed |= ui
+            .checkbox(
+                &mut automation.pause_on_lock,
+                "Pause when Windows is locked",
+            )
+            .changed();
+        automation_changed |= ui
+            .checkbox(
+                &mut automation.pause_on_display_off,
+                "Pause while the display is off / sleeping",
+            )
+            .changed();
+        automation_changed |= ui
+            .checkbox(
+                &mut automation.pause_on_suspend,
+                "Pause while the system is suspended",
+            )
+            .changed();
+        if automation_changed {
+            self.send(
+                Command::SetPlaybackSettings(automation),
+                "Playback automation updated…",
+            );
+        }
 
         ui.add_space(6.0);
         ui.separator();
@@ -77,6 +158,12 @@ impl DesktopApp {
                     }
                     if ui
                         .selectable_value(&mut target_fps, Some(30), "30 FPS (Balanced)")
+                        .clicked()
+                    {
+                        settings_changed = true;
+                    }
+                    if ui
+                        .selectable_value(&mut target_fps, Some(45), "45 FPS (Smooth)")
                         .clicked()
                     {
                         settings_changed = true;
@@ -198,6 +285,105 @@ impl DesktopApp {
 
         ui.add_space(6.0);
         ui.separator();
+        ui.label("Wallpaper Rotation & Playlists (Auto-Cycle)");
+        ui.small("Automatically switch desktop wallpapers on a timed interval.");
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.auto_cycle_enabled, "Enable auto-cycle rotation");
+            if self.auto_cycle_enabled {
+                ui.label("· Every:");
+                let current_interval_text = match self.auto_cycle_interval_secs {
+                    60 => "1 Minute (Demo / Test)",
+                    300 => "5 Minutes",
+                    900 => "15 Minutes",
+                    1800 => "30 Minutes",
+                    3600 => "1 Hour",
+                    86400 => "24 Hours (Daily)",
+                    _ => "Custom",
+                };
+                egui::ComboBox::from_id_salt("auto_cycle_combo")
+                    .selected_text(current_interval_text)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.auto_cycle_interval_secs,
+                            60,
+                            "1 Minute (Demo / Test)",
+                        );
+                        ui.selectable_value(&mut self.auto_cycle_interval_secs, 300, "5 Minutes");
+                        ui.selectable_value(&mut self.auto_cycle_interval_secs, 900, "15 Minutes");
+                        ui.selectable_value(&mut self.auto_cycle_interval_secs, 1800, "30 Minutes");
+                        ui.selectable_value(&mut self.auto_cycle_interval_secs, 3600, "1 Hour");
+                        ui.selectable_value(
+                            &mut self.auto_cycle_interval_secs,
+                            86400,
+                            "24 Hours (Daily)",
+                        );
+                    });
+
+                ui.checkbox(&mut self.auto_cycle_shuffle, "Shuffle (Random order)");
+            }
+        });
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    snapshot.connected,
+                    egui::Button::new("⏭ Rotate to Next Wallpaper Now"),
+                )
+                .on_hover_text("Rotate desktop to another wallpaper from your library")
+                .clicked()
+            {
+                self.cycle_next_wallpaper(snapshot);
+            }
+            ui.small("(Hotkey: Alt+N)");
+        });
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label("Audio & Ambient Sound");
+        ui.small(
+            "Master volume and mute control for wallpapers with audio or ambient soundtracks.",
+        );
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            let mut vol = self.master_volume;
+            if ui
+                .add(egui::Slider::new(&mut vol, 0..=100).text("Master Volume"))
+                .changed()
+            {
+                self.master_volume = vol;
+                self.send(
+                    Command::SetVolume {
+                        monitor: None,
+                        volume: vol,
+                    },
+                    "Master volume updated…",
+                );
+            }
+            let mut muted = self.master_muted;
+            if ui
+                .checkbox(&mut muted, "Mute all audio (Hotkey: Alt+M)")
+                .changed()
+            {
+                self.master_muted = muted;
+                self.send(
+                    Command::SetMute {
+                        monitor: None,
+                        muted,
+                    },
+                    if muted {
+                        "Muted all audio…"
+                    } else {
+                        "Unmuted all audio…"
+                    },
+                );
+            }
+        });
+
+        ui.add_space(6.0);
+        ui.separator();
         ui.label("Windows Startup");
         ui.add_space(4.0);
 
@@ -254,10 +440,26 @@ impl DesktopApp {
         }
 
         ui.horizontal(|ui| {
-            if ext_registered {
-                ui.small("✔ Active: Launching Chrome, Edge, or Brave prompts to enable the companion extension.");
-            } else {
-                ui.small("Disabled: Browsers will not detect the companion extension.");
+            if ui.button("🚀 Launch Browser with Extension").clicked() {
+                match wallpaper_windows::launch_browser_with_extension(None) {
+                    Ok(()) => {
+                        self.notice = "Browser launched with RustWallpaper companion extension active!".into();
+                    }
+                    Err(e) => {
+                        self.notice = format!("Launch failed: {e}");
+                    }
+                }
+            }
+
+            if ui.button("⚡ Auto-Configure Shortcuts").clicked() {
+                match wallpaper_windows::enable_browser_shortcut_integration() {
+                    Ok(count) => {
+                        self.notice = format!("Injected extension auto-load into {count} browser shortcut(s)! Restart your browser to see it.");
+                    }
+                    Err(e) => {
+                        self.notice = format!("Shortcut configuration error: {e}");
+                    }
+                }
             }
 
             if ui.button("🌐 Browser Setup & Info").clicked() {
@@ -267,10 +469,13 @@ impl DesktopApp {
             }
         });
 
+        ui.add_space(2.0);
+        ui.small("💡 Chromium (Brave/Chrome) requires a browser restart for shortcut or policy changes to activate.");
+
         ui.separator();
         ui.label("Current implementation");
         ui.label("The daemon owns Win32 desktop integration, monitor lifecycle and MPV processes.");
-        ui.label("This UI communicates only through the versioned named-pipe protocol.");
+        ui.label("Playback commands are sent through the versioned named-pipe protocol.");
         ui.separator();
         ui.label("Future Roadmap");
         ui.label("WebView2 interactive HTML/web wallpapers, audio visualizer scenes, and automatic updater.");

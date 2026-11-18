@@ -278,6 +278,12 @@ impl LibraryQuery {
 
     /// Evaluates whether a wallpaper satisfies the current search and filter criteria.
     pub fn matches(&self, wallpaper: &Wallpaper) -> bool {
+        let normalized_search = self.search.trim().to_lowercase();
+        let tokens: Vec<&str> = normalized_search.split_whitespace().collect();
+        self.matches_with_tokens(wallpaper, &tokens)
+    }
+
+    fn matches_with_tokens(&self, wallpaper: &Wallpaper, tokens: &[&str]) -> bool {
         // 1. Status filter
         if !self.status.matches(wallpaper.metadata.processing_state) {
             return false;
@@ -302,9 +308,7 @@ impl LibraryQuery {
         }
 
         // 5. Multi-token search matching across title, filename, codec, resolution, and source path
-        let query = self.search.trim().to_lowercase();
-        if !query.is_empty() {
-            let tokens: Vec<&str> = query.split_whitespace().collect();
+        if !tokens.is_empty() {
             let title = wallpaper.title().to_lowercase();
             let source = wallpaper.source().to_lowercase();
             let filename = Path::new(&source)
@@ -384,8 +388,13 @@ impl LibraryQuery {
 
     /// Filters and sorts borrowed wallpaper items.
     pub fn apply<'a>(&self, items: impl IntoIterator<Item = &'a Wallpaper>) -> Vec<&'a Wallpaper> {
-        let mut filtered: Vec<&'a Wallpaper> =
-            items.into_iter().filter(|wp| self.matches(wp)).collect();
+        // Normalize and tokenize once per library query, not once per wallpaper.
+        let normalized_search = self.search.trim().to_lowercase();
+        let tokens: Vec<&str> = normalized_search.split_whitespace().collect();
+        let mut filtered: Vec<&'a Wallpaper> = items
+            .into_iter()
+            .filter(|wallpaper| self.matches_with_tokens(wallpaper, &tokens))
+            .collect();
         filtered.sort_by(|a, b| Self::compare(a, b, self.sort_key, self.sort_direction));
         filtered
     }
@@ -396,6 +405,7 @@ mod tests {
     use super::*;
     use crate::WallpaperKind;
 
+    #[allow(clippy::too_many_arguments)]
     fn make_test_wallpaper(
         title: &str,
         source: &str,
@@ -441,10 +451,12 @@ mod tests {
             ProcessingStatus::Completed,
         );
 
-        let mut query = LibraryQuery::default();
+        let mut query = LibraryQuery {
+            search: "forest".into(),
+            ..Default::default()
+        };
 
         // Search by title token
-        query.search = "forest".into();
         assert!(query.matches(&wp1));
         assert!(!query.matches(&wp2));
 
@@ -507,10 +519,12 @@ mod tests {
             ProcessingStatus::Completed,
         );
 
-        let mut query = LibraryQuery::default();
+        let mut query = LibraryQuery {
+            aspect_ratio: AspectRatioFilter::Wide16x9,
+            ..Default::default()
+        };
 
         // Aspect ratio 16:9
-        query.aspect_ratio = AspectRatioFilter::Wide16x9;
         assert!(query.matches(&wp_fhd));
         assert!(!query.matches(&wp_ultra));
         assert!(!query.matches(&wp_portrait));
@@ -561,7 +575,7 @@ mod tests {
             ProcessingStatus::Completed,
         );
 
-        let items = vec![&wp_a, &wp_b, &wp_c];
+        let items = [&wp_a, &wp_b, &wp_c];
 
         // Sort by Title Ascending
         let query_title = LibraryQuery {

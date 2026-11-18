@@ -8,7 +8,9 @@ pub mod client;
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use uuid::Uuid;
-use wallpaper_core::{PerformanceProfile, PlaybackState, VideoQuality, Wallpaper, WallpaperId};
+use wallpaper_core::{
+    PerformanceProfile, PlaybackSettings, PlaybackState, VideoQuality, Wallpaper, WallpaperId,
+};
 
 /// Increment when an incompatible wire-contract change is made.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -63,6 +65,9 @@ pub enum Command {
         profile: PerformanceProfile,
     },
     GetProfile,
+    GetPlaybackSettings,
+    /// Persistent playback automation: fullscreen threshold and system-event pauses.
+    SetPlaybackSettings(PlaybackSettings),
     ApplyWallpaper {
         wallpaper_id: WallpaperId,
         monitor: Option<String>,
@@ -96,6 +101,8 @@ pub enum Command {
         quality: VideoQuality,
     },
     GetPerformanceSettings,
+    /// Stop the daemon and all wallpaper players after acknowledging the request.
+    Quit,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -170,6 +177,7 @@ pub enum Response {
     },
     PlayerStatus(Vec<PlayerStatusInfo>),
     Profile(PerformanceProfile),
+    PlaybackSettings(PlaybackSettings),
     PerformanceSettings {
         target_fps: Option<u32>,
         ram_budget_mb: Option<u32>,
@@ -285,6 +293,36 @@ mod tests {
         let encoded = serde_json::to_vec(&unassign).unwrap();
         let decoded: RequestEnvelope = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(decoded, unassign);
+
+        let quit = RequestEnvelope::new(Command::Quit);
+        let encoded = serde_json::to_vec(&quit).unwrap();
+        let decoded: RequestEnvelope = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, quit);
+    }
+
+    #[test]
+    fn playback_settings_round_trip() {
+        use wallpaper_core::{FullscreenPauseMode, PlaybackSettings};
+
+        let settings = PlaybackSettings {
+            fullscreen_pause: FullscreenPauseMode::ExclusiveOnly,
+            pause_on_lock: false,
+            pause_on_display_off: true,
+            pause_on_suspend: false,
+        };
+        let request = RequestEnvelope::new(Command::SetPlaybackSettings(settings));
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<RequestEnvelope>(&encoded).unwrap(),
+            request
+        );
+
+        let response = ResponseEnvelope::new(Uuid::new_v4(), Response::PlaybackSettings(settings));
+        let encoded = serde_json::to_vec(&response).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ResponseEnvelope>(&encoded).unwrap(),
+            response
+        );
     }
 
     #[test]

@@ -321,11 +321,256 @@
     });
   }
 
-  // Scan for existing videos and Steam items
+  // --- Pinterest Integration ---
+  const capturedMediaUrls = new Set();
+
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message.action === "MEDIA_STREAM_DETECTED" && message.mediaUrl) {
+      capturedMediaUrls.add(message.mediaUrl);
+      scanPinterest();
+    }
+  });
+
+  function extractPinterestMedia(cardOrContainer) {
+    // 1. Direct <video> element
+    const video =
+      cardOrContainer.querySelector("video") ||
+      (cardOrContainer.tagName === "VIDEO" ? cardOrContainer : null);
+    if (video) {
+      const src = video.currentSrc || video.src || video.querySelector("source")?.src;
+      if (
+        src &&
+        !src.startsWith("blob:") &&
+        (src.includes(".mp4") || src.includes(".webm") || src.includes("pinimg.com"))
+      ) {
+        return src;
+      }
+    }
+
+    // 2. Any captured media URLs from background sniffer for this tab
+    if (capturedMediaUrls.size > 0) {
+      for (const url of Array.from(capturedMediaUrls).reverse()) {
+        if (url.includes("pinimg.com/videos/")) {
+          return url;
+        }
+      }
+      for (const url of Array.from(capturedMediaUrls).reverse()) {
+        if (url.includes(".mp4")) {
+          return url;
+        }
+      }
+    }
+
+    // 3. Schema.org JSON-LD
+    try {
+      const scripts = document.querySelectorAll('script[type="application/ld+json"]');
+      for (const script of scripts) {
+        const text = script.textContent || "";
+        if (text.includes("contentUrl")) {
+          const data = JSON.parse(text);
+          if (data.contentUrl) return data.contentUrl;
+        }
+      }
+    } catch (_) {}
+
+    // 4. OpenGraph video
+    const ogVideo = document.querySelector(
+      'meta[property="og:video"], meta[property="og:video:secure_url"]'
+    );
+    if (ogVideo && ogVideo.content) {
+      return ogVideo.content;
+    }
+
+    // 5. Pin link inside the card
+    const link =
+      cardOrContainer.querySelector('a[href*="/pin/"]') ||
+      cardOrContainer.closest('a[href*="/pin/"]');
+    if (link && link.href) {
+      return link.href;
+    }
+
+    // 6. Current page URL if on pin page
+    if (window.location.pathname.includes("/pin/")) {
+      return window.location.href;
+    }
+
+    return null;
+  }
+
+  function cleanPinterestTitle(raw) {
+    if (!raw) return "Pinterest Wallpaper";
+    return raw
+      .replace(/\s*\|\s*Pinterest\s*$/i, "")
+      .replace(/\s*on\s*Pinterest\s*$/i, "")
+      .trim();
+  }
+
+  function scanPinterest() {
+    if (!window.location.hostname.includes("pinterest.")) return;
+
+    // 1. Pin Detail / Closeup Page Action Button
+    if (window.location.pathname.includes("/pin/")) {
+      const actionContainer = document.querySelector(
+        '[data-test-id="pin-action-buttons"], [data-test-id="closeup-action-bar"], [data-test-id="pin-closeup"]'
+      );
+      if (actionContainer && !document.getElementById("RustWallpaperPinterestBtn")) {
+        const pBtn = document.createElement("button");
+        pBtn.id = "RustWallpaperPinterestBtn";
+        pBtn.className = "rust-wp-pinterest-action-btn";
+        pBtn.type = "button";
+        pBtn.innerHTML = `<span>🖥️ Set as Wallpaper</span>`;
+
+        pBtn.addEventListener("click", async (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+
+          const mediaUrl = extractPinterestMedia(document.body);
+          const rawTitle = document.querySelector("h1")?.textContent?.trim() || document.title;
+          const title = cleanPinterestTitle(rawTitle);
+
+          showStatus(pBtn, "Sending…", null);
+
+          try {
+            const response = await chrome.runtime.sendMessage({
+              action: "SET_WALLPAPER",
+              url: mediaUrl || window.location.href,
+              title,
+            });
+
+            if (response && response.success) {
+              showStatus(pBtn, "Applied! ✨", true);
+            } else {
+              showStatus(pBtn, "Failed", false);
+            }
+          } catch (_) {
+            showStatus(pBtn, "Offline", false);
+          }
+        });
+
+        actionContainer.appendChild(pBtn);
+      }
+    }
+
+    // 2. Video Pins in Feed / Grid
+    const pinCards = document.querySelectorAll(
+      '[data-test-id="pin"], [data-test-id="pinWrapper"], [data-grid-item="true"], div[role="listitem"]'
+    );
+
+    pinCards.forEach((card) => {
+      const hasVideo =
+        card.querySelector("video") || card.querySelector('[data-test-id="video-player"]');
+      if (!hasVideo) return;
+
+      if (card.dataset.rustWallpaperAttached) return;
+      card.dataset.rustWallpaperAttached = "true";
+
+      const cardPos = window.getComputedStyle(card).position;
+      if (cardPos === "static") {
+        card.classList.add(CONTAINER_CLASS);
+      }
+
+      const cardBtn = document.createElement("button");
+      cardBtn.className = BADGE_CLASS;
+      cardBtn.type = "button";
+      cardBtn.title = "Set this Pinterest video as live desktop wallpaper";
+      cardBtn.innerHTML = `
+        <svg class="rust-wp-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+          <line x1="8" y1="21" x2="16" y2="21"></line>
+          <line x1="12" y1="17" x2="12" y2="21"></line>
+        </svg>
+        <span class="rust-wp-label">Set as Wallpaper</span>
+      `;
+
+      cardBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+
+        const mediaUrl = extractPinterestMedia(card);
+        const link = card.querySelector('a[href*="/pin/"]');
+        const rawTitle =
+          card.querySelector("h2, h3, [title]")?.textContent?.trim() || "Pinterest Video Pin";
+        const title = cleanPinterestTitle(rawTitle);
+
+        showStatus(cardBtn, "Sending…", null);
+
+        try {
+          const response = await chrome.runtime.sendMessage({
+            action: "SET_WALLPAPER",
+            url: mediaUrl || (link ? link.href : window.location.href),
+            title,
+          });
+
+          if (response && response.success) {
+            showStatus(cardBtn, "Applied! ✨", true);
+          } else {
+            showStatus(cardBtn, "Failed", false);
+          }
+        } catch (_) {
+          showStatus(cardBtn, "Offline", false);
+        }
+      });
+
+      card.appendChild(cardBtn);
+
+      let hideTimer = null;
+      const show = () => {
+        if (hideTimer) clearTimeout(hideTimer);
+        cardBtn.classList.add("visible");
+      };
+      const hide = () => {
+        hideTimer = setTimeout(() => {
+          cardBtn.classList.remove("visible");
+        }, 800);
+      };
+
+      card.addEventListener("mouseenter", show);
+      card.addEventListener("mouseleave", hide);
+      cardBtn.addEventListener("mouseenter", show);
+      cardBtn.addEventListener("mouseleave", hide);
+    });
+  }
+
+  // --- TikTok Integration ---
+  function scanTikTok() {
+    if (!window.location.hostname.includes("tiktok.com")) return;
+    const containers = document.querySelectorAll(
+      'div[data-e2e="feed-video"], div[data-e2e="recommend-list-item-container"], .tiktok-video-container'
+    );
+    containers.forEach((box) => {
+      const video = box.querySelector("video");
+      if (video) attachBadgeToVideo(video);
+    });
+  }
+
+  // --- Instagram Reels Integration ---
+  function scanInstagram() {
+    if (!window.location.hostname.includes("instagram.com")) return;
+    const videos = document.querySelectorAll("article video, div[role='dialog'] video, video");
+    videos.forEach(attachBadgeToVideo);
+  }
+
+  // --- Reddit Video Integration ---
+  function scanReddit() {
+    if (!window.location.hostname.includes("reddit.com")) return;
+    const players = document.querySelectorAll(
+      "shreddit-player, div[data-testid='post-container'] video, video"
+    );
+    players.forEach((p) => {
+      const video = p.tagName === "VIDEO" ? p : p.querySelector("video");
+      if (video) attachBadgeToVideo(video);
+    });
+  }
+
+  // Scan for existing videos, Steam items, Pinterest, TikTok, Instagram, and Reddit
   function scanAll() {
     const videos = document.querySelectorAll("video");
     videos.forEach(attachBadgeToVideo);
     scanSteamWorkshop();
+    scanPinterest();
+    scanTikTok();
+    scanInstagram();
+    scanReddit();
   }
 
   // MutationObserver for dynamic websites (YouTube, Reddit, Steam Workshop, etc.)

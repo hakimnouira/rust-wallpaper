@@ -2,6 +2,22 @@
 
 Run these checks on a Windows machine after a daemon/UI build. The cross-platform unit tests cover policy decisions, but these checks exercise Explorer, Win32 windows, named pipes, MPV, and actual power/display events.
 
+## Single instance and diagnostics
+
+1. Launch the UI twice; confirm the second launch exits and the existing window is shown/focused instead of opening another control panel.
+2. Start `wallpaper-daemon.exe` while the UI (with its running daemon) is open; confirm the standalone daemon exits immediately and playback is unaffected.
+3. Confirm daily `ui.*.log` and `daemon.*.log` files exist under `%LOCALAPPDATA%\RustWallpaper\logs`, then use Settings > Open logs and Open data folder.
+4. While the window is hidden in the notification area, confirm CPU use settles and the tray icon still restores the window within a moment.
+
+## Notification-area lifecycle
+
+1. Launch the UI and confirm the Rust Wallpaper icon appears in the Windows notification area (including the hidden-icons overflow on Windows 11).
+2. Close the main window with the X button; confirm the window hides but the tray icon remains and playback continues.
+3. Left-click or double-click the tray icon; confirm the window is restored and focused.
+4. Right-click the tray icon and choose Quit; confirm the UI closes, the tray icon disappears, and the daemon/MPV processes stop.
+5. Restart Windows Explorer while the app is running; confirm the tray icon is re-created and its menu still works.
+6. Enable Windows startup, reboot or sign out/in, and confirm the app starts hidden with a working tray icon; then disable startup and confirm the Run entry is removed.
+
 ## IPC security and reconnect
 
 1. Start the daemon and UI under the same Windows account/session; confirm the UI connects and Ping/status requests work.

@@ -445,7 +445,7 @@ fn extract_media_url_from_html(html: &str) -> String {
         "name=\"twitter:player:stream\"",
     ] {
         if let Some(pos) = html.find(marker) {
-            let start = if pos > 100 { pos - 100 } else { 0 };
+            let start = pos.saturating_sub(100);
             let end = (pos + 250).min(html.len());
             let context = &html[start..end];
             if let Some(c_pos) = context.find("content=\"http") {
@@ -477,7 +477,7 @@ fn extract_media_url_from_html(html: &str) -> String {
 
     // 4. Look for HTML5 <source src="...mp4"> or <video src="...mp4">
     for src_marker in ["<source", "<video"] {
-        let mut cur = &html[..];
+        let mut cur = html;
         while let Some(pos) = cur.find(src_marker) {
             cur = &cur[pos + src_marker.len()..];
             let tag_end = cur.find('>').unwrap_or(cur.len());
@@ -522,7 +522,7 @@ fn extract_steam_workshop_title(html: &str) -> Option<String> {
         }
     }
     if let Some(pos) = html.find("property=\"og:title\"") {
-        let start = if pos > 50 { pos - 50 } else { 0 };
+        let start = pos.saturating_sub(50);
         let end = (pos + 300).min(html.len());
         let slice = &html[start..end];
         if let Some(c_pos) = slice.find("content=\"") {
@@ -573,7 +573,7 @@ fn extract_steam_workshop_media_url(html: &str) -> String {
 
     // 3. Look for og:image with steamusercontent
     if let Some(pos) = html.find("property=\"og:image\"") {
-        let start = if pos > 50 { pos - 50 } else { 0 };
+        let start = pos.saturating_sub(50);
         let end = (pos + 300).min(html.len());
         let slice = &html[start..end];
         if let Some(c_pos) = slice.find("content=\"http") {
@@ -582,6 +582,127 @@ fn extract_steam_workshop_media_url(html: &str) -> String {
                 let candidate = &after[..end_q];
                 if candidate.contains("steamusercontent.com") {
                     return candidate.split('?').next().unwrap_or(candidate).to_string();
+                }
+            }
+        }
+    }
+
+    String::new()
+}
+
+fn extract_pinterest_title(html: &str) -> Option<String> {
+    if let Some(pos) = html.find("property=\"og:title\"") {
+        let start = pos.saturating_sub(50);
+        let end = (pos + 300).min(html.len());
+        let slice = &html[start..end];
+        if let Some(c_pos) = slice.find("content=\"") {
+            let after = &slice[c_pos + 9..];
+            if let Some(end_q) = after.find('"') {
+                let mut title = after[..end_q].trim();
+                if let Some(stripped) = title.strip_suffix(" | Pinterest") {
+                    title = stripped.trim();
+                }
+                if let Some(stripped) = title.strip_suffix(" on Pinterest") {
+                    title = stripped.trim();
+                }
+                if !title.is_empty() {
+                    return Some(clean_html_title(title));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_pinterest_media_url(html: &str) -> String {
+    // 1. Look for progressive MP4 video streams:
+    // e.g. https://v1.pinimg.com/videos/mc/720p/17/52/ac/1752aca4002bf24c520aadc3c76aaa08.mp4
+    // or https://v.pinimg.com/videos/...
+    for prefix in [
+        "https://v1.pinimg.com/videos/",
+        "https://v.pinimg.com/videos/",
+        "https://v2.pinimg.com/videos/",
+    ] {
+        if let Some(pos) = html.find(prefix) {
+            let slice = &html[pos..];
+            let end = slice
+                .find(['"', '\'', ' ', '\\', '<', '>', '&', '\n', '\r', ','])
+                .unwrap_or_else(|| slice.len().min(300));
+            let candidate = &slice[..end];
+            if candidate.ends_with(".mp4") || candidate.contains(".mp4?") {
+                return candidate.to_string();
+            }
+            // If it's an HLS master playlist:
+            // e.g. https://v1.pinimg.com/videos/hls/.../index.m3u8 or master.m3u8
+            if candidate.contains("/hls/") {
+                let converted = candidate
+                    .replace("/hls/", "/mc/720p/")
+                    .replace(".m3u8", ".mp4")
+                    .replace("playlist.json", "720p.mp4");
+                return converted;
+            }
+        }
+    }
+
+    // 2. Look for schema.org contentUrl (used for videos)
+    if let Some(pos) = html.find("\"contentUrl\"") {
+        let slice = &html[pos..];
+        if let Some(q_start) = slice.find("http") {
+            let after_http = &slice[q_start..];
+            if let Some(q_end) = after_http.find('"') {
+                let candidate = &after_http[..q_end];
+                if candidate.contains(".mp4") || candidate.contains("pinimg.com/videos") {
+                    return candidate.replace(r"\/", "/");
+                }
+            }
+        }
+    }
+
+    // 3. Look for OpenGraph video: og:video or og:video:secure_url
+    for marker in ["property=\"og:video\"", "property=\"og:video:secure_url\""] {
+        if let Some(pos) = html.find(marker) {
+            let start = pos.saturating_sub(50);
+            let end = (pos + 350).min(html.len());
+            let slice = &html[start..end];
+            if let Some(c_pos) = slice.find("content=\"http") {
+                let after = &slice[c_pos + 9..];
+                if let Some(end_q) = after.find('"') {
+                    let candidate = &after[..end_q];
+                    if candidate.contains(".mp4") || candidate.contains("pinimg.com/videos") {
+                        return candidate.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Look for original uncompressed image / animated GIF:
+    // e.g. "images_orig":{"url":"https://i.pinimg.com/originals/..."}
+    if let Some(pos) = html.find("https://i.pinimg.com/originals/") {
+        let slice = &html[pos..];
+        let end = slice
+            .find(['"', '\'', ' ', '\\', '<', '>', '&', '\n', '\r'])
+            .unwrap_or_else(|| slice.len().min(300));
+        let candidate = &slice[..end];
+        return candidate.replace(r"\/", "/");
+    }
+
+    // 5. Look for standard og:image fallback
+    if let Some(pos) = html.find("property=\"og:image\"") {
+        let start = pos.saturating_sub(50);
+        let end = (pos + 350).min(html.len());
+        let slice = &html[start..end];
+        if let Some(c_pos) = slice.find("content=\"http") {
+            let after = &slice[c_pos + 9..];
+            if let Some(end_q) = after.find('"') {
+                let candidate = &after[..end_q];
+                if candidate.contains("pinimg.com") {
+                    let orig = candidate
+                        .replace("/736x/", "/originals/")
+                        .replace("/564x/", "/originals/")
+                        .replace("/474x/", "/originals/")
+                        .replace("/236x/", "/originals/");
+                    return orig;
                 }
             }
         }
@@ -677,24 +798,90 @@ pub fn resolve_web_media_info_with_policy(
         }
     }
 
-    // 2. Special handling for Pixabay:
-    // If it's on pixabay.com and NOT cdn.pixabay.com:
-    if lower.contains("pixabay.com") && !lower.contains("cdn.pixabay.com") {
-        let mut target_page = trimmed.to_string();
-        if let Some(id) = extract_pixabay_video_id(trimmed) {
-            target_page = format!("https://pixabay.com/videos/id-{id}/");
-        }
-        validate_remote_url_with_policy(&target_page, allow_local)?;
-        if let Some(html) =
-            fetch_html_content_with_policy(&target_page, Some(cancelled), allow_local)
-        {
-            let extracted = extract_media_url_from_html(&html);
+    // 1b. Steam UGC direct asset URLs (end with a hash + trailing slash, no extension)
+    // e.g. https://images.steamusercontent.com/ugc/<numbers>/<hash>/
+    if lower.contains("images.steamusercontent.com/ugc/") {
+        return Ok(ResolvedWebMedia {
+            media_url: trimmed.to_string(),
+            title: None,
+        });
+    }
+
+    // 1c. Pinterest direct asset URLs (v1.pinimg.com/videos/..., v.pinimg.com/videos/..., i.pinimg.com/originals/...)
+    if lower.contains("pinimg.com/videos/") || lower.contains("i.pinimg.com/originals/") {
+        return Ok(ResolvedWebMedia {
+            media_url: trimmed.to_string(),
+            title: None,
+        });
+    }
+
+    // 1e. Social media direct CDN video URLs (TikTok, Instagram, Reddit v.redd.it)
+    if lower.contains("tiktokcdn.com/")
+        || lower.contains("cdninstagram.com/")
+        || lower.contains("v.redd.it/")
+    {
+        return Ok(ResolvedWebMedia {
+            media_url: trimmed.to_string(),
+            title: None,
+        });
+    }
+
+    // 1d. Pinterest Pin page or shortlink (pinterest.com/pin/... or pin.it/...)
+    if lower.contains("pinterest.com/pin/") || lower.contains("pin.it/") {
+        validate_remote_url_with_policy(trimmed, allow_local)?;
+        if let Some(html) = fetch_html_content_with_policy(trimmed, Some(cancelled), allow_local) {
+            let extracted = extract_pinterest_media_url(&html);
+            let title = extract_pinterest_title(&html);
             if !extracted.is_empty() {
                 validate_remote_url_with_policy(&extracted, allow_local)?;
                 return Ok(ResolvedWebMedia {
                     media_url: extracted,
-                    title: None,
+                    title,
                 });
+            }
+        }
+    }
+
+    // 2. Special handling for Pixabay:
+    // If it's on pixabay.com and NOT cdn.pixabay.com:
+    if lower.contains("pixabay.com") && !lower.contains("cdn.pixabay.com") {
+        // Try to extract video ID and attempt known CDN patterns directly
+        if let Some(id) = extract_pixabay_video_id(trimmed) {
+            // Known Pixabay CDN download URL patterns (try these first before fetching page HTML)
+            let cdn_patterns = [
+                format!("https://cdn.pixabay.com/video/download/x-{id}_large.mp4"),
+                format!("https://cdn.pixabay.com/video/download/x-{id}_medium.mp4"),
+                format!("https://cdn.pixabay.com/video/download/x-{id}_small.mp4"),
+                format!("https://cdn.pixabay.com/video/download/x-{id}_tiny.mp4"),
+            ];
+            for cdn_url in &cdn_patterns {
+                if validate_remote_url_with_policy(cdn_url, allow_local).is_ok() {
+                    return Ok(ResolvedWebMedia {
+                        media_url: cdn_url.clone(),
+                        title: None,
+                    });
+                }
+            }
+        }
+
+        // Fallback: try fetching the HTML page to scrape the CDN URL
+        let mut target_page = trimmed.to_string();
+        if let Some(id) = extract_pixabay_video_id(trimmed) {
+            target_page = format!("https://pixabay.com/videos/id-{id}/");
+        }
+        if validate_remote_url_with_policy(&target_page, allow_local).is_ok() {
+            if let Some(html) =
+                fetch_html_content_with_policy(&target_page, Some(cancelled), allow_local)
+            {
+                let extracted = extract_media_url_from_html(&html);
+                if !extracted.is_empty()
+                    && validate_remote_url_with_policy(&extracted, allow_local).is_ok()
+                {
+                    return Ok(ResolvedWebMedia {
+                        media_url: extracted,
+                        title: None,
+                    });
+                }
             }
         }
     }
@@ -1026,14 +1213,14 @@ fn publish_download(temp_path: &Path, destination: &Path) -> std::io::Result<()>
             .encode_wide()
             .chain(Some(0))
             .collect();
-        return unsafe {
+        unsafe {
             MoveFileExW(
                 windows::core::PCWSTR(source.as_ptr()),
                 windows::core::PCWSTR(target.as_ptr()),
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
             )
         }
-        .map_err(|error| std::io::Error::other(error.to_string()));
+        .map_err(|error| std::io::Error::other(error.to_string()))
     }
 
     #[cfg(not(windows))]
@@ -1070,6 +1257,16 @@ fn urlencoding(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_steam_real_online() {
+        let res = resolve_web_media_info(
+            "https://steamcommunity.com/sharedfiles/filedetails/?id=3830732662",
+        );
+        println!("RESOLVED STEAM MEDIA URL: {}", res.media_url);
+        println!("RESOLVED STEAM TITLE: {:?}", res.title);
+        assert!(res.media_url.contains("steamusercontent"));
+    }
 
     #[test]
     fn test_extract_steam_workshop_media_and_title() {
@@ -1373,5 +1570,43 @@ mod tests {
         let result = safe_get_with_policy(&format!("http://{address}/redirect"), None, true);
         server.join().unwrap();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_extract_pinterest_media_url_progressive_mp4() {
+        let html = r#"
+            <meta property="og:title" content="Aesthetic Cyberpunk City Video | Pinterest">
+            <script>{"v3GetPinQueryv2":{"data":{"videos":{"video_list":{"V_720P":{"url":"https://v1.pinimg.com/videos/mc/720p/17/52/ac/1752aca4002bf24c520aadc3c76aaa08.mp4"}}}}}}</script>
+        "#;
+        assert_eq!(
+            extract_pinterest_media_url(html),
+            "https://v1.pinimg.com/videos/mc/720p/17/52/ac/1752aca4002bf24c520aadc3c76aaa08.mp4"
+        );
+        assert_eq!(
+            extract_pinterest_title(html),
+            Some("Aesthetic Cyberpunk City Video".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_pinterest_media_url_hls_conversion() {
+        let html = r#"
+            <script>var x = "https://v1.pinimg.com/videos/hls/expmp4/17/52/ac/1752aca4002bf24c520aadc3c76aaa08.m3u8";</script>
+        "#;
+        assert_eq!(
+            extract_pinterest_media_url(html),
+            "https://v1.pinimg.com/videos/mc/720p/expmp4/17/52/ac/1752aca4002bf24c520aadc3c76aaa08.mp4"
+        );
+    }
+
+    #[test]
+    fn test_extract_pinterest_media_url_original_image_fallback() {
+        let html = r#"
+            <script>{"images_orig":{"url":"https://i.pinimg.com/originals/76/64/90/7664909f7aeb05fe923359a08512c652.jpg"}}</script>
+        "#;
+        assert_eq!(
+            extract_pinterest_media_url(html),
+            "https://i.pinimg.com/originals/76/64/90/7664909f7aeb05fe923359a08512c652.jpg"
+        );
     }
 }

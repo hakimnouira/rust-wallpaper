@@ -435,6 +435,28 @@ impl MonitorRegistry {
                 .is_some_and(|assignment| assignment.video_path == path)
     }
 
+    /// Applies global performance settings to persisted preferences before the first
+    /// topology sync, so a daemon restart restores the user's FPS/RAM/quality choice
+    /// instead of replaying whatever was stored with each assignment.
+    pub fn apply_playback_defaults(
+        &mut self,
+        target_fps: Option<u32>,
+        ram_budget_mb: Option<u32>,
+        quality: crate::VideoQuality,
+    ) {
+        let apply = |config: &mut crate::PlaybackConfig| {
+            config.target_fps = target_fps;
+            config.ram_budget_mb = ram_budget_mb;
+            config.quality = quality;
+        };
+        for assignment in self.user.values_mut() {
+            apply(&mut assignment.config);
+        }
+        if let Some(fallback) = self.fallback.as_mut() {
+            apply(&mut fallback.config);
+        }
+    }
+
     /// The wallpaper this monitor should show, and where that decision came from.
     pub fn desired(&self, id: &MonitorId) -> Option<(&Assignment, AssignmentSource)> {
         self.user
@@ -602,6 +624,10 @@ impl MonitorLifecycle {
 
     pub fn registry(&self) -> &MonitorRegistry {
         &self.registry
+    }
+
+    pub fn registry_mut(&mut self) -> &mut MonitorRegistry {
+        &mut self.registry
     }
 
     pub fn connected_devices(&self) -> Vec<String> {
@@ -933,6 +959,21 @@ mod tests {
 
     fn registry(fallback: Option<Assignment>) -> MonitorRegistry {
         MonitorRegistry::new(Box::new(InMemoryAssignmentStore::default()), fallback)
+    }
+
+    #[test]
+    fn global_playback_defaults_apply_to_restored_assignments() {
+        let id = MonitorId::from_device_name("\\\\.\\DISPLAY1");
+        let mut reg = registry(Some(a("fallback.mp4")));
+        reg.assign_user(&id, a("video.mp4")).unwrap();
+
+        reg.apply_playback_defaults(Some(24), Some(128), crate::VideoQuality::Balanced);
+
+        let (assignment, source) = reg.desired(&id).expect("user assignment survives");
+        assert_eq!(source, super::AssignmentSource::User);
+        assert_eq!(assignment.config.target_fps, Some(24));
+        assert_eq!(assignment.config.ram_budget_mb, Some(128));
+        assert_eq!(assignment.config.quality, crate::VideoQuality::Balanced);
     }
 
     // ---- fake host --------------------------------------------------------------------

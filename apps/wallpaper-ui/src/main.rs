@@ -6,21 +6,31 @@
 //! starts MPV, or mutates daemon runtime state directly.
 
 #[cfg(windows)]
+mod tray;
+
+#[cfg(windows)]
 mod desktop {
+    mod appearance;
     mod browse;
     mod library;
     mod monitors;
+    mod overview;
     mod settings;
+    mod theme;
     use eframe::egui;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
+    use theme::{
+        accent_color, card_frame, monitor_fill, muted_color, soft_accent, subtle_frame, UiTheme,
+    };
     use tokio::runtime::Builder;
     use tokio::time::timeout;
     use wallpaper_core::{
-        AspectRatioFilter, CodecFilter, LibraryQuery, PerformanceProfile, ResolutionFilter,
-        SortDirection, SortKey, StatusFilter, Wallpaper, WallpaperId,
+        AspectRatioFilter, CodecFilter, FullscreenPauseMode, LibraryQuery, PerformanceProfile,
+        PlaybackSettings, ResolutionFilter, SortDirection, SortKey, StatusFilter, Wallpaper,
+        WallpaperId,
     };
     use wallpaper_protocol::client::IpcClient;
     use wallpaper_protocol::{Command, MonitorInfo, PlayerStatusInfo, RequestEnvelope, Response};
@@ -33,6 +43,7 @@ mod desktop {
         wallpapers: Vec<Wallpaper>,
         players: Vec<PlayerStatusInfo>,
         profile: PerformanceProfile,
+        playback_settings: PlaybackSettings,
         target_fps: Option<u32>,
         ram_budget_mb: Option<u32>,
         quality: wallpaper_core::VideoQuality,
@@ -41,9 +52,11 @@ mod desktop {
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Page {
+        Overview,
         Library,
         Browse,
         Monitors,
+        Appearance,
         Settings,
     }
 
@@ -157,6 +170,7 @@ mod desktop {
         snapshot: Arc<Mutex<Snapshot>>,
         commands: mpsc::Sender<Command>,
         page: Page,
+        theme: UiTheme,
         selected_monitor: Option<String>,
         selected_wallpaper: Option<WallpaperId>,
         selected_wallpapers: HashSet<WallpaperId>,
@@ -193,15 +207,35 @@ mod desktop {
         online_is_searching: bool,
         online_search_cache: HashMap<(String, String), Vec<wallpaper_core::OnlineWallpaper>>,
         pending_apply_source: Option<String>,
+        tray_rx: crate::tray::TrayReceiver,
+        _tray_icon: Option<crate::tray::TrayIcon>,
+        quitting: bool,
+        quit_after: Option<Instant>,
+        window_visible: bool,
+        visibility_flag: Arc<AtomicBool>,
         autostart_enabled: bool,
         direct_url_input: String,
         direct_url_status: Option<String>,
         direct_download_id: Option<String>,
         pending_apply_download_id: Option<String>,
+        auto_cycle_enabled: bool,
+        auto_cycle_interval_secs: u64,
+        auto_cycle_shuffle: bool,
+        auto_cycle_last_time: Option<Instant>,
+        auto_cycle_index: usize,
+        master_volume: u32,
+        master_muted: bool,
     }
 
     impl DesktopApp {
-        fn new(snapshot: Arc<Mutex<Snapshot>>, commands: mpsc::Sender<Command>) -> Self {
+        fn new(
+            snapshot: Arc<Mutex<Snapshot>>,
+            commands: mpsc::Sender<Command>,
+            tray_rx: crate::tray::TrayReceiver,
+            tray_icon: Option<crate::tray::TrayIcon>,
+            theme: UiTheme,
+            visibility_flag: Arc<AtomicBool>,
+        ) -> Self {
             let (download_tx, download_rx) = mpsc::channel();
 
             // A single decoder limits peak CPU and memory while browsing large libraries.
@@ -285,17 +319,20 @@ mod desktop {
                 })
                 .expect("failed to spawn online search worker");
 
+            // Run extension registration off the UI thread to avoid blocking startup.
             #[cfg(windows)]
-            {
-                if !wallpaper_windows::is_browser_extension_registered() {
+            std::thread::Builder::new()
+                .name("ext-register".into())
+                .spawn(|| {
                     let _ = wallpaper_windows::register_browser_extension(None);
-                }
-            }
+                })
+                .ok();
 
             Self {
                 snapshot,
                 commands,
-                page: Page::Library,
+                page: Page::Overview,
+                theme,
                 selected_monitor: None,
                 selected_wallpaper: None,
                 selected_wallpapers: HashSet::new(),
@@ -332,6 +369,12 @@ mod desktop {
                 online_is_searching: false,
                 online_search_cache: HashMap::new(),
                 pending_apply_source: None,
+                tray_rx,
+                _tray_icon: tray_icon,
+                quitting: false,
+                quit_after: None,
+                window_visible: visibility_flag.load(Ordering::Relaxed),
+                visibility_flag,
                 #[cfg(windows)]
                 autostart_enabled: wallpaper_windows::is_autostart_enabled(),
                 #[cfg(not(windows))]
@@ -340,7 +383,59 @@ mod desktop {
                 direct_url_status: None,
                 direct_download_id: None,
                 pending_apply_download_id: None,
+                auto_cycle_enabled: false,
+                auto_cycle_interval_secs: 900,
+                auto_cycle_shuffle: true,
+                auto_cycle_last_time: None,
+                auto_cycle_index: 0,
+                master_volume: 100,
+                master_muted: false,
             }
+        }
+
+        fn cycle_next_wallpaper(&mut self, snapshot: &Snapshot) {
+            let ready_wallpapers: Vec<_> = snapshot
+                .wallpapers
+                .iter()
+                .filter(|w| w.metadata.is_ready())
+                .collect();
+            if ready_wallpapers.is_empty() {
+                self.notice = "No ready wallpapers in library to rotate.".into();
+                return;
+            }
+
+            let next_wp = if self.auto_cycle_shuffle {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as usize;
+                let idx = (nanos ^ (self.frame_counter as usize)) % ready_wallpapers.len();
+                ready_wallpapers[idx]
+            } else {
+                self.auto_cycle_index = (self.auto_cycle_index + 1) % ready_wallpapers.len();
+                ready_wallpapers[self.auto_cycle_index]
+            };
+
+            let title = next_wp.title().to_string();
+            self.selected_wallpaper = Some(next_wp.id);
+            self.send(
+                Command::ApplyWallpaper {
+                    wallpaper_id: next_wp.id,
+                    monitor: self.selected_monitor.clone(),
+                },
+                &format!("Rotated to wallpaper: '{title}'"),
+            );
+            self.auto_cycle_last_time = Some(Instant::now());
+        }
+
+        fn nav_button(&self, ui: &mut egui::Ui, page: Page, label: &str) -> bool {
+            let active = self.page == page;
+            let mut button = egui::Button::new(label).frame(true);
+            if active {
+                button = button.fill(soft_accent(&self.theme));
+            }
+            let width = ui.available_width().max(120.0);
+            ui.add_sized(egui::vec2(width, 30.0), button).clicked()
         }
 
         fn send(&mut self, command: Command, message: &str) {
@@ -404,8 +499,104 @@ mod desktop {
 
     impl eframe::App for DesktopApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-            // Status is refreshed from IPC every two seconds; egui input events still repaint immediately.
-            ctx.request_repaint_after(Duration::from_secs(1));
+            let minimized = ctx
+                .input(|input| input.viewport().minimized)
+                .unwrap_or(false);
+            let active = self.window_visible && !minimized;
+            self.visibility_flag.store(active, Ordering::Relaxed);
+            // Hidden tray mode only needs occasional refreshes; input and tray
+            // actions still wake egui immediately.
+            ctx.request_repaint_after(if active {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_secs(30)
+            });
+
+            let snapshot = self
+                .snapshot
+                .lock()
+                .map(|state| state.clone())
+                .unwrap_or_default();
+
+            while let Ok(action) = self.tray_rx.try_recv() {
+                match action {
+                    crate::tray::TrayAction::Show => {
+                        self.window_visible = true;
+                        self.visibility_flag.store(true, Ordering::Relaxed);
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    }
+                    crate::tray::TrayAction::NextWallpaper => {
+                        self.cycle_next_wallpaper(&snapshot);
+                    }
+                    crate::tray::TrayAction::TogglePause => {
+                        let any_paused = snapshot.players.iter().any(|p| p.suspended);
+                        if any_paused {
+                            self.send(Command::Resume { monitor: None }, "Resumed playback…");
+                        } else {
+                            self.send(Command::Pause { monitor: None }, "Paused playback…");
+                        }
+                    }
+                    crate::tray::TrayAction::ToggleMute => {
+                        self.master_muted = !self.master_muted;
+                        let muted = self.master_muted;
+                        self.send(
+                            Command::SetMute {
+                                monitor: None,
+                                muted,
+                            },
+                            if muted {
+                                "Muted all audio…"
+                            } else {
+                                "Unmuted all audio…"
+                            },
+                        );
+                    }
+                    crate::tray::TrayAction::Quit => {
+                        if !self.quitting {
+                            self.quitting = true;
+                            self.quit_after = Some(Instant::now() + Duration::from_millis(750));
+                            self.send(Command::Quit, "Quitting Rust Wallpaper…");
+                            self.window_visible = false;
+                            self.visibility_flag.store(false, Ordering::Relaxed);
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                            ctx.request_repaint_after(Duration::from_millis(100));
+                        }
+                    }
+                }
+            }
+
+            if self.quitting {
+                if self
+                    .quit_after
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                } else {
+                    ctx.request_repaint_after(Duration::from_millis(100));
+                }
+            }
+
+            // The window close button minimizes to the notification area. A real
+            // exit is available from the tray menu (or after a tray quit request).
+            if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
+                if self._tray_icon.is_some() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                    self.window_visible = false;
+                    self.visibility_flag.store(false, Ordering::Relaxed);
+                    self.notice = "Rust Wallpaper is still running in the notification area. Right-click its icon to quit.".into();
+                } else {
+                    // If Windows refused to create the tray icon, closing must still
+                    // be able to stop the daemon instead of leaving it orphaned.
+                    self.quitting = true;
+                    self.quit_after = Some(Instant::now());
+                    self.window_visible = false;
+                    self.visibility_flag.store(false, Ordering::Relaxed);
+                    self.send(Command::Quit, "Quitting Rust Wallpaper…");
+                }
+            }
 
             // Drain completed asynchronous thumbnail decodes and upload to GPU
             while let Ok(decoded) = self.thumb_res_rx.try_recv() {
@@ -430,11 +621,49 @@ mod desktop {
                 }
             }
 
-            let snapshot = self
-                .snapshot
-                .lock()
-                .map(|state| state.clone())
-                .unwrap_or_default();
+            // Hotkeys: Alt+W (Pause/Resume), Alt+N (Next Wallpaper), Alt+M (Mute/Unmute)
+            if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::W)) {
+                let any_paused = snapshot.players.iter().any(|p| p.suspended);
+                if any_paused {
+                    self.send(Command::Resume { monitor: None }, "Resumed playback…");
+                } else {
+                    self.send(Command::Pause { monitor: None }, "Paused playback…");
+                }
+            }
+            if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::N)) {
+                self.cycle_next_wallpaper(&snapshot);
+            }
+            if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::M)) {
+                self.master_muted = !self.master_muted;
+                let muted = self.master_muted;
+                self.send(
+                    Command::SetMute {
+                        monitor: None,
+                        muted,
+                    },
+                    if muted {
+                        "Muted all audio…"
+                    } else {
+                        "Unmuted all audio…"
+                    },
+                );
+            }
+
+            // Automatic wallpaper rotation timer
+            if self.auto_cycle_enabled && snapshot.connected && !snapshot.wallpapers.is_empty() {
+                let interval = Duration::from_secs(self.auto_cycle_interval_secs.max(10));
+                let should_rotate = match self.auto_cycle_last_time {
+                    Some(last) => last.elapsed() >= interval,
+                    None => {
+                        self.auto_cycle_last_time = Some(Instant::now());
+                        false
+                    }
+                };
+                if should_rotate {
+                    self.cycle_next_wallpaper(&snapshot);
+                }
+                ctx.request_repaint_after(Duration::from_secs(5));
+            }
 
             // Auto-apply newly imported wallpaper if requested
             if let Some(src) = self.pending_apply_source.clone() {
@@ -454,59 +683,65 @@ mod desktop {
                 }
             }
             egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
+                ui.add_space(5.0);
                 ui.horizontal(|ui| {
-                    ui.heading("Rust Wallpaper");
-                    ui.separator();
+                    ui.colored_label(accent_color(&self.theme), "◆");
+                    ui.strong("Rust Wallpaper");
+                    ui.add_space(10.0);
                     let (color, label) = if snapshot.connected {
-                        (egui::Color32::LIGHT_GREEN, "Daemon connected")
+                        (egui::Color32::from_rgb(90, 200, 140), "Daemon connected")
                     } else {
-                        (egui::Color32::LIGHT_RED, "Daemon disconnected")
+                        (
+                            egui::Color32::from_rgb(230, 110, 110),
+                            "Daemon disconnected",
+                        )
                     };
-                    ui.colored_label(color, label);
+                    ui.colored_label(color, format!("● {label}"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(format!(
-                            "{} monitors · {} wallpapers",
+                        ui.small(format!(
+                            "{} displays  ·  {} wallpapers",
                             snapshot.monitors.len(),
                             snapshot.wallpapers.len()
                         ));
                     });
                 });
+                ui.add_space(5.0);
             });
             egui::SidePanel::left("navigation")
                 .resizable(false)
-                .default_width(170.0)
+                .min_width(186.0)
+                .max_width(186.0)
                 .show(ctx, |ui| {
-                    ui.add_space(12.0);
-                    if ui
-                        .selectable_label(matches!(self.page, Page::Library), "▦  Library")
-                        .clicked()
-                    {
+                    ui.add_space(14.0);
+                    ui.colored_label(muted_color(&self.theme), "WORKSPACE");
+                    ui.add_space(4.0);
+                    if self.nav_button(ui, Page::Overview, "⌂  Overview") {
+                        self.page = Page::Overview;
+                    }
+                    if self.nav_button(ui, Page::Library, "▦  Library") {
                         self.page = Page::Library;
                     }
-                    if ui
-                        .selectable_label(
-                            matches!(self.page, Page::Browse),
-                            "🌐  Browse & Workshop",
-                        )
-                        .clicked()
-                    {
+                    if self.nav_button(ui, Page::Browse, "◈  Browse & Workshop") {
                         self.page = Page::Browse;
                     }
-                    if ui
-                        .selectable_label(matches!(self.page, Page::Monitors), "▣  Monitors")
-                        .clicked()
-                    {
+                    if self.nav_button(ui, Page::Monitors, "▣  Monitors") {
                         self.page = Page::Monitors;
                     }
-                    if ui
-                        .selectable_label(matches!(self.page, Page::Settings), "⚙  Settings")
-                        .clicked()
-                    {
+
+                    ui.add_space(14.0);
+                    ui.separator();
+                    ui.colored_label(muted_color(&self.theme), "PERSONALIZE");
+                    ui.add_space(4.0);
+                    if self.nav_button(ui, Page::Appearance, "◐  Appearance") {
+                        self.page = Page::Appearance;
+                    }
+                    if self.nav_button(ui, Page::Settings, "⚙  Settings") {
                         self.page = Page::Settings;
                     }
-                    ui.add_space(20.0);
+
+                    ui.add_space(14.0);
                     ui.separator();
-                    ui.label("Assignment target");
+                    ui.small("Assignment target");
                     egui::ComboBox::from_id_salt("target_monitor")
                         .selected_text(
                             self.selected_monitor
@@ -529,13 +764,15 @@ mod desktop {
                             }
                         });
                     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        ui.label("v0.1 · Early access");
+                        ui.small("v0.1 · UI build 3 · Early access");
                     });
                 });
             egui::CentralPanel::default().show(ctx, |ui| match self.page {
+                Page::Overview => self.render_overview(ui, &snapshot),
                 Page::Library => self.render_library(ui, &snapshot),
                 Page::Browse => self.render_browse(ui, &snapshot),
                 Page::Monitors => self.render_monitors(ui, &snapshot),
+                Page::Appearance => self.render_appearance(ui),
                 Page::Settings => self.render_settings(ui, &snapshot),
             });
             egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
@@ -570,14 +807,13 @@ mod desktop {
 
                 if let Some(parent) = exe.parent() {
                     let daemon_exe = parent.join("wallpaper-daemon.exe");
-                    if daemon_exe.is_file() {
-                        if std::process::Command::new(&daemon_exe)
+                    if daemon_exe.is_file()
+                        && std::process::Command::new(&daemon_exe)
                             .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
                             .spawn()
                             .is_ok()
-                        {
-                            return;
-                        }
+                    {
+                        return;
                     }
                 }
 
@@ -601,7 +837,10 @@ mod desktop {
             .ok();
     }
 
-    fn spawn_worker(snapshot: Arc<Mutex<Snapshot>>) -> mpsc::Sender<Command> {
+    fn spawn_worker(
+        snapshot: Arc<Mutex<Snapshot>>,
+        visibility: Arc<AtomicBool>,
+    ) -> mpsc::Sender<Command> {
         let (tx, rx) = mpsc::channel::<Command>();
         std::thread::Builder::new()
             .name("wallpaper-ui-ipc".into())
@@ -619,7 +858,13 @@ mod desktop {
                     let mut client: Option<IpcClient> = None;
                     let mut next_refresh = Instant::now();
                     let mut attempted_autostart = false;
+                    let mut was_active = true;
                     loop {
+                        let active = visibility.load(Ordering::Relaxed);
+                        if active && !was_active {
+                            next_refresh = Instant::now();
+                        }
+                        was_active = active;
                         if client.is_none() {
                             match IpcClient::connect().await {
                                 Ok(connection) => {
@@ -641,7 +886,12 @@ mod desktop {
                                         state.connected = false;
                                         state.last_error = Some(error.to_string());
                                     }
-                                    tokio::time::sleep(Duration::from_secs(1)).await;
+                                    tokio::time::sleep(if active {
+                                        Duration::from_secs(1)
+                                    } else {
+                                        Duration::from_secs(5)
+                                    })
+                                    .await;
                                     continue;
                                 }
                             }
@@ -671,6 +921,7 @@ mod desktop {
                                     Command::ListWallpapers,
                                     Command::GetStatus { monitor: None },
                                     Command::GetProfile,
+                                    Command::GetPlaybackSettings,
                                     Command::GetPerformanceSettings,
                                 ] {
                                     match send(connection, command).await {
@@ -692,6 +943,11 @@ mod desktop {
                                         Ok(Response::Profile(profile)) => {
                                             if let Ok(mut state) = snapshot.lock() {
                                                 state.profile = profile;
+                                            }
+                                        }
+                                        Ok(Response::PlaybackSettings(settings)) => {
+                                            if let Ok(mut state) = snapshot.lock() {
+                                                state.playback_settings = settings;
                                             }
                                         }
                                         Ok(Response::PerformanceSettings {
@@ -720,7 +976,12 @@ mod desktop {
                                         }
                                     }
                                 }
-                                next_refresh = Instant::now() + Duration::from_secs(2);
+                                next_refresh = Instant::now()
+                                    + if active {
+                                        Duration::from_secs(2)
+                                    } else {
+                                        Duration::from_secs(30)
+                                    };
                                 if let Ok(mut state) = snapshot.lock() {
                                     state.last_updated = Some(Instant::now());
                                 }
@@ -732,7 +993,12 @@ mod desktop {
                                 }
                             }
                         }
-                        tokio::time::sleep(Duration::from_millis(40)).await;
+                        tokio::time::sleep(if active {
+                            Duration::from_millis(40)
+                        } else {
+                            Duration::from_millis(250)
+                        })
+                        .await;
                     }
                 });
             })
@@ -766,9 +1032,14 @@ mod desktop {
         ctx.set_fonts(fonts);
     }
 
-    pub fn run() -> eframe::Result<()> {
+    pub fn run(start_hidden: bool) -> eframe::Result<()> {
+        wallpaper_daemon::logging::init("ui", true);
+        tracing::info!(start_hidden, "Rust Wallpaper UI starting");
+        let theme = UiTheme::load();
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
-        let commands = spawn_worker(snapshot.clone());
+        let visibility = Arc::new(AtomicBool::new(!start_hidden));
+        let commands = spawn_worker(snapshot.clone(), visibility.clone());
+        let (tray_tx, tray_rx) = mpsc::channel();
 
         let icon_data = image::load_from_memory(include_bytes!("../../../assets/icon.png"))
             .ok()
@@ -785,7 +1056,11 @@ mod desktop {
         let mut viewport = egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([860.0, 560.0])
-            .with_title("Rust Wallpaper");
+            // Start fully on the primary monitor; a saved/resized position can
+            // otherwise leave the panel partly off-screen after a restart.
+            .with_position([60.0, 60.0])
+            .with_title("Rust Wallpaper")
+            .with_visible(!start_hidden);
 
         if let Some(icon) = icon_data {
             viewport = viewport.with_icon(icon);
@@ -795,14 +1070,29 @@ mod desktop {
             viewport,
             ..Default::default()
         };
-        eframe::run_native(
+        let result = eframe::run_native(
             "Rust Wallpaper",
             options,
             Box::new(move |cc| {
                 configure_fonts(&cc.egui_ctx);
-                Ok(Box::new(DesktopApp::new(snapshot, commands)))
+                theme.apply(&cc.egui_ctx);
+                let tray_icon = crate::tray::TrayIcon::start(cc.egui_ctx.clone(), tray_tx)
+                    .map_err(|error| {
+                        tracing::warn!(%error, "Could not create notification-area icon");
+                        error
+                    })
+                    .ok();
+                Ok(Box::new(DesktopApp::new(
+                    snapshot, commands, tray_rx, tray_icon, theme, visibility,
+                )))
             }),
-        )
+        );
+        if let Err(error) = &result {
+            tracing::error!(%error, "Rust Wallpaper UI event loop failed");
+        } else {
+            tracing::info!("Rust Wallpaper UI event loop exited");
+        }
+        result
     }
 }
 
@@ -813,11 +1103,30 @@ fn main() -> eframe::Result<()> {
         .iter()
         .any(|a| a == "--daemon" || a == "--headless" || a == "-d")
     {
+        // The daemon itself owns the single-instance lock, so embedded and
+        // standalone daemon launches use exactly the same guard.
         if let Err(e) = wallpaper_daemon::run_daemon() {
             eprintln!("Daemon error: {e}");
         }
         return Ok(());
     }
+
+    if args.iter().any(|a| a == "--register-extension") {
+        match wallpaper_windows::register_browser_extension(None) {
+            Ok(()) => {
+                println!("Browser extension successfully registered for Chrome, Edge, and Brave!")
+            }
+            Err(e) => eprintln!("Failed to register browser extension: {e}"),
+        }
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--unregister-extension") {
+        wallpaper_windows::unregister_browser_extension();
+        println!("Browser extension successfully unregistered from Chrome, Edge, and Brave.");
+        return Ok(());
+    }
+
+    // A normal UI launch starts the daemon and the tray icon together.
     if args.iter().any(|a| a == "--version" || a == "-v") {
         println!("Rust Wallpaper v0.1.0 (production release)");
         return Ok(());
@@ -829,12 +1138,29 @@ fn main() -> eframe::Result<()> {
         println!();
         println!("Options:");
         println!("  (no args)      Launch the interactive UI control panel");
+        println!("  --tray         Start hidden in the Windows notification area");
         println!("  --daemon, -d   Run wallpaper engine daemon in background/headless mode");
         println!("  --version, -v  Print version information");
         println!("  --help, -h     Print this help message");
         return Ok(());
     }
-    desktop::run()
+    let _ui_guard = match wallpaper_windows::SingleInstanceGuard::acquire_ui() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            if !wallpaper_windows::focus_existing_ui_window() {
+                eprintln!("Rust Wallpaper is already running, but its window could not be found.");
+            }
+            return Ok(());
+        }
+        Err(error) => {
+            eprintln!("Could not acquire the UI single-instance lock: {error}");
+            return Ok(());
+        }
+    };
+    let start_hidden = args
+        .iter()
+        .any(|arg| arg == "--tray" || arg == "--minimized");
+    desktop::run(start_hidden)
 }
 
 #[cfg(not(windows))]

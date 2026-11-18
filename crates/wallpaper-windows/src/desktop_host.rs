@@ -147,7 +147,7 @@ mod platform {
         let progman = unsafe { FindWindowW(w!("Progman"), PCWSTR::null()) }
             .map_err(|_| DesktopHostError::ProgmanNotFound)?;
 
-        if progman.0 == std::ptr::null_mut() || !unsafe { IsWindow(progman).as_bool() } {
+        if progman.0.is_null() || !unsafe { IsWindow(progman).as_bool() } {
             return Err(DesktopHostError::ProgmanNotFound);
         }
 
@@ -202,7 +202,7 @@ mod platform {
                 .ok();
 
                 if let Some(view) = shell_view {
-                    if view.0 != std::ptr::null_mut() {
+                    if !view.0.is_null() {
                         ctx.shell_container = Some(hwnd);
                         ctx.shell_view = Some(view);
                     }
@@ -213,9 +213,7 @@ mod platform {
                     let _ = GetWindowRect(hwnd, &mut r);
                     ctx.workerw_list.push(WorkerWInfo {
                         hwnd: hwnd.0 as isize,
-                        has_shelldll: shell_view
-                            .map(|v| v.0 != std::ptr::null_mut())
-                            .unwrap_or(false),
+                        has_shelldll: shell_view.map(|v| !v.0.is_null()).unwrap_or(false),
                         rect: (r.left, r.top, r.right - r.left, r.bottom - r.top),
                     });
                 }
@@ -254,7 +252,7 @@ mod platform {
             .ok();
 
             if let Some(workerw) = workerw_behind {
-                if workerw.0 != std::ptr::null_mut() && unsafe { IsWindow(workerw).as_bool() } {
+                if !workerw.0.is_null() && unsafe { IsWindow(workerw).as_bool() } {
                     selected_host = Some((workerw, DesktopHostKind::WorkerW));
                 }
             }

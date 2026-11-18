@@ -16,7 +16,8 @@
 
 use crate::health::PlayerHealth;
 use crate::{
-    ForegroundKind, PerformanceProfile, PlaybackPolicy, SuspensionFlags, SuspensionReason,
+    ForegroundKind, PerformanceProfile, PlaybackPolicy, PlaybackSettings, SuspensionFlags,
+    SuspensionReason,
 };
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -708,6 +709,9 @@ pub struct MonitorStatus {
 /// Nothing outside [`reconcile`](Self::reconcile) may pause or resume a player.
 pub struct RuntimeState {
     policy: PlaybackPolicy,
+    /// Only set when the user explicitly chooses automation settings. Without it,
+    /// performance profiles keep their documented threshold and event flags.
+    explicit_settings: Option<PlaybackSettings>,
     suspension: PlayerSuspensionManager,
     reconciler: Reconciler,
 
@@ -728,6 +732,7 @@ impl RuntimeState {
     pub fn new(policy: PlaybackPolicy) -> Self {
         Self {
             policy,
+            explicit_settings: None,
             suspension: PlayerSuspensionManager::new(),
             reconciler: Reconciler::new(DEFAULT_COMMAND_RETRY),
             session_locked: false,
@@ -744,6 +749,24 @@ impl RuntimeState {
         &self.policy
     }
 
+    /// Effective settings: an explicit user override, or the current profile's
+    /// behavior read back from the policy.
+    pub fn playback_settings(&self) -> PlaybackSettings {
+        self.explicit_settings
+            .unwrap_or_else(|| PlaybackSettings::from_policy(&self.policy))
+    }
+
+    /// Applies persistent automation overrides (foreground threshold and system
+    /// event pause flags) without touching the profile's timing knobs.
+    pub fn set_playback_settings(&mut self, settings: PlaybackSettings) {
+        if self.playback_settings() == settings {
+            return;
+        }
+        self.explicit_settings = Some(settings);
+        self.apply_policy(PlaybackPolicy::for_profile(self.policy.profile));
+        info!(?settings, "Playback automation settings updated");
+    }
+
     pub fn suspension(&self) -> &PlayerSuspensionManager {
         &self.suspension
     }
@@ -754,14 +777,34 @@ impl RuntimeState {
 
     /// Switches performance profile. Fullscreen debouncers are retuned in place so a pending
     /// transition keeps its timer; system-event reasons are re-derived under the new policy.
+    /// Persistent playback overrides are preserved across profile changes.
     pub fn set_profile(&mut self, profile: PerformanceProfile) {
-        self.policy = PlaybackPolicy::for_profile(profile);
+        self.apply_policy(PlaybackPolicy::for_profile(profile));
+        info!(?profile, "Switched runtime performance profile");
+    }
+
+    /// Installs a policy, reapplying user overrides and retuning live debouncers.
+    /// A changed foreground threshold clears stale suspension reasons immediately;
+    /// unchanged thresholds keep their timers so profile switches do not cause flapping.
+    fn apply_policy(&mut self, mut policy: PlaybackPolicy) {
+        let previous_threshold = self.policy.foreground_pause_threshold;
+        if let Some(settings) = self.explicit_settings {
+            settings.apply_to(&mut policy);
+        }
+        self.policy = policy;
+
         let (engage, release) = self.debounce_delays();
         for entry in self.fullscreen.values_mut() {
             entry.debouncer.set_delays(engage, release);
         }
+        if previous_threshold != self.policy.foreground_pause_threshold {
+            let devices: Vec<String> = self.fullscreen.keys().cloned().collect();
+            for device in devices {
+                self.suspension
+                    .remove_monitor(&device, SuspensionReason::FullscreenApplication);
+            }
+        }
         self.sync_system_reasons();
-        info!(?profile, "Switched runtime performance profile");
     }
 
     fn debounce_delays(&self) -> (Duration, Duration) {
@@ -1064,6 +1107,7 @@ impl RuntimeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FullscreenPauseMode;
     use crate::PerformanceProfile as Profile;
 
     const D1: &str = r"\\.\DISPLAY1";
@@ -1838,6 +1882,43 @@ mod tests {
         rt.set_profile(Profile::Balanced);
         run_foreground(&mut rt, &mut sink, &maxed, t, 2000);
         assert_eq!(sink.state(D1), ActualPlayback::Playing);
+    }
+
+    #[test]
+    fn never_fullscreen_mode_releases_an_active_suspension() {
+        let t = Instant::now();
+        let mut rt = rt(Profile::Balanced);
+        let mut sink = FakeSink::with(&[D1]);
+        let fullscreen = [obs(D1, ForegroundKind::BorderlessFullscreen)];
+        let t = run_foreground(&mut rt, &mut sink, &fullscreen, t, 700);
+        assert_eq!(sink.state(D1), ActualPlayback::Paused);
+
+        rt.set_playback_settings(PlaybackSettings {
+            fullscreen_pause: FullscreenPauseMode::Never,
+            ..PlaybackSettings::default()
+        });
+        run_foreground(&mut rt, &mut sink, &fullscreen, t, 2000);
+        assert_eq!(sink.state(D1), ActualPlayback::Playing);
+    }
+
+    #[test]
+    fn playback_settings_survive_profile_switches() {
+        let mut rt = rt(Profile::Balanced);
+        rt.set_playback_settings(PlaybackSettings {
+            fullscreen_pause: FullscreenPauseMode::ExclusiveOnly,
+            pause_on_lock: false,
+            ..PlaybackSettings::default()
+        });
+        rt.set_profile(Profile::Eco);
+        assert_eq!(
+            rt.policy().foreground_pause_threshold,
+            Some(ForegroundKind::ExclusiveFullscreen)
+        );
+        assert!(!rt.policy().pause_on_lock);
+        assert_eq!(
+            rt.playback_settings().fullscreen_pause,
+            FullscreenPauseMode::ExclusiveOnly
+        );
     }
 
     // ---- control parsing --------------------------------------------------------------

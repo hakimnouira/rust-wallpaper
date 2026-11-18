@@ -88,12 +88,28 @@ pub fn get_autostart_command() -> Option<String> {
     None
 }
 
-/// Enables or disables automatic startup with Windows.
-///
-/// When `enabled` is `true`, it registers either `wallpaper-daemon.exe` or
-/// `wallpaper-ui.exe --daemon` in `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+/// Chooses the installed UI executable so autostart includes the tray icon.
+fn autostart_command() -> Result<String, std::io::Error> {
+    let current_exe = std::env::current_exe()?;
+    let directory = current_exe
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    for name in ["RustWallpaper.exe", "wallpaper-ui.exe"] {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return Ok(format!("\"{}\" --tray", candidate.display()));
+        }
+    }
+    let daemon = directory.join("wallpaper-daemon.exe");
+    if daemon.is_file() {
+        return Ok(format!("\"{}\"", daemon.display()));
+    }
+    Ok(format!("\"{}\" --tray", current_exe.display()))
+}
+
+/// Writes an explicit command to the current user's startup registration.
 #[cfg(windows)]
-pub fn set_autostart(enabled: bool) -> Result<(), std::io::Error> {
+pub fn set_autostart_command(enabled: bool, command: Option<&str>) -> Result<(), std::io::Error> {
     let wide_key: Vec<u16> = std::ffi::OsStr::new(RUN_KEY)
         .encode_wide()
         .chain(std::iter::once(0))
@@ -121,14 +137,10 @@ pub fn set_autostart(enabled: bool) -> Result<(), std::io::Error> {
                 ));
             }
 
-            let current_exe = std::env::current_exe()?;
-            let daemon_exe = current_exe.parent().map(|p| p.join("wallpaper-daemon.exe"));
-            let command = if let Some(daemon) = daemon_exe.filter(|d| d.is_file()) {
-                format!("\"{}\"", daemon.display())
-            } else {
-                format!("\"{}\" --daemon", current_exe.display())
-            };
-
+            let command = command
+                .map(str::to_owned)
+                .map(Ok)
+                .unwrap_or_else(autostart_command)?;
             let wide_cmd: Vec<u16> = std::ffi::OsStr::new(&command)
                 .encode_wide()
                 .chain(std::iter::once(0))
@@ -142,10 +154,10 @@ pub fn set_autostart(enabled: bool) -> Result<(), std::io::Error> {
             let _ = RegCloseKey(hkey);
 
             if status.is_err() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to write registry value: {:?}", status),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "Failed to write registry value: {:?}",
+                    status
+                )));
             }
         } else {
             if RegOpenKeyExW(
@@ -168,8 +180,36 @@ pub fn set_autostart(enabled: bool) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+/// Registers the installed UI so Windows starts it hidden in the notification area.
+#[cfg(windows)]
+pub fn set_autostart_for(executable: &std::path::Path) -> Result<(), std::io::Error> {
+    let command = format!("\"{}\" --tray", executable.display());
+    set_autostart_command(true, Some(&command))
+}
+
+#[cfg(windows)]
+pub fn set_autostart(enabled: bool) -> Result<(), std::io::Error> {
+    set_autostart_command(enabled, None)
+}
+
 #[cfg(not(windows))]
 pub fn set_autostart(_enabled: bool) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Autostart is only supported on Windows",
+    ))
+}
+
+#[cfg(not(windows))]
+pub fn set_autostart_for(_executable: &std::path::Path) -> Result<(), std::io::Error> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "Autostart is only supported on Windows",
+    ))
+}
+
+#[cfg(not(windows))]
+pub fn set_autostart_command(_enabled: bool, _command: Option<&str>) -> Result<(), std::io::Error> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "Autostart is only supported on Windows",

@@ -286,7 +286,7 @@ async fn handle_wallpaper(
     let parsed_filename = url
         .split('?')
         .next()
-        .and_then(|u| u.split('/').last())
+        .and_then(|u| u.split('/').next_back())
         .filter(|s| !s.is_empty())
         .unwrap_or("web_wallpaper.mp4");
 
@@ -766,28 +766,6 @@ Connection: close\r\n\r\n",
     Ok(())
 }
 
-#[cfg(test)]
-mod security_tests {
-    use super::*;
-
-    #[test]
-    fn only_extension_and_loopback_origins_are_allowed() {
-        assert!(is_allowed_origin(&format!(
-            "chrome-extension://{}",
-            wallpaper_windows::EXTENSION_ID
-        )));
-        assert!(is_allowed_origin("http://127.0.0.1:24242"));
-        assert!(is_allowed_origin("http://localhost:24242"));
-        for origin in [
-            "https://evil.example",
-            "null",
-            "http://127.0.0.1.evil.example:24242",
-        ] {
-            assert!(!is_allowed_origin(origin), "allowed {origin}");
-        }
-    }
-}
-
 async fn send_json_response(
     stream: &mut TcpStream,
     status_code: u16,
@@ -825,4 +803,26 @@ async fn send_response(
         "message": message
     });
     send_json_response(stream, status_code, status_text, &json).await
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn only_extension_and_loopback_origins_are_allowed() {
+        assert!(is_allowed_origin(&format!(
+            "chrome-extension://{}",
+            wallpaper_windows::EXTENSION_ID
+        )));
+        assert!(is_allowed_origin("http://127.0.0.1:24242"));
+        assert!(is_allowed_origin("http://localhost:24242"));
+        for origin in [
+            "https://evil.example",
+            "null",
+            "http://127.0.0.1.evil.example:24242",
+        ] {
+            assert!(!is_allowed_origin(origin), "allowed {origin}");
+        }
+    }
 }
