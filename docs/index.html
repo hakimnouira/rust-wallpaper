@@ -6,111 +6,178 @@
   <meta name="color-scheme" content="light dark">
   <title>RustWallpaper — Ultra-Low Overhead Windows Live Wallpaper Engine</title>
   <meta name="description" content="Hardware-accelerated multi-monitor live wallpaper engine for Windows 10 and 11 written in pure Rust.">
+  <link rel="icon" href="icon.png" type="image/png">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <header class="site-header">
     <div class="container nav-bar">
       <a class="brand" href="index.html">
-        <span class="brand-mark" aria-hidden="true">RW</span>
+        <img class="brand-icon" src="icon.png" alt="" width="28" height="28">
         <span>RustWallpaper</span>
       </a>
       <nav class="nav-links" aria-label="Main navigation">
         <a href="index.html" aria-current="page">Home</a>
+        <a href="#tour">App Tour</a>
+        <a href="#capabilities">Capabilities</a>
         <a href="install.html">Installation</a>
-        <a href="#features">Features</a>
-        <a href="#screenshots">Screenshots</a>
         <a href="https://github.com/hakimnouira/rust-wallpaper">GitHub</a>
+        <a class="nav-cta" href="install.html">Get RustWallpaper</a>
       </nav>
     </div>
   </header>
 
   <main>
     <section class="hero">
-      <div class="container hero-grid">
-        <div>
+      <div class="container">
+        <div class="hero-center">
           <span class="badge">Pure Rust • Windows 10 / 11 x64 • GPU Accelerated</span>
           <h1>Live Desktop Wallpapers Without the Overhead</h1>
-          <p>
-            <strong>RustWallpaper</strong> re-parents hardware-accelerated MPV video streams behind your
-            Windows desktop icons via native Win32 <code>WorkerW</code> hooks—delivering smooth 60+ FPS
-            playback, multi-monitor layouts, Steam Workshop integration, and one-click browser capture.
+          <p class="lead">
+            <strong>RustWallpaper</strong> embeds hardware-accelerated MPV video streams directly behind
+            your Windows desktop icons via native Win32 <code>WorkerW</code> hooks—delivering 60+ FPS playback,
+            per-monitor control, Steam Workshop sync, and one-click browser capture.
           </p>
           <div class="cta-row">
             <a class="btn btn-primary" href="install.html">Install RustWallpaper</a>
             <a class="btn btn-secondary" href="https://github.com/hakimnouira/rust-wallpaper/releases/latest">Download Release</a>
+            <a class="btn btn-secondary" href="#tour">Explore Screens</a>
+          </div>
+          <div class="pill-strip">
+            <span class="pill"><strong>DXVA2 / D3D11VA</strong> GPU Decode</span>
+            <span class="pill"><strong>60+ FPS</strong> MPV Engine</span>
+            <span class="pill"><strong>Multi-Monitor</strong> Topology</span>
+            <span class="pill"><strong>Chrome / Edge / Brave</strong> Companion</span>
           </div>
         </div>
-        <figure class="hero-media">
-          <img src="screenshots/01_overview.png" alt="RustWallpaper desktop control panel overview" fetchpriority="high">
+
+        <figure class="app-frame">
+          <div class="app-frame-bar">
+            <span class="window-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+            <span>RustWallpaper — Live Overview (2 Displays Connected)</span>
+            <span>Click image to zoom</span>
+          </div>
+          <button class="shot-trigger" type="button" data-zoom-src="screenshots/01_overview.png" data-zoom-title="RustWallpaper Overview">
+            <img src="screenshots/01_overview.png" alt="RustWallpaper desktop control panel overview showing 2 active displays and 12 library wallpapers" fetchpriority="high">
+          </button>
         </figure>
       </div>
     </section>
 
-    <section id="features" class="section">
+    <section id="tour" class="section">
       <div class="container">
-        <div class="section-header">
-          <h2>Engineered for Speed and Multi-Monitor Control</h2>
-          <p>Built from the ground up in Rust with decoupled background supervision and GPU decoding.</p>
+        <div class="section-header centered">
+          <span class="eyebrow">Interactive App Tour</span>
+          <h2>Explore Every Screen in RustWallpaper</h2>
+          <p>Switch tabs below to inspect the real desktop UI—click any screenshot to open full-size.</p>
         </div>
-        <div class="cards-wrap">
-          <div class="cards-grid">
-            <article class="card">
-              <h3>Native Win32 WorkerW Integration</h3>
-              <p>Renders directly behind desktop icons while preserving selection boxes, context menus, and automatic recovery when Explorer restarts.</p>
-            </article>
-            <article class="card">
-              <h3>GPU-Accelerated MPV Engine</h3>
-              <p>Offloads decoding to DXVA2 / D3D11VA hardware decoders for near-zero CPU usage across MP4, WebM, MKV, MOV, AVI, and animated GIFs.</p>
-            </article>
-            <article class="card">
-              <h3>Wallpaper Engine-Style Tuning</h3>
-              <p>Configure FPS caps (15 to Uncapped), demuxer RAM cache (32–256 MB), scaling filters, and automatic pause on fullscreen apps or lock screen.</p>
-            </article>
-            <article class="card">
-              <h3>Multi-Monitor Topology &amp; Playlists</h3>
-              <p>Assign independent wallpapers and audio levels per monitor, or enable auto-rotating playlists with global hotkeys (<code>Alt+W</code>, <code>Alt+M</code>).</p>
-            </article>
-            <article class="card">
-              <h3>Browser Companion Extension</h3>
-              <p>Sniff and apply web videos directly from Chrome, Edge, or Brave over the authenticated local loopback API on <code>127.0.0.1:24242</code>.</p>
-            </article>
-            <article class="card">
-              <h3>Steam Workshop &amp; Online Catalog</h3>
-              <p>Browse curated online wallpapers or sync compatible Steam Wallpaper Engine video items right inside the desktop library.</p>
-            </article>
+
+        <div class="tour-shell">
+          <div class="tour-tabs" role="tablist" aria-label="Application screens">
+            <button class="tour-tab" type="button" role="tab" aria-selected="true" data-screen="overview">Overview</button>
+            <button class="tour-tab" type="button" role="tab" aria-selected="false" data-screen="library">Library</button>
+            <button class="tour-tab" type="button" role="tab" aria-selected="false" data-screen="browse">Browse &amp; Workshop</button>
+            <button class="tour-tab" type="button" role="tab" aria-selected="false" data-screen="monitors">Monitors</button>
+            <button class="tour-tab" type="button" role="tab" aria-selected="false" data-screen="appearance">Appearance</button>
+            <button class="tour-tab" type="button" role="tab" aria-selected="false" data-screen="settings">Settings</button>
+          </div>
+
+          <div class="tour-stage">
+            <div class="tour-media">
+              <div class="app-frame">
+                <div class="app-frame-bar">
+                  <span class="window-dots" aria-hidden="true"><span></span><span></span><span></span></span>
+                  <span id="tour-bar-title">Overview Dashboard</span>
+                  <span>Click to enlarge</span>
+                </div>
+                <button id="tour-zoom-btn" class="shot-trigger" type="button" data-zoom-src="screenshots/01_overview.png" data-zoom-title="Overview Dashboard">
+                  <img id="tour-img" src="screenshots/01_overview.png" alt="RustWallpaper Overview screen">
+                </button>
+              </div>
+            </div>
+            <div class="tour-info">
+              <span id="tour-eyebrow" class="card-tag">Workspace</span>
+              <h3 id="tour-title">Real-Time Engine Overview</h3>
+              <p id="tour-desc">Monitor connected displays, active MPV players, fullscreen policy, and jump straight into your library or next wallpaper in one click.</p>
+              <ul id="tour-bullets" class="feature-bullets">
+                <li>Live daemon connection &amp; active player counters</li>
+                <li>One-click Pause All, Resume All, and Next Wallpaper</li>
+                <li>Per-display quick status &amp; management shortcuts</li>
+              </ul>
+            </div>
           </div>
         </div>
       </div>
     </section>
 
-    <section id="screenshots" class="section">
+    <section id="capabilities" class="section">
       <div class="container">
         <div class="section-header">
-          <h2>Control Panel Preview</h2>
-          <p>Hardware-accelerated <code>egui</code> desktop interface backed by Named Pipe IPC.</p>
+          <span class="eyebrow">What It Can Do</span>
+          <h2>Built for Daily Desktop Performance</h2>
+          <p>Every workflow is backed by the persistent <code>wallpaper-daemon</code> and hardware-accelerated MPV subprocesses.</p>
         </div>
-        <div class="gallery-grid">
-          <figure class="shot-card">
-            <img src="screenshots/01_overview.png" alt="Overview dashboard showing active wallpaper and controls" loading="lazy">
-            <figcaption>Overview — Live playback status and quick controls</figcaption>
-          </figure>
-          <figure class="shot-card">
-            <img src="screenshots/02_library.png" alt="Grid library view of imported wallpapers" loading="lazy">
-            <figcaption>Library — Local collection, search, and playlists</figcaption>
-          </figure>
-          <figure class="shot-card">
-            <img src="screenshots/03_browse.png" alt="Browse view for online wallpapers and Steam Workshop" loading="lazy">
-            <figcaption>Browse — Curated online catalog &amp; direct URL download</figcaption>
-          </figure>
-          <figure class="shot-card">
-            <img src="screenshots/04_monitors.png" alt="Multi-monitor topology and per-screen assignment" loading="lazy">
-            <figcaption>Monitors — Display topology &amp; per-screen assignment</figcaption>
-          </figure>
-          <figure class="shot-card">
-            <img src="screenshots/06_settings.png" alt="Settings view with performance tuning and browser extension controls" loading="lazy">
-            <figcaption>Settings — Performance tuning &amp; browser extension setup</figcaption>
-          </figure>
+
+        <div class="spotlights">
+          <article class="spotlight">
+            <div class="spotlight-text">
+              <span class="card-tag">Library &amp; Organization</span>
+              <h3>Smart Wallpaper Library with Instant Filtering</h3>
+              <p>Import local MP4, WebM, MKV, MOV, AVI, or animated GIF files with automatic FFmpeg thumbnail and codec/resolution extraction.</p>
+              <ul class="feature-bullets">
+                <li>Filter by resolution (4K UHD, 1080p FHD, SD), aspect ratio, codec, or playback status</li>
+                <li>Switch between Grid and List layouts with adjustable thumbnail sizes</li>
+                <li>Double-click any card to assign it to a single display or all monitors</li>
+              </ul>
+            </div>
+            <div class="spotlight-media">
+              <div class="app-frame">
+                <button class="shot-trigger" type="button" data-zoom-src="screenshots/02_library.png" data-zoom-title="Wallpaper Library">
+                  <img src="screenshots/02_library.png" alt="RustWallpaper library grid showing imported video wallpapers and filters" loading="lazy">
+                </button>
+              </div>
+            </div>
+          </article>
+
+          <article class="spotlight reverse">
+            <div class="spotlight-text">
+              <span class="card-tag">Online &amp; Steam Workshop</span>
+              <h3>Download from Web URLs or Sync Workshop Items</h3>
+              <p>Discover free video loops, paste any direct video or social media link, or sync compatible Steam Wallpaper Engine items right inside the app.</p>
+              <ul class="feature-bullets">
+                <li>Built-in free video catalog with 1-click Import or Apply</li>
+                <li>Direct Web URL resolver &amp; downloader for MP4/WebM streams</li>
+                <li>Companion Chrome/Edge/Brave extension sends videos straight from Pinterest, TikTok, Reddit, Instagram, YouTube, and Wallhaven</li>
+              </ul>
+            </div>
+            <div class="spotlight-media">
+              <div class="app-frame">
+                <button class="shot-trigger" type="button" data-zoom-src="screenshots/03_browse.png" data-zoom-title="Browse &amp; Workshop">
+                  <img src="screenshots/03_browse.png" alt="RustWallpaper Browse &amp; Workshop view with URL downloader and video catalog" loading="lazy">
+                </button>
+              </div>
+            </div>
+          </article>
+
+          <article class="spotlight">
+            <div class="spotlight-text">
+              <span class="card-tag">Multi-Monitor &amp; Tuning</span>
+              <h3>Per-Display Topology &amp; Game-Safe Automation</h3>
+              <p>Control multiple monitors independently with D3D11VA hardware decoding, per-screen volume, FPS caps, RAM demuxer cache, and automatic game detection.</p>
+              <ul class="feature-bullets">
+                <li>Visual monitor layout map (e.g. 2560×1440 + 1920×1080) with click-to-target assignment</li>
+                <li>Auto-pause on borderless/exclusive fullscreen games, lock screen (<code>Win+L</code>), display sleep, or system suspend</li>
+                <li>FPS limiter (15 FPS to Uncapped), RAM cache (32–256 MB), and Bilinear/Spline36/Lanczos scaling</li>
+              </ul>
+            </div>
+            <div class="spotlight-media">
+              <div class="app-frame">
+                <button class="shot-trigger" type="button" data-zoom-src="screenshots/04_monitors.png" data-zoom-title="Monitor Manager">
+                  <img src="screenshots/04_monitors.png" alt="RustWallpaper Monitor Manager showing dual display layout and hardware decoder status" loading="lazy">
+                </button>
+              </div>
+            </div>
+          </article>
         </div>
       </div>
     </section>
@@ -118,19 +185,39 @@
     <section class="section">
       <div class="container">
         <div class="section-header">
-          <h2>Decoupled Architecture</h2>
-          <p>
-            <strong>wallpaper-daemon</strong> manages Win32 <code>WorkerW</code> desktop embedding, monitor lifecycle,
-            SQLite state (<code>library.db</code>), and the extension Web API bridge, while
-            <strong>wallpaper-ui</strong> connects over versioned Win32 Named Pipes (<code>\\.\pipe\rust-wallpaper-ipc</code>).
-          </p>
+          <span class="eyebrow">Architecture</span>
+          <h2>Under the Hood</h2>
         </div>
+        <div class="cards-wrap">
+          <div class="cards-grid">
+            <article class="card">
+              <h3>Native Win32 WorkerW</h3>
+              <p>Re-parents video windows behind desktop icons while preserving selection rectangles, context menus, and automatic recovery if Explorer restarts.</p>
+            </article>
+            <article class="card">
+              <h3>Named Pipe IPC</h3>
+              <p><code>wallpaper-daemon</code> runs silently in the background; <code>wallpaper-ui</code> connects over <code>\\.\pipe\rust-wallpaper-ipc</code> and minimizes cleanly to the tray.</p>
+            </article>
+            <article class="card">
+              <h3>Custom Themes &amp; Hotkeys</h3>
+              <p>Recolor the entire UI live in the Appearance tab without interrupting playback, and control rotation or mute globally with <code>Alt+W</code> and <code>Alt+M</code>.</p>
+            </article>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="container">
         <div class="cta-banner">
           <div>
-            <h3>Ready to install on Windows 10 or 11?</h3>
-            <p>Follow the step-by-step installer, portable, or source build guide.</p>
+            <h3>Ready to try RustWallpaper on Windows 10 or 11?</h3>
+            <p>Install with the 1-click setup wizard, run portable, or build from source.</p>
           </div>
-          <a class="btn btn-primary" href="install.html">Go to Installation Guide</a>
+          <div class="cta-row" style="margin-top: 0;">
+            <a class="btn btn-primary" href="install.html">Go to Installation Guide</a>
+            <a class="btn btn-secondary" href="https://github.com/hakimnouira/rust-wallpaper/releases/latest">Latest Release</a>
+          </div>
         </div>
       </div>
     </section>
@@ -138,7 +225,7 @@
 
   <footer class="site-footer">
     <div class="container footer-inner">
-      <span>RustWallpaper — Windows Live Wallpaper Engine</span>
+      <span>RustWallpaper — Windows Live Wallpaper Engine in Pure Rust</span>
       <nav class="nav-links" aria-label="Footer navigation">
         <a href="install.html">Installation</a>
         <a href="https://github.com/hakimnouira/rust-wallpaper">Repository</a>
@@ -146,5 +233,142 @@
       </nav>
     </div>
   </footer>
+
+  <dialog id="lightbox" class="lightbox" aria-label="Screenshot preview">
+    <div class="lightbox-head">
+      <span id="lightbox-title">Screenshot</span>
+      <button id="lightbox-close" class="lightbox-close" type="button">Close</button>
+    </div>
+    <img id="lightbox-img" src="" alt="">
+  </dialog>
+
+  <script>
+    const screens = {
+      overview: {
+        src: "screenshots/01_overview.png",
+        eyebrow: "Workspace",
+        barTitle: "Overview Dashboard",
+        title: "Real-Time Engine Overview",
+        desc: "Monitor connected displays, active MPV players, fullscreen policy, and jump straight into your library or next wallpaper in one click.",
+        bullets: [
+          "Live daemon connection and active player counters",
+          "One-click Pause All, Resume All, and Next Wallpaper",
+          "Per-display quick status and management shortcuts"
+        ]
+      },
+      library: {
+        src: "screenshots/02_library.png",
+        eyebrow: "Workspace",
+        barTitle: "Wallpaper Library",
+        title: "Organize & Filter Your Collection",
+        desc: "Import local videos or GIFs with automatic FFmpeg metadata extraction, search by title or codec, and assign wallpapers per monitor.",
+        bullets: [
+          "Filter by resolution (4K, 1080p, SD), aspect ratio, and codec",
+          "Grid and List views with configurable thumbnail sizes",
+          "Double-click any wallpaper to apply immediately"
+        ]
+      },
+      browse: {
+        src: "screenshots/03_browse.png",
+        eyebrow: "Workspace",
+        barTitle: "Browse & Workshop",
+        title: "Online Catalog, Direct URLs & Steam Workshop",
+        desc: "Browse curated free video loops, paste any direct media URL to download and apply, or sync local Steam Wallpaper Engine folders.",
+        bullets: [
+          "Curated video loop catalog with 1-click Import or Apply",
+          "Web URL downloader with automatic format verification",
+          "Local & Steam Workshop folder integration"
+        ]
+      },
+      monitors: {
+        src: "screenshots/04_monitors.png",
+        eyebrow: "Workspace",
+        barTitle: "Monitor Manager",
+        title: "Multi-Monitor Topology & Audio",
+        desc: "Inspect display coordinates and resolutions, target individual monitors for wallpaper assignment, and control per-screen volume or mute.",
+        bullets: [
+          "Interactive display layout map (e.g. 2560×1440 + 1920×1080)",
+          "Live hardware decoder readout (D3D11VA) and memory usage",
+          "Independent Pause, Resume, Volume, and Mute per display"
+        ]
+      },
+      appearance: {
+        src: "screenshots/05_appearance.png",
+        eyebrow: "Personalize",
+        barTitle: "Appearance & Themes",
+        title: "Live UI Theming & Scaling",
+        desc: "Customize theme presets, accent and background colors, dark/light mode, and DPI UI scale without restarting active wallpapers.",
+        bullets: [
+          "Instant theme presets (Midnight blue and custom palettes)",
+          "Custom accent and background color pickers",
+          "Adjustable UI scale for compact laptops or 4K displays"
+        ]
+      },
+      settings: {
+        src: "screenshots/06_settings.png",
+        eyebrow: "Personalize",
+        barTitle: "Settings & Diagnostics",
+        title: "Engine Tuning & Browser Extension",
+        desc: "Fine-tune FPS caps, RAM demuxer cache, scaling filters, fullscreen pause rules, Windows startup, and the Chrome/Edge/Brave companion extension.",
+        bullets: [
+          "Eco, Balanced, and Performance profiles with FPS & cache controls",
+          "Auto-pause on fullscreen games, Windows lock, or sleep",
+          "1-click Browser Companion Extension registration and diagnostics"
+        ]
+      }
+    };
+
+    const tabs = document.querySelectorAll(".tour-tab");
+    const tourImg = document.getElementById("tour-img");
+    const tourZoomBtn = document.getElementById("tour-zoom-btn");
+    const tourBarTitle = document.getElementById("tour-bar-title");
+    const tourEyebrow = document.getElementById("tour-eyebrow");
+    const tourTitle = document.getElementById("tour-title");
+    const tourDesc = document.getElementById("tour-desc");
+    const tourBullets = document.getElementById("tour-bullets");
+
+    tabs.forEach((tab) => {
+      tab.addEventListener("click", () => {
+        const key = tab.dataset.screen;
+        const data = screens[key];
+        if (!data) return;
+
+        tabs.forEach((t) => t.setAttribute("aria-selected", String(t === tab)));
+        tourImg.src = data.src;
+        tourImg.alt = `RustWallpaper ${data.barTitle} screen`;
+        tourZoomBtn.dataset.zoomSrc = data.src;
+        tourZoomBtn.dataset.zoomTitle = data.barTitle;
+        tourBarTitle.textContent = data.barTitle;
+        tourEyebrow.textContent = data.eyebrow;
+        tourTitle.textContent = data.title;
+        tourDesc.textContent = data.desc;
+        tourBullets.innerHTML = "";
+        data.bullets.forEach((text) => {
+          const li = document.createElement("li");
+          li.textContent = text;
+          tourBullets.appendChild(li);
+        });
+      });
+    });
+
+    const lightbox = document.getElementById("lightbox");
+    const lightboxImg = document.getElementById("lightbox-img");
+    const lightboxTitle = document.getElementById("lightbox-title");
+    const lightboxClose = document.getElementById("lightbox-close");
+
+    document.querySelectorAll("[data-zoom-src]").forEach((trigger) => {
+      trigger.addEventListener("click", () => {
+        lightboxImg.src = trigger.dataset.zoomSrc;
+        lightboxImg.alt = trigger.dataset.zoomTitle || "Screenshot preview";
+        lightboxTitle.textContent = trigger.dataset.zoomTitle || "Screenshot";
+        lightbox.showModal();
+      });
+    });
+
+    lightboxClose.addEventListener("click", () => lightbox.close());
+    lightbox.addEventListener("click", (event) => {
+      if (event.target === lightbox) lightbox.close();
+    });
+  </script>
 </body>
 </html>
