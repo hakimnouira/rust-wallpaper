@@ -6,8 +6,8 @@
   <meta name="color-scheme" content="light dark">
   <title>RustWallpaper — Ultra-Low Overhead Windows Live Wallpaper Engine</title>
   <meta name="description" content="Hardware-accelerated multi-monitor live wallpaper engine for Windows 10 and 11 written in pure Rust.">
-  <link rel="icon" href="icon.png" type="image/png">
-  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="icon.png?v=2" type="image/png">
+  <link rel="stylesheet" href="styles.css?v=2">
 </head>
 <body>
   <header class="site-header">
@@ -57,8 +57,8 @@
             <span>RustWallpaper — Live Overview (2 Displays Connected)</span>
             <span>Click image to zoom</span>
           </div>
-          <button class="shot-trigger" type="button" data-zoom-src="screenshots/01_overview.png" data-zoom-title="RustWallpaper Overview">
-            <img src="screenshots/01_overview.png" alt="RustWallpaper desktop control panel overview showing 2 active displays and 12 library wallpapers" fetchpriority="high">
+          <button class="shot-trigger" type="button" data-zoom-src="screenshots/01_overview.png?v=2" data-zoom-title="RustWallpaper Overview">
+            <img src="screenshots/01_overview.png?v=2" alt="RustWallpaper desktop control panel overview showing 2 active displays and 12 library wallpapers" fetchpriority="high">
           </button>
         </figure>
       </div>
@@ -90,8 +90,8 @@
                   <span id="tour-bar-title">Overview Dashboard</span>
                   <span>Click to enlarge</span>
                 </div>
-                <button id="tour-zoom-btn" class="shot-trigger" type="button" data-zoom-src="screenshots/01_overview.png" data-zoom-title="Overview Dashboard">
-                  <img id="tour-img" src="screenshots/01_overview.png" alt="RustWallpaper Overview screen">
+                <button id="tour-zoom-btn" class="shot-trigger" type="button" data-zoom-src="screenshots/01_overview.png?v=2" data-zoom-title="Overview Dashboard">
+                  <img id="tour-img" src="screenshots/01_overview.png?v=2" alt="RustWallpaper Overview screen">
                 </button>
               </div>
             </div>
@@ -132,8 +132,8 @@
             </div>
             <div class="spotlight-media">
               <div class="app-frame">
-                <button class="shot-trigger" type="button" data-zoom-src="screenshots/02_library.png" data-zoom-title="Wallpaper Library">
-                  <img src="screenshots/02_library.png" alt="RustWallpaper library grid showing imported video wallpapers and filters" loading="lazy">
+                <button class="shot-trigger" type="button" data-zoom-src="screenshots/02_library.png?v=2" data-zoom-title="Wallpaper Library">
+                  <img src="screenshots/02_library.png?v=2" alt="RustWallpaper library grid showing imported video wallpapers and filters" loading="lazy">
                 </button>
               </div>
             </div>
@@ -152,8 +152,8 @@
             </div>
             <div class="spotlight-media">
               <div class="app-frame">
-                <button class="shot-trigger" type="button" data-zoom-src="screenshots/03_browse.png" data-zoom-title="Browse &amp; Workshop">
-                  <img src="screenshots/03_browse.png" alt="RustWallpaper Browse &amp; Workshop view with URL downloader and video catalog" loading="lazy">
+                <button class="shot-trigger" type="button" data-zoom-src="screenshots/03_browse.png?v=2" data-zoom-title="Browse &amp; Workshop">
+                  <img src="screenshots/03_browse.png?v=2" alt="RustWallpaper Browse &amp; Workshop view with URL downloader and video catalog" loading="lazy">
                 </button>
               </div>
             </div>
@@ -172,8 +172,8 @@
             </div>
             <div class="spotlight-media">
               <div class="app-frame">
-                <button class="shot-trigger" type="button" data-zoom-src="screenshots/04_monitors.png" data-zoom-title="Monitor Manager">
-                  <img src="screenshots/04_monitors.png" alt="RustWallpaper Monitor Manager showing dual display layout and hardware decoder status" loading="lazy">
+                <button class="shot-trigger" type="button" data-zoom-src="screenshots/04_monitors.png?v=2" data-zoom-title="Monitor Manager">
+                  <img src="screenshots/04_monitors.png?v=2" alt="RustWallpaper Monitor Manager showing dual display layout and hardware decoder status" loading="lazy">
                 </button>
               </div>
             </div>
@@ -245,7 +245,7 @@
   <script>
     const screens = {
       overview: {
-        src: "screenshots/01_overview.png",
+        src: "screenshots/01_overview.png?v=2",
         eyebrow: "Workspace",
         barTitle: "Overview Dashboard",
         title: "Real-Time Engine Overview",
@@ -257,7 +257,7 @@
         ]
       },
       library: {
-        src: "screenshots/02_library.png",
+        src: "screenshots/02_library.png?v=2",
         eyebrow: "Workspace",
         barTitle: "Wallpaper Library",
         title: "Organize & Filter Your Collection",
@@ -269,7 +269,7 @@
         ]
       },
       browse: {
-        src: "screenshots/03_browse.png",
+        src: "screenshots/03_browse.png?v=2",
         eyebrow: "Workspace",
         barTitle: "Browse & Workshop",
         title: "Online Catalog, Direct URLs & Steam Workshop",
@@ -281,7 +281,7 @@
         ]
       },
       monitors: {
-        src: "screenshots/04_monitors.png",
+        src: "screenshots/04_monitors.png?v=2",
         eyebrow: "Workspace",
         barTitle: "Monitor Manager",
         title: "Multi-Monitor Topology & Audio",
@@ -293,7 +293,7 @@
         ]
       },
       appearance: {
-        src: "screenshots/05_appearance.png",
+        src: "screenshots/05_appearance.png?v=2",
         eyebrow: "Personalize",
         barTitle: "Appearance & Themes",
         title: "Live UI Theming & Scaling",
@@ -305,7 +305,7 @@
         ]
       },
       settings: {
-        src: "screenshots/06_settings.png",
+        src: "screenshots/06_settings.png?v=2",
         eyebrow: "Personalize",
         barTitle: "Settings & Diagnostics",
         title: "Engine Tuning & Browser Extension",
