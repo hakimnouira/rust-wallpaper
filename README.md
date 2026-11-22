@@ -15,7 +15,7 @@
 
 **RustWallpaper** is a high-performance Windows desktop wallpaper engine built from the ground up in Rust. It re-parents hardware-accelerated video streams directly behind Windows desktop icons using native Win32 `WorkerW` hooks. It delivers butter-smooth 60+ FPS video playback with near-zero CPU usage, comprehensive multi-monitor topology management, Wallpaper Engine-style performance tuning, and an IDM-style browser companion extension to capture and set wallpapers straight from the web.
 
-[Home Page](https://hakimnouira.github.io/rust-wallpaper/) • [Installation Guide](https://hakimnouira.github.io/rust-wallpaper/install.html) • [Latest Release](https://github.com/hakimnouira/rust-wallpaper/releases/latest) • [Features](#-key-features) • [Screenshots](#-screenshots) • [Architecture](#-architecture) • [Quick Start](#-quick-start) • [Browser Extension](#-browser-companion-extension) • [Building](#-building-from-source)
+[Home Page](https://hakimnouira.github.io/rust-wallpaper/) • [Installation Guide](INSTALLATION.md) • [Web Install Page](https://hakimnouira.github.io/rust-wallpaper/install.html) • [Latest Release](https://github.com/hakimnouira/rust-wallpaper/releases/latest) • [Features](#-key-features) • [Screenshots](#-screenshots) • [Architecture](#-architecture) • [Quick Start](#-quick-start) • [Browser Extension](#-browser-companion-extension) • [Building](#-building-from-source)
 
 ---
 
@@ -81,26 +81,26 @@ RustWallpaper follows a strictly decoupled, service-oriented client/server archi
 
 ```mermaid
 graph TD
-    subgraph Browser Integration
-        Ext[Chrome / Brave Extension] -->|HTTP REST API :24242| WebBridge[Web API Bridge]
+    subgraph Browser["Browser Integration"]
+        Ext["Chrome / Brave Extension"] -->|"HTTP REST API :24242"| WebBridge["Web API Bridge"]
     end
 
-    subgraph Client Application
-        UI[wallpaper-ui.exe\nModern egui GUI Panel] <-->|Named Pipe IPC| Pipe[\\.\\pipe\\rust-wallpaper-ipc]
-        Tray[System Tray Icon\nGlobal Hotkeys] --> UI
+    subgraph Client["Client Application"]
+        UI["wallpaper-ui.exe<br/>Modern egui GUI Panel"] <-->|"Named Pipe IPC"| Pipe["Named Pipe: rust-wallpaper-ipc"]
+        Tray["System Tray Icon<br/>Global Hotkeys"] --> UI
     end
 
-    subgraph Background Engine
+    subgraph Engine["Background Engine"]
         WebBridge --> Daemon
-        Pipe <--> Daemon[wallpaper-daemon.exe\nRuntime Supervisor]
-        Daemon --> DB[(SQLite Library\nlibrary.db)]
-        Daemon --> EvWatcher[Win32 Event Listener\nLock / Sleep / Fullscreen]
-        Daemon --> Topology[Monitor Lifecycle Manager]
-        Topology --> Host[Desktop Host\nWorkerW / Progman Hooks]
-        Topology --> MPV[MPV Video Players\nChild Subprocesses / IPC]
+        Pipe <--> Daemon["wallpaper-daemon.exe<br/>Runtime Supervisor"]
+        Daemon --> DB[("SQLite Library<br/>library.db")]
+        Daemon --> EvWatcher["Win32 Event Listener<br/>Lock / Sleep / Fullscreen"]
+        Daemon --> Topology["Monitor Lifecycle Manager"]
+        Topology --> Host["Desktop Host<br/>WorkerW / Progman Hooks"]
+        Topology --> MPV["MPV Video Players<br/>Child Subprocesses / IPC"]
     end
 
-    Host -.-> Screen((Desktop Background))
+    Host -.-> Screen(("Desktop Background"))
     MPV -.-> Screen
 ```
 

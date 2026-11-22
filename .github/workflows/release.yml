@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release -p wallpaper-ui -p wallpaper-daemon -p wallpaper-installer
+
+      - name: Package binaries & extension
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release-pkg\assets\wallpapers, release-pkg\extension | Out-Null
+          Copy-Item target\release\RustWallpaper.exe release-pkg\RustWallpaper.exe
+          Copy-Item target\release\wallpaper-daemon.exe release-pkg\wallpaper-daemon.exe
+          Copy-Item target\release\RustWallpaper-Setup.exe release-pkg\RustWallpaper-Setup.exe
+          Copy-Item target\release\uninstall.exe release-pkg\uninstall.exe
+          Copy-Item assets\icon.ico, assets\icon.png, assets\app.manifest release-pkg\assets\
+          Copy-Item assets\wallpapers\* release-pkg\assets\wallpapers\
+          Copy-Item extensions\chrome\* release-pkg\extension\ -Recurse
+          Copy-Item extensions\chrome.crx release-pkg\chrome.crx
+          Compress-Archive -Path release-pkg\* -DestinationPath RustWallpaper-windows-x64-bin.zip -Force
+          Compress-Archive -Path release-pkg\extension\* -DestinationPath RustWallpaper-Extension.zip -Force
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            RustWallpaper-windows-x64-bin.zip
+            RustWallpaper-Extension.zip
+          generate_release_notes: true
