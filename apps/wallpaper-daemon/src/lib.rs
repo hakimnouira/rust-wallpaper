@@ -27,7 +27,7 @@ pub mod logging;
 #[cfg(windows)]
 mod ipc;
 #[cfg(windows)]
-mod ipc_commands;
+pub(crate) mod ipc_commands;
 #[cfg(windows)]
 mod ipc_security;
 pub mod metadata;
@@ -37,8 +37,7 @@ pub mod web_api;
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
-/// Requests that the daemon stop its supervision loop and release players.
-pub(crate) fn request_shutdown() {
+pub fn request_shutdown() {
     RUNNING.store(false, Ordering::SeqCst);
 }
 
@@ -46,20 +45,6 @@ pub(crate) fn request_shutdown() {
 unsafe extern "system" fn ctrl_handler(_: u32) -> windows::Win32::Foundation::BOOL {
     RUNNING.store(false, Ordering::SeqCst);
     windows::Win32::Foundation::BOOL(1)
-}
-
-fn bundled_asset_path(file_name: &str) -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("assets").join("wallpapers").join(file_name));
-        }
-    }
-    candidates.push(PathBuf::from("assets").join("wallpapers").join(file_name));
-    candidates
-        .into_iter()
-        .find(|path| path.is_file())
-        .and_then(|path| std::fs::canonicalize(&path).ok().or(Some(path)))
 }
 
 fn parse_cli_args() -> (Option<Duration>, Option<PerformanceProfile>) {
@@ -98,22 +83,13 @@ pub fn run_daemon_with_options(
     requested_profile: Option<PerformanceProfile>,
     external_running: Option<std::sync::Arc<AtomicBool>>,
 ) -> anyhow::Result<()> {
-    logging::init("daemon", true);
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
 
-    #[cfg(windows)]
-    let _instance_guard = match wallpaper_windows::SingleInstanceGuard::acquire_daemon() {
-        Ok(Some(guard)) => guard,
-        Ok(None) => {
-            info!("Rust Wallpaper daemon is already running; exiting");
-            return Ok(());
-        }
-        Err(error) => {
-            warn!(%error, "Could not acquire the daemon single-instance lock");
-            return Ok(());
-        }
-    };
-
-    RUNNING.store(true, Ordering::SeqCst);
     info!("Rust Wallpaper daemon starting");
     info!(?requested_profile, "RuntimeSupervisor orchestration active");
 
@@ -163,9 +139,28 @@ pub fn run_daemon_with_options(
             library.set_setting("performance_profile", profile_name)?;
         }
 
-        // Resolve packaged sample media beside the installed binaries, independent of cwd.
-        let nature_mp4 = bundled_asset_path("sample-nature.mp4");
-        let abstract_webm = bundled_asset_path("sample-abstract.webm");
+        // Import bundled demo assets only once when not already present in the library.
+        // Use canonical absolute paths to avoid relative-path resolution failures.
+        let nature_mp4 = std::fs::canonicalize("assets/wallpapers/sample-nature.mp4")
+            .ok()
+            .or_else(|| {
+                let p = PathBuf::from("assets/wallpapers/sample-nature.mp4");
+                if p.is_file() {
+                    Some(p)
+                } else {
+                    None
+                }
+            });
+        let abstract_webm = std::fs::canonicalize("assets/wallpapers/sample-abstract.webm")
+            .ok()
+            .or_else(|| {
+                let p = PathBuf::from("assets/wallpapers/sample-abstract.webm");
+                if p.is_file() {
+                    Some(p)
+                } else {
+                    None
+                }
+            });
 
         let demo_config = PlaybackConfig {
             loop_playback: true,
@@ -176,6 +171,7 @@ pub fn run_daemon_with_options(
         };
 
         let existing_wallpapers = library.list().unwrap_or_default();
+        let mut library_count = existing_wallpapers.len();
         let has_nature = existing_wallpapers
             .iter()
             .any(|w| w.title() == "Nature Test Video (MP4)");
@@ -185,26 +181,33 @@ pub fn run_daemon_with_options(
 
         if !has_nature {
             if let Some(ref path) = nature_mp4 {
-                let _ = library.import_video(
-                    path,
-                    Some("Nature Test Video (MP4)"),
-                    Some(demo_config.clone()),
-                );
+                if library
+                    .import_video(
+                        path,
+                        Some("Nature Test Video (MP4)"),
+                        Some(demo_config.clone()),
+                    )
+                    .is_ok()
+                {
+                    library_count += 1;
+                }
             }
         }
         if !has_abstract {
             if let Some(ref path) = abstract_webm {
-                let _ = library.import_video(
-                    path,
-                    Some("Abstract Test Video (WebM)"),
-                    Some(demo_config.clone()),
-                );
+                if library
+                    .import_video(
+                        path,
+                        Some("Abstract Test Video (WebM)"),
+                        Some(demo_config.clone()),
+                    )
+                    .is_ok()
+                {
+                    library_count += 1;
+                }
             }
         }
-        info!(
-            count = library.list().unwrap_or_default().len(),
-            "Wallpaper library loaded"
-        );
+        info!(count = library_count, "Wallpaper library loaded");
 
         let fallback_path = nature_mp4.or(abstract_webm);
         let fallback = fallback_path.map(|path| Assignment {
@@ -220,8 +223,6 @@ pub fn run_daemon_with_options(
         let mut runtime_state = RuntimeState::new(PlaybackPolicy::for_profile(profile));
         runtime_state.set_playback_settings(playback_settings);
         let mut runtime = RuntimeSupervisor::new(runtime_state, lifecycle, HealthPolicy::default());
-        // Persisted global performance settings must reach wallpapers restored from
-        // the database before the first player launch, not only newly applied ones.
         let (target_fps, ram_budget_mb, quality) =
             ipc_commands::load_performance_settings(&library);
         runtime.lifecycle.registry_mut().apply_playback_defaults(
@@ -242,8 +243,11 @@ pub fn run_daemon_with_options(
             "Desktop host ready"
         );
 
-        let initial = enumerate_monitor_details()
-            .context("failed to enumerate monitor identities")?
+        let initial_details =
+            enumerate_monitor_details().context("failed to enumerate monitor identities")?;
+        let mut daemon_cache = ipc_commands::DaemonCache::load(&library);
+        daemon_cache.set_monitors_from_details(&initial_details);
+        let initial = initial_details
             .into_iter()
             .map(|m| m.into_descriptor())
             .collect();
@@ -263,7 +267,7 @@ pub fn run_daemon_with_options(
         let control_rx = spawn_control_reader();
         let (ipc_tx, ipc_rx) = ipc::start();
         web_api::start(ipc_tx.clone(), web_api::DEFAULT_PORT);
-        // Scan disk and queue stale thumbnail work only after IPC and HTTP are serving requests.
+        // Keep startup responsive: scan disk and queue stale thumbnail work only after IPC is serving.
         pipeline::ExtractionPipeline::start_recovery(
             library.clone(),
             pipeline.clone(),
@@ -286,16 +290,18 @@ pub fn run_daemon_with_options(
         }
 
         let start_time = Instant::now();
-        let mut known_monitors: Vec<String> = enumerate_monitor_details()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|m| m.info.device_name)
+        let mut known_monitors: Vec<String> = daemon_cache
+            .monitors
+            .iter()
+            .map(|m| m.device_name.clone())
             .collect();
         let mut last_poll = Instant::now() - Duration::from_secs(1);
         let mut last_health = Instant::now();
         let mut last_refresh = Instant::now();
         let mut last_telemetry = Instant::now();
         let mut last_reconcile = Instant::now();
+        let mut last_rotation = Instant::now();
+        let mut active_benchmark: Option<ipc_commands::ActiveBenchmark> = None;
 
         while RUNNING.load(Ordering::SeqCst)
             && external_running
@@ -329,8 +335,39 @@ pub fn run_daemon_with_options(
                     &mut manager,
                     &known_monitors,
                     now,
+                    &mut active_benchmark,
+                    &mut daemon_cache,
                 );
                 let _ = pending.reply.send(response);
+            }
+
+            // 10-second initial peak RAM and CPU benchmark for wallpapers
+            if let Some(ref mut bench) = active_benchmark {
+                if bench.started_at.elapsed() < Duration::from_secs(10) {
+                    if bench.last_sample.elapsed() >= Duration::from_millis(500) {
+                        bench.last_sample = Instant::now();
+                        let ram = manager.get_player_memory(&bench.device);
+                        let cpu = manager.sample_player_cpu(&bench.device);
+                        if ram > bench.peak_ram_bytes {
+                            bench.peak_ram_bytes = ram;
+                        }
+                        if cpu > bench.peak_cpu_percent {
+                            bench.peak_cpu_percent = cpu;
+                        }
+                    }
+                } else {
+                    let peak_ram_mb =
+                        (bench.peak_ram_bytes as f64 / (1024.0 * 1024.0)).round() as u32;
+                    let peak_cpu = (bench.peak_cpu_percent * 10.0).round() / 10.0;
+                    let _ = library.update_benchmark(bench.wallpaper_id, peak_ram_mb, peak_cpu);
+                    info!(
+                        wallpaper_id = %bench.wallpaper_id,
+                        peak_ram_mb,
+                        peak_cpu,
+                        "10-second initial wallpaper benchmark completed. Profiling stopped to save system resources."
+                    );
+                    active_benchmark = None;
+                }
             }
 
             let mut listener_died = false;
@@ -400,12 +437,17 @@ pub fn run_daemon_with_options(
                 if let Err(e) = manager.refresh() {
                     warn!(%e, "Wallpaper manager refresh failed");
                 }
-                sync_monitors(&mut runtime, &mut manager, &mut known_monitors, now);
+                sync_monitors(
+                    &mut runtime,
+                    &mut manager,
+                    &mut known_monitors,
+                    &mut daemon_cache,
+                    now,
+                );
             }
 
             if now.saturating_duration_since(last_poll) >= runtime.runtime.poll_interval() {
                 last_poll = now;
-                sync_known_devices(&mut known_monitors);
                 let probe = tracker.probe();
                 runtime
                     .runtime
@@ -419,7 +461,13 @@ pub fn run_daemon_with_options(
                 if let Err(e) = manager.refresh() {
                     warn!(%e, "Error refreshing wallpaper manager");
                 }
-                sync_monitors(&mut runtime, &mut manager, &mut known_monitors, now);
+                sync_monitors(
+                    &mut runtime,
+                    &mut manager,
+                    &mut known_monitors,
+                    &mut daemon_cache,
+                    now,
+                );
             }
 
             if now.saturating_duration_since(last_health) >= HEALTH_TICK {
@@ -447,6 +495,19 @@ pub fn run_daemon_with_options(
                 last_reconcile = now;
             }
 
+            if now.saturating_duration_since(last_rotation) >= Duration::from_secs(1) {
+                last_rotation = now;
+                ipc_commands::tick_rotation(
+                    &library,
+                    &mut runtime,
+                    &mut manager,
+                    &known_monitors,
+                    now,
+                    &mut daemon_cache,
+                    &mut active_benchmark,
+                );
+            }
+
             if now.saturating_duration_since(last_telemetry) >= Duration::from_secs(10) {
                 last_telemetry = now;
                 // Keep the daemon loop non-blocking: detailed MPV telemetry performs several
@@ -459,7 +520,7 @@ pub fn run_daemon_with_options(
                         .into_iter()
                         .map(|r| r.as_str())
                         .collect();
-                    info!(
+                    tracing::debug!(
                         device = %device,
                         active_decoder = %decoder,
                         state = ?state,
@@ -474,7 +535,9 @@ pub fn run_daemon_with_options(
                 info!("Scheduled run duration reached; shutting down");
                 break;
             }
-            std::thread::sleep(Duration::from_millis(16));
+            // Most work is event-driven; a 50 ms idle wait keeps command latency responsive
+            // while avoiding roughly 60 wakeups per second when the desktop is quiet.
+            std::thread::sleep(Duration::from_millis(50));
         }
 
         info!("Shutting down daemon");
@@ -493,11 +556,11 @@ pub fn run_daemon_with_options(
 #[cfg(windows)]
 const LISTENER_RETRY: Duration = Duration::from_secs(2);
 #[cfg(windows)]
-const TOPOLOGY_POLL: Duration = Duration::from_millis(750);
+const TOPOLOGY_POLL: Duration = Duration::from_secs(5);
 #[cfg(windows)]
 const HEALTH_TICK: Duration = Duration::from_millis(250);
 #[cfg(windows)]
-const RECONCILE_HEARTBEAT: Duration = Duration::from_millis(100);
+const RECONCILE_HEARTBEAT: Duration = Duration::from_millis(250);
 
 #[cfg(windows)]
 fn start_listener_with_retry() -> Option<SystemEventListener> {
@@ -514,20 +577,11 @@ fn start_listener_with_retry() -> Option<SystemEventListener> {
 }
 
 #[cfg(windows)]
-fn sync_known_devices(known: &mut Vec<String>) {
-    if let Ok(monitors) = enumerate_monitor_details() {
-        let devices: Vec<String> = monitors.into_iter().map(|m| m.info.device_name).collect();
-        if !devices.is_empty() {
-            *known = devices;
-        }
-    }
-}
-
-#[cfg(windows)]
 fn sync_monitors(
     runtime: &mut RuntimeSupervisor,
     manager: &mut WallpaperManager,
     known: &mut Vec<String>,
+    daemon_cache: &mut ipc_commands::DaemonCache,
     now: Instant,
 ) {
     match enumerate_monitor_details() {
@@ -536,6 +590,7 @@ fn sync_monitors(
                 .iter()
                 .map(|m| m.info.device_name.clone())
                 .collect();
+            daemon_cache.set_monitors_from_details(&monitors);
             let report = runtime.sync_topology(
                 monitors.into_iter().map(|m| m.into_descriptor()).collect(),
                 manager,

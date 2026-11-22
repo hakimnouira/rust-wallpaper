@@ -130,8 +130,8 @@ impl MpvProcess {
             JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
         };
         use windows::Win32::System::Threading::{
-            CreateProcessW, ResumeThread, TerminateProcess, CREATE_SUSPENDED, PROCESS_INFORMATION,
-            STARTF_USESHOWWINDOW, STARTUPINFOW,
+            CreateProcessW, ResumeThread, TerminateProcess, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+            PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
         };
         use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -201,7 +201,7 @@ impl MpvProcess {
 
         let mut pi = PROCESS_INFORMATION::default();
 
-        // 2. Create process in SUSPENDED state
+        // 2. Create process in SUSPENDED state with CREATE_NO_WINDOW
         let create_res = unsafe {
             CreateProcessW(
                 None,
@@ -209,7 +209,7 @@ impl MpvProcess {
                 None,
                 None,
                 false,
-                CREATE_SUSPENDED,
+                CREATE_SUSPENDED | CREATE_NO_WINDOW,
                 None,
                 None,
                 &si,
@@ -303,7 +303,9 @@ impl MpvProcess {
                     return Ok(());
                 }
                 if let Err(e) = TerminateProcess(self.process_handle, 1) {
-                    if WaitForSingleObject(self.process_handle, 0) != WAIT_OBJECT_0 {
+                    // Windows returns ERROR_ACCESS_DENIED if the process has already exited or is in teardown.
+                    // Allow up to 1 second for the process handle to become signaled.
+                    if WaitForSingleObject(self.process_handle, 1000) != WAIT_OBJECT_0 {
                         return Err(std::io::Error::other(format!(
                             "TerminateProcess failed: {e}"
                         )));
@@ -442,6 +444,11 @@ pub struct MpvPlayer {
     volume: u32,
     muted: bool,
     started_at: Instant,
+    #[cfg(windows)]
+    last_cpu_time: Arc<AtomicU64>,
+    #[cfg(windows)]
+    last_cpu_sample_instant: Arc<Mutex<Instant>>,
+    log_path: Option<PathBuf>,
     #[doc(hidden)]
     mock_stop_failure: bool,
 }
@@ -491,16 +498,24 @@ impl MpvPlayer {
         crate::desktop_host::ensure_interactive_desktop();
 
         let log_path = std::env::temp_dir().join(format!("mpv-{}.log", pipe_id));
+        let trace_mpv = std::env::var("RUST_WALLPAPER_MPV_TRACE")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        let msg_level_arg = if trace_mpv {
+            "--msg-level=all=trace".to_string()
+        } else {
+            "--msg-level=all=warn".to_string()
+        };
 
         let mut cmd_args = vec![
             format!("\"{}\"", mpv_bin.display()),
             format!("--wid={}", launch_cfg.wid as usize),
             format!("--input-ipc-server={}", pipe_path),
             format!("--log-file={}", log_path.display()),
-            "--msg-level=all=trace".to_string(),
+            msg_level_arg,
             format!("--hwdec={}", hwdec_arg),
             "--hwdec-codecs=all".to_string(),
             "--hwdec-software-fallback=yes".to_string(),
+            "--audio-display=no".to_string(),
             format!("--loop-file={}", loop_arg),
             "--image-display-duration=inf".to_string(),
             format!("--volume={}", launch_cfg.config.volume),
@@ -520,10 +535,23 @@ impl MpvPlayer {
             cmd_args.push("--mute=yes".to_string());
         }
 
-        // Framerate limit (Wallpaper Engine style)
+        // Video rotation (0, 90, 180, 270 degrees)
+        if let Some(rotation) = launch_cfg.config.video_rotation {
+            if rotation > 0 {
+                cmd_args.push(format!("--video-rotate={rotation}"));
+            }
+        }
+
+        // Framerate limit: avoid CPU-copying `--vf=fps` when hardware decoding is enabled
         if let Some(target_fps) = launch_cfg.config.target_fps {
             if target_fps > 0 {
-                cmd_args.push(format!("--vf=fps=fps={target_fps}"));
+                if launch_cfg.config.hardware_acceleration
+                    == wallpaper_core::HardwareAcceleration::Disabled
+                {
+                    cmd_args.push(format!("--vf=fps=fps={target_fps}"));
+                } else {
+                    cmd_args.push(format!("--override-display-fps={target_fps}"));
+                }
             }
         }
 
@@ -783,6 +811,11 @@ impl MpvPlayer {
             volume: launch_cfg.config.volume,
             muted: launch_cfg.config.mute,
             started_at: Instant::now(),
+            #[cfg(windows)]
+            last_cpu_time: Arc::new(AtomicU64::new(0)),
+            #[cfg(windows)]
+            last_cpu_sample_instant: Arc::new(Mutex::new(Instant::now())),
+            log_path: if trace_mpv { None } else { Some(log_path) },
             mock_stop_failure: false,
         };
 
@@ -1061,6 +1094,12 @@ impl MpvPlayer {
         Ok(())
     }
 
+    fn cleanup_log_file(&mut self) {
+        if let Some(path) = self.log_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     /// Stops playback and terminates MPV.
     pub fn stop(&mut self) -> Result<(), MpvError> {
         if self.mock_stop_failure {
@@ -1072,7 +1111,10 @@ impl MpvPlayer {
         if self.state() == PlaybackState::Stopped {
             // Repeated stop calls are safe: verify process is actually dead
             match self.child.try_wait() {
-                Ok(Some(_)) => return Ok(()),
+                Ok(Some(_)) => {
+                    self.cleanup_log_file();
+                    return Ok(());
+                }
                 Ok(None) => {
                     // Process still alive despite stopped flag, fall through to force-kill
                 }
@@ -1112,6 +1154,7 @@ impl MpvPlayer {
             match self.child.try_wait() {
                 Ok(Some(_)) => {
                     *self.state.lock().unwrap() = PlaybackState::Stopped;
+                    self.cleanup_log_file();
                     return Ok(());
                 }
                 Ok(None) => {
@@ -1134,6 +1177,7 @@ impl MpvPlayer {
         match self.child.wait_timeout(Duration::from_millis(1000)) {
             Ok(Some(_)) => {
                 *self.state.lock().unwrap() = PlaybackState::Stopped;
+                self.cleanup_log_file();
                 Ok(())
             }
             Ok(None) => Err(MpvError::Player(
@@ -1166,6 +1210,62 @@ impl MpvPlayer {
             }
         }
         0
+    }
+
+    /// Sets the video rotation angle (0, 90, 180, 270 degrees) dynamically on the running player.
+    pub fn set_video_rotation(&mut self, rotation: u32) -> Result<(), MpvError> {
+        self.send_command(&[
+            serde_json::json!("set_property"),
+            serde_json::json!("video-rotate"),
+            serde_json::json!(rotation),
+        ])?;
+        Ok(())
+    }
+
+    /// Samples current CPU utilization percentage of the MPV child process.
+    pub fn sample_cpu(&self) -> f64 {
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::FILETIME;
+            use windows::Win32::System::Threading::GetProcessTimes;
+
+            unsafe {
+                let proc_handle = self.child.raw_handle();
+                let mut creation = FILETIME::default();
+                let mut exit = FILETIME::default();
+                let mut kernel = FILETIME::default();
+                let mut user = FILETIME::default();
+
+                if GetProcessTimes(
+                    proc_handle,
+                    &mut creation,
+                    &mut exit,
+                    &mut kernel,
+                    &mut user,
+                )
+                .is_ok()
+                {
+                    let cur_cpu_100ns = (((kernel.dwHighDateTime as u64) << 32)
+                        | (kernel.dwLowDateTime as u64))
+                        + (((user.dwHighDateTime as u64) << 32) | (user.dwLowDateTime as u64));
+
+                    let mut last_guard = self.last_cpu_sample_instant.lock().unwrap();
+                    let elapsed = last_guard.elapsed().as_secs_f64();
+                    *last_guard = Instant::now();
+
+                    let prev_cpu = self.last_cpu_time.swap(cur_cpu_100ns, Ordering::SeqCst);
+                    if prev_cpu > 0 && cur_cpu_100ns >= prev_cpu && elapsed > 0.05 {
+                        let delta_secs = (cur_cpu_100ns - prev_cpu) as f64 / 10_000_000.0;
+                        let num_cpus = std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(1) as f64;
+                        let cpu_pct = (delta_secs / (elapsed * num_cpus)) * 100.0;
+                        return (cpu_pct * 10.0).round() / 10.0;
+                    }
+                }
+            }
+        }
+        0.0
     }
 
     /// Returns the PID of the MPV child process.

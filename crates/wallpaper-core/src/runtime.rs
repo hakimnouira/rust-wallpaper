@@ -582,6 +582,7 @@ pub enum RuntimeEvent {
     SystemResume,
     DisplayTopologyChanged,
     ExplorerRestarted,
+    PowerSourceChanged { on_battery: bool },
 }
 
 /// Quiet period after the last topology event before monitors are re-enumerated.
@@ -720,6 +721,7 @@ pub struct RuntimeState {
     session_locked: bool,
     display_off: bool,
     system_suspended: bool,
+    on_battery: bool,
 
     fullscreen: HashMap<String, MonitorFullscreen>,
 
@@ -738,6 +740,7 @@ impl RuntimeState {
             session_locked: false,
             display_off: false,
             system_suspended: false,
+            on_battery: false,
             fullscreen: HashMap::new(),
             topology_event_at: None,
             explorer_event_at: None,
@@ -828,6 +831,7 @@ impl RuntimeState {
             RuntimeEvent::SystemResume => self.system_suspended = false,
             RuntimeEvent::DisplayTopologyChanged => self.topology_event_at = Some(now),
             RuntimeEvent::ExplorerRestarted => self.explorer_event_at = Some(now),
+            RuntimeEvent::PowerSourceChanged { on_battery } => self.on_battery = on_battery,
         }
         self.sync_system_reasons();
     }
@@ -846,6 +850,10 @@ impl RuntimeState {
             (
                 SuspensionReason::SystemSuspended,
                 self.system_suspended && self.policy.pause_on_system_suspend,
+            ),
+            (
+                SuspensionReason::BatterySaver,
+                self.on_battery && self.policy.pause_on_battery,
             ),
         ];
         for (reason, active) in derived {

@@ -30,17 +30,23 @@ fn main() {
     }
 
     // 1. Terminate running application processes if any
-    let _ = std::process::Command::new("taskkill")
-        .args([
-            "/F",
-            "/IM",
-            "RustWallpaper.exe",
-            "/IM",
-            "wallpaper-ui.exe",
-            "/IM",
-            "wallpaper-daemon.exe",
-        ])
-        .output();
+    let mut kill_cmd = std::process::Command::new("taskkill");
+    kill_cmd.args([
+        "/F",
+        "/IM",
+        "RustWallpaper.exe",
+        "/IM",
+        "wallpaper-ui.exe",
+        "/IM",
+        "wallpaper-daemon.exe",
+    ]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        kill_cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = kill_cmd.output();
 
     // 2. Remove desktop shortcut
     if let Ok(userprofile) = std::env::var("USERPROFILE") {
@@ -111,12 +117,18 @@ fn main() {
     if let Ok(current_exe) = std::env::current_exe() {
         if let Some(install_dir) = current_exe.parent() {
             let dir_str = install_dir.to_string_lossy().to_string();
-            let _ = std::process::Command::new("cmd.exe")
-                .args([
-                    "/c",
-                    &format!("timeout /t 1 /nobreak >nul & rmdir /s /q \"{}\"", dir_str),
-                ])
-                .spawn();
+            let mut del_cmd = std::process::Command::new("cmd.exe");
+            del_cmd.args([
+                "/c",
+                &format!("timeout /t 1 /nobreak >nul & rmdir /s /q \"{}\"", dir_str),
+            ]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                del_cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            let _ = del_cmd.spawn();
         }
     }
 

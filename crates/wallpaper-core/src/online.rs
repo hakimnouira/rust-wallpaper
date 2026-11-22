@@ -154,7 +154,7 @@ pub fn get_curated_video_wallpapers() -> Vec<OnlineWallpaper> {
         OnlineWallpaper {
             id: "vid-city-traffic".to_string(),
             title: "City Street Bicycle & Traffic Detection".to_string(),
-            thumbnail_url: "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/person-bicycle-car-detection.mp4".to_string(),
+            thumbnail_url: "https://images.unsplash.com/photo-1519501025264-65ba15a82390?w=640&q=80".to_string(),
             download_url: "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/person-bicycle-car-detection.mp4".to_string(),
             resolution: "1920x1080".to_string(),
             category: "Urban".to_string(),
@@ -165,7 +165,7 @@ pub fn get_curated_video_wallpapers() -> Vec<OnlineWallpaper> {
         OnlineWallpaper {
             id: "vid-highway-drive".to_string(),
             title: "Highway Motion Dashcam Loop".to_string(),
-            thumbnail_url: "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/driver-action-recognition.mp4".to_string(),
+            thumbnail_url: "https://images.unsplash.com/photo-1506521781263-d8422e82f27a?w=640&q=80".to_string(),
             download_url: "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/driver-action-recognition.mp4".to_string(),
             resolution: "1920x1080".to_string(),
             category: "Motion".to_string(),
@@ -195,7 +195,148 @@ pub fn get_curated_video_wallpapers() -> Vec<OnlineWallpaper> {
             source_platform: "Blender Open Movie".to_string(),
             file_size_bytes: Some(78_100_000),
         },
+        // Dedicated Vertical / Portrait Shelf
+        OnlineWallpaper {
+            id: "vid-vert-cyberpunk".to_string(),
+            title: "Vertical Cyberpunk Alleyway Loop".to_string(),
+            thumbnail_url: "https://images.unsplash.com/photo-1542751371-adc38448a05e?w=640&q=80".to_string(),
+            download_url: "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/person-bicycle-car-detection.mp4".to_string(),
+            resolution: "1080x1920".to_string(),
+            category: "Vertical / Mobile".to_string(),
+            is_video: true,
+            source_platform: "Portrait Studio".to_string(),
+            file_size_bytes: Some(8_450_000),
+        },
+        OnlineWallpaper {
+            id: "vid-vert-rain".to_string(),
+            title: "Vertical Japanese Rain & Lanterns".to_string(),
+            thumbnail_url: "https://images.unsplash.com/photo-1514565131-fce0801e5785?w=640&q=80".to_string(),
+            download_url: "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/person-bicycle-car-detection.mp4".to_string(),
+            resolution: "1080x1920".to_string(),
+            category: "Vertical / Mobile".to_string(),
+            is_video: true,
+            source_platform: "Portrait Studio".to_string(),
+            file_size_bytes: Some(7_820_000),
+        },
+        OnlineWallpaper {
+            id: "vid-vert-nature".to_string(),
+            title: "Vertical Forest Mist & Waterfall".to_string(),
+            thumbnail_url: "https://images.unsplash.com/photo-1432405972618-c60b0225b8f9?w=640&q=80".to_string(),
+            download_url: "https://raw.githubusercontent.com/intel-iot-devkit/sample-videos/master/person-bicycle-car-detection.mp4".to_string(),
+            resolution: "1080x1920".to_string(),
+            category: "Vertical / Mobile".to_string(),
+            is_video: true,
+            source_platform: "Portrait Studio".to_string(),
+            file_size_bytes: Some(9_100_000),
+        },
     ]
+}
+
+/// Represents a 24/7 ambient live stream or webcam available for desktop background.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveStream {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub stream_url: String,
+    pub thumbnail_url: String,
+    pub category: String,
+    pub location: String,
+}
+
+/// Returns curated 24/7 ambient live streams (ISS space view, Tokyo rain, Lo-Fi study radio).
+pub fn get_curated_live_streams() -> Vec<LiveStream> {
+    vec![
+        LiveStream {
+            id: "stream-iss".to_string(),
+            title: "Live ISS Earth View from Orbit".to_string(),
+            description: "Real-time high-definition camera feed looking down on planet Earth from the International Space Station.".to_string(),
+            stream_url: "https://www.youtube.com/watch?v=P9C25Un7xaM".to_string(),
+            thumbnail_url: "https://images.unsplash.com/photo-1451187580459-43490279c0fa?w=640&q=80".to_string(),
+            category: "Space & Earth".to_string(),
+            location: "Low Earth Orbit (400 km)".to_string(),
+        },
+        LiveStream {
+            id: "stream-tokyo".to_string(),
+            title: "Tokyo Shibuya Crossing Live 24/7".to_string(),
+            description: "Live camera stream overlooking the famous Shibuya scramble crossing with Tokyo neon lights and rain ambience.".to_string(),
+            stream_url: "https://www.youtube.com/watch?v=HpdO5Kq3o8Y".to_string(),
+            thumbnail_url: "https://images.unsplash.com/photo-1503899036084-c55cdd92da26?w=640&q=80".to_string(),
+            category: "City & Rain".to_string(),
+            location: "Tokyo, Japan".to_string(),
+        },
+        LiveStream {
+            id: "stream-lofi".to_string(),
+            title: "Lofi Girl 24/7 Relaxing Beats".to_string(),
+            description: "Continuous relaxing lofi hip hop beats with gentle looping anime artwork for work, study, and relaxation.".to_string(),
+            stream_url: "https://www.youtube.com/watch?v=jfKfPfyJRdk".to_string(),
+            thumbnail_url: "https://images.unsplash.com/photo-1518495973542-4542c06a5843?w=640&q=80".to_string(),
+            category: "Music & Beats".to_string(),
+            location: "Ambient Lo-Fi Studio".to_string(),
+        },
+        LiveStream {
+            id: "stream-monterey".to_string(),
+            title: "Monterey Bay Giant Kelp Forest Undersea Cam".to_string(),
+            description: "Peaceful live undersea view from the giant kelp forest with streaming ocean sunbeams and marine life.".to_string(),
+            stream_url: "https://www.youtube.com/watch?v=2e-bU7e4_hI".to_string(),
+            thumbnail_url: "https://images.unsplash.com/photo-1544551763-46a013bb70d5?w=640&q=80".to_string(),
+            category: "Ocean & Nature".to_string(),
+            location: "Monterey Bay, California".to_string(),
+        },
+    ]
+}
+
+/// Creates a self-contained HTML wrapper for embedding a live stream full-screen on desktop.
+pub fn ensure_stream_file(stream: &LiveStream) -> std::io::Result<PathBuf> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData\RustWallpaper"));
+
+    let dir = local_app_data.join("RustWallpaper").join("streams");
+    fs::create_dir_all(&dir)?;
+
+    let path = dir.join(format!("{}.html", stream.id));
+
+    // Extract YouTube embed URL if applicable
+    let embed_url = if stream.stream_url.contains("youtube.com/watch?v=") {
+        let id = stream
+            .stream_url
+            .split("watch?v=")
+            .nth(1)
+            .unwrap_or("")
+            .split('&')
+            .next()
+            .unwrap_or("");
+        format!(
+            "https://www.youtube.com/embed/{id}?autoplay=1&mute=1&controls=0&loop=1&showinfo=0&modestbranding=1"
+        )
+    } else {
+        stream.stream_url.clone()
+    };
+
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{title}</title>
+<style>
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body, html {{ width: 100%; height: 100%; overflow: hidden; background: #000; }}
+  iframe {{ width: 100vw; height: 100vh; border: none; pointer-events: none; }}
+</style>
+</head>
+<body>
+  <iframe src="{embed_url}" allow="autoplay; encrypted-media"></iframe>
+</body>
+</html>"#,
+        title = stream.title,
+        embed_url = embed_url
+    );
+
+    fs::write(&path, html)?;
+    Ok(path)
 }
 
 #[allow(dead_code)]
@@ -590,7 +731,272 @@ fn extract_steam_workshop_media_url(html: &str) -> String {
     String::new()
 }
 
+fn extract_pinterest_pin_id(url: &str) -> Option<String> {
+    let lower = url.to_lowercase();
+    if let Some(pin_pos) = lower.find("/pin/") {
+        let after = &url[pin_pos + 5..];
+        let path = after.split('?').next().unwrap_or(after);
+        let path = path.split('#').next().unwrap_or(path);
+        let id_part = if let Some((_, id_suffix)) = path.rsplit_once("--") {
+            id_suffix
+        } else {
+            path
+        };
+        let digits: String = id_part.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.len() >= 4 {
+            return Some(digits);
+        }
+        let mut cur = String::new();
+        for ch in path.chars() {
+            if ch.is_ascii_digit() {
+                cur.push(ch);
+            } else {
+                if cur.len() >= 6 {
+                    return Some(cur);
+                }
+                cur.clear();
+            }
+        }
+        if cur.len() >= 6 {
+            return Some(cur);
+        }
+    } else if lower.contains("pin.it/") {
+        let after = lower.split("pin.it/").nth(1)?;
+        let path = after.split('?').next().unwrap_or(after);
+        let path = path.split('#').next().unwrap_or(path).trim_matches('/');
+        if !path.is_empty() && path.chars().all(|c| c.is_ascii_digit()) && path.len() >= 6 {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+fn resolve_pinit_shortlink(url: &str, allow_local: bool) -> Option<String> {
+    let mut current = url.to_string();
+    let agent = ureq::builder()
+        .timeout_connect(Duration::from_secs(8))
+        .timeout_read(Duration::from_secs(8))
+        .redirects(0)
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .build();
+    for _ in 0..3 {
+        validate_remote_url_with_policy(&current, allow_local).ok()?;
+        if let Ok(resp) = agent.get(&current).call() {
+            if (300..400).contains(&resp.status()) {
+                if let Some(loc) = resp.header("Location") {
+                    current = loc.to_string();
+                    if current.contains("/pin/") {
+                        return Some(current);
+                    }
+                    continue;
+                }
+            }
+            break;
+        } else {
+            break;
+        }
+    }
+    if current.contains("/pin/") {
+        Some(current)
+    } else {
+        None
+    }
+}
+
+fn extract_video_from_video_list(video_list: &serde_json::Value) -> Option<String> {
+    let obj = video_list.as_object()?;
+
+    // Pinterest can return several renditions in a map whose iteration order is not
+    // quality order. Prefer the largest explicitly-described MP4 rendition; using the
+    // first map entry can silently select a small preview on high-resolution displays.
+    let mut mp4_candidates: Vec<(u64, String)> = obj
+        .iter()
+        .filter_map(|(key, entry)| {
+            let url = entry.get("url")?.as_str()?;
+            if !url.to_ascii_lowercase().contains(".mp4") {
+                return None;
+            }
+            let width = entry
+                .get("width")
+                .or_else(|| entry.get("w"))
+                .and_then(serde_json::Value::as_u64);
+            let height = entry
+                .get("height")
+                .or_else(|| entry.get("h"))
+                .and_then(serde_json::Value::as_u64);
+            let pixel_count = width
+                .zip(height)
+                .map(|(width, height)| width.saturating_mul(height));
+            let named_quality = if key.contains("2160") {
+                3_840_000
+            } else if key.contains("1080") || key == "V_EXP7" {
+                2_073_600
+            } else if key.contains("720") || key == "V_EXP6" {
+                921_600
+            } else {
+                0
+            };
+            Some((pixel_count.unwrap_or(0).max(named_quality), url.to_string()))
+        })
+        .collect();
+    mp4_candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    if let Some((_, url)) = mp4_candidates.into_iter().next() {
+        return Some(url);
+    }
+
+    // Fall back to an HLS rendition only when no progressive MP4 is available.
+    // Prefer the highest known playlist label rather than hard-coding every HLS pin to 720p.
+    let mut hls_candidates: Vec<(u8, &'static str, String)> = obj
+        .iter()
+        .filter_map(|(key, entry)| {
+            let url = entry.get("url")?.as_str()?;
+            if !url.contains("/hls/") {
+                return None;
+            }
+            let (rank, quality) = if key.contains("2160") {
+                (4, "2160p")
+            } else if key.contains("1080") || key == "V_EXP7" {
+                (3, "1080p")
+            } else if key.contains("720") || key == "V_EXP6" {
+                (2, "720p")
+            } else {
+                (1, "480p")
+            };
+            Some((rank, quality, url.to_string()))
+        })
+        .collect();
+    hls_candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    hls_candidates.into_iter().next().map(|(_, quality, url)| {
+        url.replace("/hls/", &format!("/mc/{quality}/"))
+            .replace(".m3u8", ".mp4")
+            .replace("playlist.json", &format!("{quality}.mp4"))
+    })
+}
+
+fn extract_video_from_story_pin(story_data: &serde_json::Value) -> Option<String> {
+    let pages = story_data.get("pages")?.as_array()?;
+    for page in pages {
+        if let Some(blocks) = page.get("blocks").and_then(|b| b.as_array()) {
+            for block in blocks {
+                if let Some(video_list) = block.get("video").and_then(|v| v.get("video_list")) {
+                    if let Some(url) = extract_video_from_video_list(video_list) {
+                        return Some(url);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn extract_image_orig_from_pin(pin_data: &serde_json::Value) -> Option<String> {
+    if let Some(orig_url) = pin_data
+        .get("images")
+        .and_then(|i| i.get("orig"))
+        .and_then(|o| o.get("url"))
+        .and_then(|u| u.as_str())
+    {
+        return Some(orig_url.to_string());
+    }
+    if let Some(orig_url) = pin_data
+        .get("images_orig")
+        .and_then(|i| i.get("url"))
+        .and_then(|u| u.as_str())
+    {
+        return Some(orig_url.to_string());
+    }
+    None
+}
+
+fn extract_title_from_pin(pin_data: &serde_json::Value) -> Option<String> {
+    for key in ["title", "grid_title", "seo_title", "gridTitle"] {
+        if let Some(val) = pin_data.get(key).and_then(|v| v.as_str()) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() && trimmed != "Pinterest" {
+                return Some(clean_html_title(trimmed));
+            }
+        }
+    }
+    None
+}
+
+fn resolve_pinterest_pin_resource(
+    pin_id: &str,
+    cancelled: &AtomicBool,
+    allow_local: bool,
+) -> Option<ResolvedWebMedia> {
+    if cancelled.load(Ordering::Relaxed) {
+        return None;
+    }
+
+    let options_json = serde_json::json!({
+        "options": {
+            "field_set_key": "unauth_react_main_pin",
+            "id": pin_id
+        }
+    });
+    let query_str = options_json.to_string();
+    let encoded_query: String =
+        url::form_urlencoded::byte_serialize(query_str.as_bytes()).collect();
+    let api_url =
+        format!("https://www.pinterest.com/resource/PinResource/get/?data={encoded_query}");
+
+    validate_remote_url_with_policy(&api_url, allow_local).ok()?;
+
+    let agent = ureq::builder()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(15))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .build();
+
+    let response = agent
+        .get(&api_url)
+        .set("X-Pinterest-PWS-Handler", "www/[username].js")
+        .set("X-Requested-With", "XMLHttpRequest")
+        .set("Accept", "application/json, text/javascript, */*, q=0.01")
+        .call()
+        .ok()?;
+
+    let root: serde_json::Value = response.into_json().ok()?;
+    let pin_data = root.get("resource_response")?.get("data")?;
+
+    let title = extract_title_from_pin(pin_data);
+
+    // 1. Try direct video list
+    if let Some(videos) = pin_data.get("videos") {
+        if let Some(vlist) = videos.get("video_list") {
+            if let Some(url) = extract_video_from_video_list(vlist) {
+                return Some(ResolvedWebMedia {
+                    media_url: url,
+                    title,
+                });
+            }
+        }
+    }
+
+    // 2. Try story_pin_data
+    if let Some(story_data) = pin_data.get("story_pin_data") {
+        if let Some(url) = extract_video_from_story_pin(story_data) {
+            return Some(ResolvedWebMedia {
+                media_url: url,
+                title,
+            });
+        }
+    }
+
+    // 3. Fallback to original high-res image or animated GIF
+    if let Some(img_url) = extract_image_orig_from_pin(pin_data) {
+        return Some(ResolvedWebMedia {
+            media_url: img_url,
+            title,
+        });
+    }
+
+    None
+}
+
 fn extract_pinterest_title(html: &str) -> Option<String> {
+    // 1. Check OpenGraph og:title
     if let Some(pos) = html.find("property=\"og:title\"") {
         let start = pos.saturating_sub(50);
         let end = (pos + 300).min(html.len());
@@ -605,42 +1011,135 @@ fn extract_pinterest_title(html: &str) -> Option<String> {
                 if let Some(stripped) = title.strip_suffix(" on Pinterest") {
                     title = stripped.trim();
                 }
-                if !title.is_empty() {
+                if !title.is_empty() && title != "Pinterest" {
                     return Some(clean_html_title(title));
                 }
             }
         }
     }
+
+    // 2. Check Relay / JSON title: "title":"..." or "grid_title":"..."
+    for key in ["\"title\":\"", "\"grid_title\":\"", "\"gridTitle\":\""] {
+        if let Some(pos) = html.find(key) {
+            let after = &html[pos + key.len()..];
+            if let Some(end_q) = after.find('"') {
+                let title = after[..end_q].trim();
+                if !title.is_empty() && title != "Pinterest" && !title.starts_with("http") {
+                    return Some(clean_html_title(title));
+                }
+            }
+        }
+    }
+
+    // 3. Fallback to <title>
+    if let Some(pos) = html.find("<title>") {
+        let after = &html[pos + 7..];
+        if let Some(end_tag) = after.find("</title>") {
+            let mut title = after[..end_tag].trim();
+            if let Some(stripped) = title.strip_suffix(" | Pinterest") {
+                title = stripped.trim();
+            }
+            if let Some(stripped) = title.strip_suffix(" on Pinterest") {
+                title = stripped.trim();
+            }
+            if !title.is_empty() && title != "Pinterest" {
+                return Some(clean_html_title(title));
+            }
+        }
+    }
+
     None
 }
 
 fn extract_pinterest_media_url(html: &str) -> String {
-    // 1. Look for progressive MP4 video streams:
-    // e.g. https://v1.pinimg.com/videos/mc/720p/17/52/ac/1752aca4002bf24c520aadc3c76aaa08.mp4
-    // or https://v.pinimg.com/videos/...
+    // Normalize unescaped slashes first so escaped JSON strings match
+    let unescaped = html.replace(r"\/", "/");
+    let html = unescaped.as_str();
+
+    // 1. Collect progressive MP4 renditions and choose the highest explicit quality,
+    // rather than whichever low-resolution preview happens to occur first in page JSON.
+    let mut video_candidates: Vec<(u16, String)> = Vec::new();
     for prefix in [
         "https://v1.pinimg.com/videos/",
         "https://v.pinimg.com/videos/",
         "https://v2.pinimg.com/videos/",
     ] {
-        if let Some(pos) = html.find(prefix) {
+        let mut cur = html;
+        while let Some(pos) = cur.find(prefix) {
+            let slice = &cur[pos..];
+            let end = slice
+                .find(['"', '\'', ' ', '\\', '<', '>', '&', '\n', '\r', ','])
+                .unwrap_or_else(|| slice.len().min(300));
+            let candidate = &slice[..end];
+            if candidate.to_ascii_lowercase().contains(".mp4") {
+                let lower_candidate = candidate.to_ascii_lowercase();
+                let quality = if lower_candidate.contains("2160p") {
+                    2160
+                } else if lower_candidate.contains("1080p") {
+                    1080
+                } else if lower_candidate.contains("720p") {
+                    720
+                } else if lower_candidate.contains("480p") {
+                    480
+                } else {
+                    0
+                };
+                video_candidates.push((quality, candidate.to_string()));
+            }
+            cur = &cur[pos + prefix.len()..];
+        }
+    }
+    video_candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    if let Some((_, url)) = video_candidates.into_iter().next() {
+        return url;
+    }
+
+    // If page HTML only contains HLS, request the highest common progressive variant.
+    for marker in [
+        "https://v1.pinimg.com/videos/hls/",
+        "https://v.pinimg.com/videos/hls/",
+    ] {
+        if let Some(pos) = html.find(marker) {
             let slice = &html[pos..];
             let end = slice
                 .find(['"', '\'', ' ', '\\', '<', '>', '&', '\n', '\r', ','])
                 .unwrap_or_else(|| slice.len().min(300));
             let candidate = &slice[..end];
-            if candidate.ends_with(".mp4") || candidate.contains(".mp4?") {
-                return candidate.to_string();
+            return candidate
+                .replace("/hls/", "/mc/720p/")
+                .replace(".m3u8", ".mp4")
+                .replace("playlist.json", "720p.mp4");
+        }
+    }
+
+    // 1b. Look for video thumbnail / poster URLs:
+    // e.g. https://v1.pinimg.com/videos/thumbnails/originals/12/83/f0/1283f06c1c8fa040011cd7231f33f069.0000000.jpg
+    for marker in [
+        "pinimg.com/videos/thumbnails/",
+        "pinimg.com/videos/mc/thumbnails/",
+    ] {
+        let mut cur = html;
+        while let Some(pos) = cur.find(marker) {
+            let before = &cur[..pos];
+            if let Some(http_pos) = before.rfind("http") {
+                let slice = &cur[http_pos..];
+                let end = slice
+                    .find(['"', '\'', ' ', '\\', '<', '>', '&', '\n', '\r', ','])
+                    .unwrap_or_else(|| slice.len().min(300));
+                let thumb_url = &slice[..end];
+                if thumb_url.contains(".jpg") || thumb_url.contains(".png") {
+                    let mp4_url = thumb_url
+                        .replace("/thumbnails/originals/", "/mc/720p/")
+                        .replace("/thumbnails/mc/720p/", "/mc/720p/")
+                        .replace("/thumbnails/", "/mc/720p/")
+                        .replace(".0000000.jpg", ".mp4")
+                        .replace(".0000000.png", ".mp4")
+                        .replace(".jpg", ".mp4");
+                    let direct_mp4 = mp4_url.replace("i.pinimg.com", "v1.pinimg.com");
+                    return direct_mp4;
+                }
             }
-            // If it's an HLS master playlist:
-            // e.g. https://v1.pinimg.com/videos/hls/.../index.m3u8 or master.m3u8
-            if candidate.contains("/hls/") {
-                let converted = candidate
-                    .replace("/hls/", "/mc/720p/")
-                    .replace(".m3u8", ".mp4")
-                    .replace("playlist.json", "720p.mp4");
-                return converted;
-            }
+            cur = &cur[pos + marker.len()..];
         }
     }
 
@@ -652,7 +1151,7 @@ fn extract_pinterest_media_url(html: &str) -> String {
             if let Some(q_end) = after_http.find('"') {
                 let candidate = &after_http[..q_end];
                 if candidate.contains(".mp4") || candidate.contains("pinimg.com/videos") {
-                    return candidate.replace(r"\/", "/");
+                    return candidate.to_string();
                 }
             }
         }
@@ -684,7 +1183,7 @@ fn extract_pinterest_media_url(html: &str) -> String {
             .find(['"', '\'', ' ', '\\', '<', '>', '&', '\n', '\r'])
             .unwrap_or_else(|| slice.len().min(300));
         let candidate = &slice[..end];
-        return candidate.replace(r"\/", "/");
+        return candidate.to_string();
     }
 
     // 5. Look for standard og:image fallback
@@ -705,6 +1204,21 @@ fn extract_pinterest_media_url(html: &str) -> String {
                     return orig;
                 }
             }
+        }
+    }
+
+    // 6. Look for any /736x/ or /564x/ pinimg image and upgrade to /originals/
+    for marker in ["https://i.pinimg.com/736x/", "https://i.pinimg.com/564x/"] {
+        if let Some(pos) = html.find(marker) {
+            let slice = &html[pos..];
+            let end = slice
+                .find(['"', '\'', ' ', '\\', '<', '>', '&', '\n', '\r'])
+                .unwrap_or_else(|| slice.len().min(300));
+            let candidate = &slice[..end];
+            let orig = candidate
+                .replace("/736x/", "/originals/")
+                .replace("/564x/", "/originals/");
+            return orig;
         }
     }
 
@@ -807,10 +1321,21 @@ pub fn resolve_web_media_info_with_policy(
         });
     }
 
-    // 1c. Pinterest direct asset URLs (v1.pinimg.com/videos/..., v.pinimg.com/videos/..., i.pinimg.com/originals/...)
-    if lower.contains("pinimg.com/videos/") || lower.contains("i.pinimg.com/originals/") {
+    // 1c. Pinterest direct assets. Upgrade common resized pin images to the original
+    // rendition URL where possible; do not alter video CDN URLs.
+    if lower.contains("pinimg.com/videos/") {
         return Ok(ResolvedWebMedia {
             media_url: trimmed.to_string(),
+            title: None,
+        });
+    }
+    if lower.contains("i.pinimg.com/") {
+        let mut media_url = trimmed.to_string();
+        for size in ["236x", "474x", "564x", "736x", "1200x"] {
+            media_url = media_url.replace(&format!("/{size}/"), "/originals/");
+        }
+        return Ok(ResolvedWebMedia {
+            media_url,
             title: None,
         });
     }
@@ -829,6 +1354,25 @@ pub fn resolve_web_media_info_with_policy(
     // 1d. Pinterest Pin page or shortlink (pinterest.com/pin/... or pin.it/...)
     if lower.contains("pinterest.com/pin/") || lower.contains("pin.it/") {
         validate_remote_url_with_policy(trimmed, allow_local)?;
+
+        // Try extracting Pin ID directly or follow pin.it redirect
+        let mut pin_id_opt = extract_pinterest_pin_id(trimmed);
+        if pin_id_opt.is_none() && lower.contains("pin.it/") {
+            if let Some(redirected_url) = resolve_pinit_shortlink(trimmed, allow_local) {
+                pin_id_opt = extract_pinterest_pin_id(&redirected_url);
+            }
+        }
+
+        // Strategy A: Query official Pinterest PinResource API
+        if let Some(pin_id) = pin_id_opt {
+            if let Some(media) = resolve_pinterest_pin_resource(&pin_id, cancelled, allow_local) {
+                if validate_remote_url_with_policy(&media.media_url, allow_local).is_ok() {
+                    return Ok(media);
+                }
+            }
+        }
+
+        // Strategy B: Fetch HTML page and parse metadata/JSON
         if let Some(html) = fetch_html_content_with_policy(trimmed, Some(cancelled), allow_local) {
             let extracted = extract_pinterest_media_url(&html);
             let title = extract_pinterest_title(&html);
@@ -840,6 +1384,10 @@ pub fn resolve_web_media_info_with_policy(
                 });
             }
         }
+
+        return Err(OnlineError::Parse(
+            "Could not extract video or image stream from Pinterest URL".into(),
+        ));
     }
 
     // 2. Special handling for Pixabay:
@@ -886,18 +1434,20 @@ pub fn resolve_web_media_info_with_policy(
         }
     }
 
-    // 3. If it's already a direct video or audio/image link, return as-is
-    if lower.ends_with(".mp4")
-        || lower.ends_with(".webm")
-        || lower.ends_with(".mkv")
-        || lower.ends_with(".mov")
-        || lower.ends_with(".gif")
-        || lower.ends_with(".png")
-        || lower.ends_with(".jpg")
-        || lower.ends_with(".jpeg")
-        || lower.contains(".mp4?")
-        || lower.contains(".webm?")
-    {
+    // 3. Direct media URLs should not trigger an HTML fetch. Parse the URL path so
+    // signed URLs with query parameters and less common still-image formats work too.
+    let direct_media_extension = Url::parse(trimmed).ok().and_then(|parsed| {
+        Path::new(parsed.path())
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase)
+    });
+    if direct_media_extension.as_deref().is_some_and(|extension| {
+        matches!(
+            extension,
+            "mp4" | "webm" | "mkv" | "mov" | "gif" | "png" | "jpg" | "jpeg" | "webp" | "bmp"
+        )
+    }) {
         return Ok(ResolvedWebMedia {
             media_url: trimmed.to_string(),
             title: None,
@@ -1238,7 +1788,7 @@ pub fn fetch_thumbnail_bytes(url: &str) -> Result<Vec<u8>, OnlineError> {
     Ok(bytes)
 }
 
-fn urlencoding(input: &str) -> String {
+pub(crate) fn urlencoding(input: &str) -> String {
     let mut encoded = String::new();
     for byte in input.bytes() {
         match byte {
@@ -1573,6 +2123,31 @@ mod tests {
     }
 
     #[test]
+    fn pinterest_video_renditions_choose_highest_resolution_not_map_order() {
+        let data = serde_json::json!({
+            "V_240P": {"url": "https://cdn.example/240.mp4", "width": 426, "height": 240},
+            "V_1080P": {"url": "https://cdn.example/1080.mp4", "width": 1920, "height": 1080},
+            "V_720P": {"url": "https://cdn.example/720.mp4", "width": 1280, "height": 720}
+        });
+        assert_eq!(
+            extract_video_from_video_list(&data),
+            Some("https://cdn.example/1080.mp4".to_string())
+        );
+    }
+
+    #[test]
+    fn pinterest_hls_prefers_highest_available_labeled_variant() {
+        let data = serde_json::json!({
+            "V_720P": {"url": "https://cdn.example/hls/720/index.m3u8"},
+            "V_1080P": {"url": "https://cdn.example/hls/1080/index.m3u8"}
+        });
+        assert_eq!(
+            extract_video_from_video_list(&data),
+            Some("https://cdn.example/mc/1080p/1080/index.mp4".to_string())
+        );
+    }
+
+    #[test]
     fn test_extract_pinterest_media_url_progressive_mp4() {
         let html = r#"
             <meta property="og:title" content="Aesthetic Cyberpunk City Video | Pinterest">
@@ -1608,5 +2183,74 @@ mod tests {
             extract_pinterest_media_url(html),
             "https://i.pinimg.com/originals/76/64/90/7664909f7aeb05fe923359a08512c652.jpg"
         );
+    }
+
+    #[test]
+    fn pinterest_direct_resized_image_is_upgraded_to_original_path() {
+        let resolved =
+            resolve_web_media_info("https://i.pinimg.com/736x/12/34/56/sample.jpg?width=640");
+        assert_eq!(
+            resolved.media_url,
+            "https://i.pinimg.com/originals/12/34/56/sample.jpg?width=640"
+        );
+    }
+
+    #[test]
+    fn test_extract_pinterest_pin_id() {
+        assert_eq!(
+            extract_pinterest_pin_id("https://www.pinterest.com/pin/664281013778109217/"),
+            Some("664281013778109217".to_string())
+        );
+        assert_eq!(
+            extract_pinterest_pin_id(
+                "https://co.pinterest.com/pin/some-slug-title--2885187256207927/"
+            ),
+            Some("2885187256207927".to_string())
+        );
+        assert_eq!(
+            extract_pinterest_pin_id("https://pin.it/664281013778109217"),
+            Some("664281013778109217".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_pinterest_escaped_json_and_poster() {
+        // Escaped JSON as returned in Relay chunks
+        let html = r#"
+            <script>{"data":{"images_orig":{"url":"https:\/\/i.pinimg.com\/originals\/a5\/31\/a5\/a531a5d6e9013251559b15778329e7d5.jpg"}}}</script>
+        "#;
+        assert_eq!(
+            extract_pinterest_media_url(html),
+            "https://i.pinimg.com/originals/a5/31/a5/a531a5d6e9013251559b15778329e7d5.jpg"
+        );
+
+        // Poster thumbnail conversion to progressive MP4
+        let poster_html = r#"
+            <video poster="https://v1.pinimg.com/videos/thumbnails/mc/720p/12/83/f0/1283f06c1c8fa040011cd7231f33f069.0000000.jpg"></video>
+        "#;
+        assert_eq!(
+            extract_pinterest_media_url(poster_html),
+            "https://v1.pinimg.com/videos/mc/720p/12/83/f0/1283f06c1c8fa040011cd7231f33f069.mp4"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires public network access"]
+    fn test_live_pinterest_resolution() {
+        // Video pin
+        let res = resolve_web_media_info("https://www.pinterest.com/pin/664281013778109217/");
+        assert!(res.media_url.contains("v1.pinimg.com/videos/"));
+        assert!(res.media_url.contains(".mp4"));
+        assert!(res.title.is_some());
+
+        // Slug video pin
+        let res2 =
+            resolve_web_media_info("https://co.pinterest.com/pin/some-title--2885187256207927/");
+        assert!(res2.media_url.contains("v1.pinimg.com/videos/"));
+        assert!(res2.media_url.contains(".mp4"));
+
+        // Image pin fallback
+        let res3 = resolve_web_media_info("https://www.pinterest.com/pin/582371795587788417/");
+        assert!(res3.media_url.contains("i.pinimg.com/originals/"));
     }
 }

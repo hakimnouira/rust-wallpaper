@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Install RustWallpaper — Setup, Browser Extension &amp; Source Build</title>
+  <meta name="description" content="How to install RustWallpaper on Windows 10/11 using the Windows installer, portable zip, browser extension, or building from source.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="container nav-bar">
+      <a class="brand" href="index.html">
+        <span class="brand-mark" aria-hidden="true">RW</span>
+        <span>RustWallpaper</span>
+      </a>
+      <nav class="nav-links" aria-label="Main navigation">
+        <a href="index.html">Home</a>
+        <a href="install.html" aria-current="page">Installation</a>
+        <a href="index.html#features">Features</a>
+        <a href="index.html#screenshots">Screenshots</a>
+        <a href="https://github.com/hakimnouira/rust-wallpaper">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="container">
+        <span class="badge">Windows 10 / 11 (64-bit)</span>
+        <h1>Install RustWallpaper</h1>
+        <p>
+          Choose the Windows installer for automatic Start Menu and browser extension setup, run in
+          portable mode with zero registry changes, or compile directly from source.
+        </p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="https://github.com/hakimnouira/rust-wallpaper/releases/latest">Download Latest Release</a>
+          <a class="btn btn-secondary" href="#source-build">Build from Source</a>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="container">
+        <div class="section-header">
+          <h2>System Requirements</h2>
+        </div>
+        <div class="cards-wrap">
+          <div class="cards-grid">
+            <article class="card">
+              <h3>Operating System</h3>
+              <p>Windows 10 or Windows 11 (x64).</p>
+            </article>
+            <article class="card">
+              <h3>Graphics &amp; Decoding</h3>
+              <p>GPU supporting DXVA2 / D3D11VA hardware video decoding and OpenGL for the control panel.</p>
+            </article>
+            <article class="card">
+              <h3>Optional Integrations</h3>
+              <p>Chromium browser (Chrome, Edge, or Brave) for the companion extension; Steam for Workshop sync.</p>
+            </article>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="container">
+        <div class="section-header">
+          <h2>Installation Methods</h2>
+        </div>
+        <div class="cards-wrap">
+          <div class="cards-grid">
+            <article class="card">
+              <h3>1. Windows Installer (Recommended)</h3>
+              <ol class="steps-list">
+                <li>Download <code>RustWallpaper-0.1.0-windows-x64.zip</code> from <a href="https://github.com/hakimnouira/rust-wallpaper/releases/latest">GitHub Releases</a>.</li>
+                <li>Extract the archive and run <code>RustWallpaper-Setup.exe</code>.</li>
+                <li>Select an install folder (defaults to <code>%LOCALAPPDATA%\RustWallpaper</code>) and finish setup.</li>
+                <li>Launch <strong>Rust Wallpaper</strong> from the Start Menu or Desktop shortcut.</li>
+              </ol>
+            </article>
+            <article class="card">
+              <h3>2. Portable Mode</h3>
+              <ol class="steps-list">
+                <li>Download and extract <code>RustWallpaper-0.1.0-windows-x64.zip</code> anywhere.</li>
+                <li>Run <code>RustWallpaper.exe</code> directly without modifying system-wide shortcuts or install paths.</li>
+              </ol>
+            </article>
+            <article class="card" id="source-build">
+              <h3>3. Build from Source</h3>
+              <p>Requires Rust 1.78+, Visual Studio C++ Build Tools (or MinGW-w64), and <code>mpv.exe</code> / <code>mpv-2.dll</code> in <code>%USERPROFILE%\.mpv</code> or beside binaries.</p>
+              <div class="code-block">
+                <button class="copy-btn" type="button" data-copy-target="cmd-source">Copy</button>
+                <pre id="cmd-source">git clone https://github.com/hakimnouira/rust-wallpaper.git
+cd rust-wallpaper
+cargo build --release --workspace</pre>
+              </div>
+              <p>Or build the full distribution package (binaries, MPV bundle, extension CRX, and setup wizard):</p>
+              <div class="code-block">
+                <button class="copy-btn" type="button" data-copy-target="cmd-dist">Copy</button>
+                <pre id="cmd-dist">powershell -ExecutionPolicy Bypass -File .\scripts\build-production.ps1</pre>
+              </div>
+            </article>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="container">
+        <div class="section-header">
+          <h2>Browser Companion Extension (Chrome, Edge, Brave)</h2>
+          <p>
+            Capture videos from Pinterest, TikTok, Instagram, Reddit, YouTube, and Wallhaven in one click.
+            Extension ID: <code>gemjknbkapmdcopknokbikcneknbpoij</code> • Loopback API: <code>127.0.0.1:24242</code>.
+          </p>
+        </div>
+        <div class="card">
+          <ol class="steps-list">
+            <li>Open <strong>RustWallpaper</strong> and go to <strong>Settings → Browser Companion Integration</strong>.</li>
+            <li>Click <strong>Enable Extension</strong> (or <strong>Auto-Configure Shortcuts</strong> / <strong>Launch Browser with Extension</strong>).</li>
+            <li>If loading manually in Developer Mode, open <code>chrome://extensions</code> (or <code>edge://extensions</code>), enable <strong>Developer mode</strong>, and click <strong>Load unpacked</strong> on <code>%LOCALAPPDATA%\RustWallpaper\extension</code> (or <code>extensions\chrome</code> in the repo).</li>
+            <li>Restart your browser if updating from an older CRX package so version <code>1.0.1</code> loads cleanly.</li>
+          </ol>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="container">
+        <div class="section-header">
+          <h2>Keyboard Shortcuts &amp; Data Paths</h2>
+        </div>
+        <div class="data-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Item</th>
+                <th>Value</th>
+                <th>Purpose</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Next Wallpaper</td>
+                <td><code>Alt + W</code></td>
+                <td>Global hotkey to skip to the next wallpaper in rotation</td>
+              </tr>
+              <tr>
+                <td>Mute Toggle</td>
+                <td><code>Alt + M</code></td>
+                <td>Global hotkey to toggle master audio mute</td>
+              </tr>
+              <tr>
+                <td>Minimize / Refresh</td>
+                <td><code>Esc</code> / <code>F5</code></td>
+                <td>Hide control panel to tray / refresh library and monitors</td>
+              </tr>
+              <tr>
+                <td>Database &amp; Thumbnails</td>
+                <td><code>%LOCALAPPDATA%\RustWallpaper\</code></td>
+                <td>Stores <code>library.db</code>, thumbnails, daily logs, and extension files</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="container">
+        <section class="faq-accordion" aria-labelledby="faq-heading">
+          <h2 id="faq-heading">Troubleshooting &amp; FAQ</h2>
+          <details>
+            <summary>The browser extension says unauthorized or monitor not found</summary>
+            <div class="faq-body">
+              <p>Ensure both <code>wallpaper-daemon</code> and the browser extension are updated to the matching build (extension <code>v1.0.1</code>), restart the daemon, and reload the extension in your browser.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Wallpaper freezes or pauses when I launch a game</summary>
+            <div class="faq-body">
+              <p>This is intentional fullscreen automation to free 100% of GPU and CPU resources for games. You can adjust fullscreen pause behavior in <strong>Settings</strong>.</p>
+            </div>
+          </details>
+          <details>
+            <summary>Where are logs stored if something fails to play?</summary>
+            <div class="faq-body">
+              <p>Daily diagnostic logs are written to <code>%LOCALAPPDATA%\RustWallpaper\logs\daemon.YYYY-MM-DD.log</code>.</p>
+            </div>
+          </details>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <span>RustWallpaper — Windows Live Wallpaper Engine</span>
+      <nav class="nav-links" aria-label="Footer navigation">
+        <a href="index.html">Home</a>
+        <a href="https://github.com/hakimnouira/rust-wallpaper">Repository</a>
+        <a href="https://github.com/hakimnouira/rust-wallpaper/releases">Releases</a>
+      </nav>
+    </div>
+  </footer>
+
+  <script>
+    document.querySelectorAll("[data-copy-target]").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const target = document.getElementById(btn.dataset.copyTarget);
+        if (!target || !navigator.clipboard) return;
+        try {
+          await navigator.clipboard.writeText(target.textContent.trim());
+          const prev = btn.textContent;
+          btn.textContent = "Copied";
+          setTimeout(() => { btn.textContent = prev; }, 1500);
+        } catch {
+          btn.textContent = "Failed";
+        }
+      });
+    });
+  </script>
+</body>
+</html>

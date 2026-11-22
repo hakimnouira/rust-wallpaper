@@ -96,6 +96,163 @@ pub struct WorkshopItem {
     pub folder_path: PathBuf,
 }
 
+/// Represents an online Wallpaper Engine item listed on the Steam Community Workshop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteamWorkshopOnlineItem {
+    pub id: String,
+    pub title: String,
+    pub thumbnail_url: String,
+    pub steam_url: String,
+    pub web_url: String,
+}
+
+fn unescape_html_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&nbsp;", " ")
+}
+
+/// Queries the public Steam Community Workshop for Wallpaper Engine items.
+pub fn fetch_steam_workshop_items(
+    query: &str,
+    sort: &str,
+) -> Result<Vec<SteamWorkshopOnlineItem>, String> {
+    let sort_param = match sort.to_lowercase().as_str() {
+        "recent" | "mostrecent" => "mostrecent",
+        "popular" | "totaluniquesubscribers" => "totaluniquesubscribers",
+        "toprated" => "toprated",
+        _ => "trend",
+    };
+
+    let mut url = format!(
+        "https://steamcommunity.com/workshop/browse/?appid=431960&browsesort={sort_param}&section=readytouseitems"
+    );
+
+    if !query.trim().is_empty() {
+        let encoded = crate::online::urlencoding(query.trim());
+        url.push_str(&format!("&searchtext={encoded}"));
+    }
+
+    let agent = ureq::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .redirects(5)
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+        .build();
+
+    let response = agent.get(&url).call().map_err(|e| e.to_string())?;
+    let html = response.into_string().map_err(|e| e.to_string())?;
+
+    let mut items = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    let marker = "https://steamcommunity.com/sharedfiles/filedetails/?id=";
+    let mut search_from = 0;
+
+    while let Some(pos) = html[search_from..].find(marker) {
+        let link_start = search_from + pos + marker.len();
+        let link_end = html[link_start..]
+            .find('"')
+            .map(|end| link_start + end)
+            .unwrap_or(link_start);
+        let id_part = &html[link_start..link_end];
+
+        if id_part.chars().all(|c| c.is_ascii_digit()) && !id_part.is_empty() {
+            let id = id_part.to_string();
+
+            let look_ahead = &html[link_end..html.len().min(link_end + 900)];
+            if let Some(img_pos) = look_ahead.find("<img ") {
+                let img_chunk = &look_ahead[img_pos..];
+                if let Some(src_pos) = img_chunk.find("src=\"") {
+                    let src_start = src_pos + 5;
+                    if let Some(src_end) = img_chunk[src_start..].find('"') {
+                        let thumb_url = &img_chunk[src_start..src_start + src_end];
+                        let alt_title = if let Some(alt_pos) = img_chunk.find("alt=\"") {
+                            let alt_start = alt_pos + 5;
+                            img_chunk[alt_start..]
+                                .find('"')
+                                .map(|alt_end| &img_chunk[alt_start..alt_start + alt_end])
+                                .unwrap_or("Wallpaper Engine Workshop Item")
+                        } else {
+                            "Wallpaper Engine Workshop Item"
+                        };
+
+                        if seen_ids.insert(id.clone()) {
+                            items.push(SteamWorkshopOnlineItem {
+                                id: id.clone(),
+                                title: unescape_html_entities(alt_title),
+                                thumbnail_url: thumb_url.replace("&amp;", "&"),
+                                steam_url: format!("steam://url/CommunityFilePage/{id}"),
+                                web_url: format!(
+                                    "https://steamcommunity.com/sharedfiles/filedetails/?id={id}"
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        search_from = link_end;
+    }
+
+    if items.is_empty() {
+        return Ok(get_curated_steam_workshop_items());
+    }
+
+    Ok(items)
+}
+
+/// Fallback / curated top Steam Workshop items for Wallpaper Engine.
+pub fn get_curated_steam_workshop_items() -> Vec<SteamWorkshopOnlineItem> {
+    vec![
+        SteamWorkshopOnlineItem {
+            id: "3840297439".to_string(),
+            title: "MEMORIES by VISUALDON - 4K Ultra HD".to_string(),
+            thumbnail_url: "https://images.steamusercontent.com/ugc/14363317062840539231/B1D30F5BCF102A1CB85D6264B92EF249CC6E21B5/?imw=322&imh=322".to_string(),
+            steam_url: "steam://url/CommunityFilePage/3840297439".to_string(),
+            web_url: "https://steamcommunity.com/sharedfiles/filedetails/?id=3840297439".to_string(),
+        },
+        SteamWorkshopOnlineItem {
+            id: "3836835109".to_string(),
+            title: "Cyberpunk: Edgerunners — Weak Kingsley".to_string(),
+            thumbnail_url: "https://images.steamusercontent.com/ugc/12029503426841588107/B1D30F5BCF102A1CB85D6264B92EF249CC6E21B5/?imw=322&imh=322".to_string(),
+            steam_url: "steam://url/CommunityFilePage/3836835109".to_string(),
+            web_url: "https://steamcommunity.com/sharedfiles/filedetails/?id=3836835109".to_string(),
+        },
+        SteamWorkshopOnlineItem {
+            id: "3828824382".to_string(),
+            title: "Cyberpunk: Edgerunners 3D — Interactive Wallpaper".to_string(),
+            thumbnail_url: "https://images.steamusercontent.com/ugc/15674011536591943272/B1D30F5BCF102A1CB85D6264B92EF249CC6E21B5/?imw=322&imh=322".to_string(),
+            steam_url: "steam://url/CommunityFilePage/3828824382".to_string(),
+            web_url: "https://steamcommunity.com/sharedfiles/filedetails/?id=3828824382".to_string(),
+        },
+        SteamWorkshopOnlineItem {
+            id: "3825047385".to_string(),
+            title: "Cyberpunk Edgerunners [4K] - David and Lucy (Enhanced)".to_string(),
+            thumbnail_url: "https://images.steamusercontent.com/ugc/18217745455842189969/B1D30F5BCF102A1CB85D6264B92EF249CC6E21B5/?imw=322&imh=322".to_string(),
+            steam_url: "steam://url/CommunityFilePage/3825047385".to_string(),
+            web_url: "https://steamcommunity.com/sharedfiles/filedetails/?id=3825047385".to_string(),
+        },
+        SteamWorkshopOnlineItem {
+            id: "3839953231".to_string(),
+            title: "Cyberpunk 2077 | 4K Wallpaper | Audio Visualizer".to_string(),
+            thumbnail_url: "https://images.steamusercontent.com/ugc/9429931869422287845/B1D30F5BCF102A1CB85D6264B92EF249CC6E21B5/?imw=322&imh=322".to_string(),
+            steam_url: "steam://url/CommunityFilePage/3839953231".to_string(),
+            web_url: "https://steamcommunity.com/sharedfiles/filedetails/?id=3839953231".to_string(),
+        },
+        SteamWorkshopOnlineItem {
+            id: "3840126735".to_string(),
+            title: "Ribs主晏 - Live Anime Artwork".to_string(),
+            thumbnail_url: "https://images.steamusercontent.com/ugc/15494973745534577405/B1D30F5BCF102A1CB85D6264B92EF249CC6E21B5/?imw=322&imh=322".to_string(),
+            steam_url: "steam://url/CommunityFilePage/3840126735".to_string(),
+            web_url: "https://steamcommunity.com/sharedfiles/filedetails/?id=3840126735".to_string(),
+        },
+    ]
+}
+
 #[derive(Debug, Deserialize)]
 struct ProjectJsonRaw {
     title: Option<String>,

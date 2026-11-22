@@ -6,12 +6,16 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
+use wallpaper_core::PerformanceProfile;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_NOREPEAT,
+};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
@@ -20,16 +24,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, LoadImageW, PostMessageW,
     PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu,
     TranslateMessage, HICON, HMENU, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE,
-    MF_SEPARATOR, MF_STRING, MSG, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_STYLE, WM_APP, WM_CLOSE,
-    WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
+    MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL,
+    WM_RBUTTONUP, WNDCLASSW,
 };
 
 const TRAY_CALLBACK: u32 = WM_APP + 1;
+const WM_RELOAD_HOTKEYS: u32 = WM_APP + 2;
+const HOTKEY_NEXT_ID: i32 = 101;
+const HOTKEY_PAUSE_ID: i32 = 102;
+const HOTKEY_MUTE_ID: i32 = 103;
 const MENU_SHOW: usize = 1;
 const MENU_QUIT: usize = 2;
 const MENU_NEXT: usize = 3;
 const MENU_TOGGLE_PAUSE: usize = 4;
 const MENU_TOGGLE_MUTE: usize = 5;
+const MENU_PROFILE_ECO: usize = 6;
+const MENU_PROFILE_BALANCED: usize = 7;
+const MENU_PROFILE_PERFORMANCE: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
@@ -38,19 +50,56 @@ pub enum TrayAction {
     NextWallpaper,
     TogglePause,
     ToggleMute,
+    SetProfile(PerformanceProfile),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TraySharedStatus {
+    paused: bool,
+    muted: bool,
+    profile: PerformanceProfile,
+    vk_next: u32,
+    vk_pause: u32,
+    vk_mute: u32,
+}
+
+impl Default for TraySharedStatus {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            muted: false,
+            profile: PerformanceProfile::Balanced,
+            vk_next: b'N' as u32,
+            vk_pause: b'W' as u32,
+            vk_mute: b'M' as u32,
+        }
+    }
+}
+
+fn char_to_vk(s: &str, fallback: u8) -> u32 {
+    let ch = s
+        .trim()
+        .chars()
+        .next()
+        .map(|c| c.to_ascii_uppercase())
+        .filter(|c| c.is_ascii_alphanumeric())
+        .unwrap_or(fallback as char);
+    ch as u32
 }
 
 struct TrayState {
     sender: Sender<TrayAction>,
     ctx: eframe::egui::Context,
+    shared: Arc<Mutex<TraySharedStatus>>,
 }
 
 // The tray state is initialized once when the app starts. The window procedure
-// runs on the tray thread and uses this to wake egui for menu actions.
+// runs on the tray thread and uses this to wake egui for menu and global hotkey actions.
 static TRAY_STATE: OnceLock<TrayState> = OnceLock::new();
 
 pub struct TrayIcon {
     hwnd: HWND,
+    shared: Arc<Mutex<TraySharedStatus>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -58,8 +107,25 @@ impl TrayIcon {
     pub fn start(
         ctx: eframe::egui::Context,
         sender: Sender<TrayAction>,
+        hotkey_next: &str,
+        hotkey_pause: &str,
+        hotkey_mute: &str,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        if TRAY_STATE.set(TrayState { sender, ctx }).is_err() {
+        let shared = Arc::new(Mutex::new(TraySharedStatus {
+            vk_next: char_to_vk(hotkey_next, b'N'),
+            vk_pause: char_to_vk(hotkey_pause, b'W'),
+            vk_mute: char_to_vk(hotkey_mute, b'M'),
+            ..Default::default()
+        }));
+
+        if TRAY_STATE
+            .set(TrayState {
+                sender,
+                ctx,
+                shared: Arc::clone(&shared),
+            })
+            .is_err()
+        {
             return Err("tray icon was already initialized".into());
         }
 
@@ -81,8 +147,37 @@ impl TrayIcon {
 
         Ok(Self {
             hwnd,
+            shared,
             thread: Some(thread),
         })
+    }
+
+    pub fn update_state(&self, paused: bool, muted: bool, profile: PerformanceProfile) {
+        if let Ok(mut guard) = self.shared.lock() {
+            guard.paused = paused;
+            guard.muted = muted;
+            guard.profile = profile;
+        }
+    }
+
+    pub fn update_hotkeys(&self, next: &str, pause: &str, mute: &str) {
+        let mut changed = false;
+        if let Ok(mut guard) = self.shared.lock() {
+            let vk_n = char_to_vk(next, b'N');
+            let vk_p = char_to_vk(pause, b'W');
+            let vk_m = char_to_vk(mute, b'M');
+            if guard.vk_next != vk_n || guard.vk_pause != vk_p || guard.vk_mute != vk_m {
+                guard.vk_next = vk_n;
+                guard.vk_pause = vk_p;
+                guard.vk_mute = vk_m;
+                changed = true;
+            }
+        }
+        if changed {
+            unsafe {
+                let _ = PostMessageW(self.hwnd, WM_RELOAD_HOTKEYS, WPARAM(0), LPARAM(0));
+            }
+        }
     }
 }
 
@@ -130,6 +225,8 @@ fn run_tray_thread(ready: &mpsc::SyncSender<Result<isize, String>>) -> Result<()
             return Err(error);
         }
 
+        register_hotkeys(hwnd);
+
         ready
             .send(Ok(hwnd.0 as isize))
             .map_err(|error| error.to_string())?;
@@ -140,9 +237,28 @@ fn run_tray_thread(ready: &mpsc::SyncSender<Result<isize, String>>) -> Result<()
             DispatchMessageW(&message);
         }
 
+        unregister_hotkeys(hwnd);
         remove_icon(hwnd);
         Ok(())
     }
+}
+
+unsafe fn register_hotkeys(hwnd: HWND) {
+    let status = TRAY_STATE
+        .get()
+        .and_then(|s| s.shared.lock().ok())
+        .map(|g| *g)
+        .unwrap_or_default();
+    let mods = HOT_KEY_MODIFIERS(MOD_ALT.0 | MOD_NOREPEAT.0);
+    let _ = RegisterHotKey(hwnd, HOTKEY_NEXT_ID, mods, status.vk_next);
+    let _ = RegisterHotKey(hwnd, HOTKEY_PAUSE_ID, mods, status.vk_pause);
+    let _ = RegisterHotKey(hwnd, HOTKEY_MUTE_ID, mods, status.vk_mute);
+}
+
+unsafe fn unregister_hotkeys(hwnd: HWND) {
+    let _ = UnregisterHotKey(hwnd, HOTKEY_NEXT_ID);
+    let _ = UnregisterHotKey(hwnd, HOTKEY_PAUSE_ID);
+    let _ = UnregisterHotKey(hwnd, HOTKEY_MUTE_ID);
 }
 
 unsafe extern "system" fn tray_window_proc(
@@ -166,7 +282,22 @@ unsafe extern "system" fn tray_window_proc(
             }
             LRESULT(0)
         }
+        WM_HOTKEY => {
+            match wparam.0 as i32 {
+                HOTKEY_NEXT_ID => notify(TrayAction::NextWallpaper),
+                HOTKEY_PAUSE_ID => notify(TrayAction::TogglePause),
+                HOTKEY_MUTE_ID => notify(TrayAction::ToggleMute),
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_RELOAD_HOTKEYS => {
+            unregister_hotkeys(hwnd);
+            register_hotkeys(hwnd);
+            LRESULT(0)
+        }
         WM_CLOSE => {
+            unregister_hotkeys(hwnd);
             remove_icon(hwnd);
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -183,9 +314,70 @@ unsafe fn show_context_menu(hwnd: HWND) {
     let Ok(menu) = CreatePopupMenu() else {
         return;
     };
+    let status = TRAY_STATE
+        .get()
+        .and_then(|s| s.shared.lock().ok())
+        .map(|g| *g)
+        .unwrap_or_default();
+
+    let pause_label = if status.paused {
+        w!("▶ Resume Wallpapers")
+    } else {
+        w!("⏸ Pause Wallpapers")
+    };
+    let mute_label = if status.muted {
+        w!("🔊 Unmute Audio")
+    } else {
+        w!("🔇 Mute Audio")
+    };
+
     let _ = AppendMenuW(menu, MF_STRING, MENU_NEXT, w!("⏭ Next Wallpaper"));
-    let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE_PAUSE, w!("⏯ Pause / Resume"));
-    let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE_MUTE, w!("🔇 Mute / Unmute"));
+    let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE_PAUSE, pause_label);
+    let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE_MUTE, mute_label);
+
+    let profile_menu = CreatePopupMenu().ok();
+    if let Some(sub) = profile_menu {
+        let eco_flags = if status.profile == PerformanceProfile::Eco {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        let bal_flags = if status.profile == PerformanceProfile::Balanced {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        let perf_flags = if status.profile == PerformanceProfile::Performance {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING
+        };
+        let _ = AppendMenuW(
+            sub,
+            eco_flags,
+            MENU_PROFILE_ECO,
+            w!("Eco (Battery & Maximized Saver)"),
+        );
+        let _ = AppendMenuW(
+            sub,
+            bal_flags,
+            MENU_PROFILE_BALANCED,
+            w!("Balanced (Recommended)"),
+        );
+        let _ = AppendMenuW(
+            sub,
+            perf_flags,
+            MENU_PROFILE_PERFORMANCE,
+            w!("Performance (High Uptime)"),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP | MF_STRING,
+            sub.0 as usize,
+            w!("Performance Profile"),
+        );
+    }
+
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     let _ = AppendMenuW(menu, MF_STRING, MENU_SHOW, w!("Open Rust Wallpaper"));
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -205,6 +397,9 @@ unsafe fn show_context_menu(hwnd: HWND) {
     )
     .0 as usize;
     let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+    if let Some(sub) = profile_menu {
+        let _ = DestroyMenu(sub);
+    }
     let _ = DestroyMenu(menu);
 
     match selected {
@@ -213,6 +408,9 @@ unsafe fn show_context_menu(hwnd: HWND) {
         MENU_NEXT => notify(TrayAction::NextWallpaper),
         MENU_TOGGLE_PAUSE => notify(TrayAction::TogglePause),
         MENU_TOGGLE_MUTE => notify(TrayAction::ToggleMute),
+        MENU_PROFILE_ECO => notify(TrayAction::SetProfile(PerformanceProfile::Eco)),
+        MENU_PROFILE_BALANCED => notify(TrayAction::SetProfile(PerformanceProfile::Balanced)),
+        MENU_PROFILE_PERFORMANCE => notify(TrayAction::SetProfile(PerformanceProfile::Performance)),
         _ => {}
     }
 }

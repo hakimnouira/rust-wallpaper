@@ -18,7 +18,7 @@ use windows::Win32::System::Registry::{
 };
 
 pub const EXTENSION_ID: &str = "gemjknbkapmdcopknokbikcneknbpoij";
-pub const EXTENSION_VERSION: &str = "1.0.0";
+pub const EXTENSION_VERSION: &str = "1.0.1";
 /// The update URL used in HKCU/HKLM External Extensions keys.
 /// NOTE: for the policy ExtensionInstallForcelist we use a file:// URL that points
 /// directly to the CRX so Chrome/Brave accept it without a live HTTP server.
@@ -228,7 +228,7 @@ foreach ($p in $hklmPaths) {{
     $k = "HKLM:\$p\$extId";
     New-Item -Path $k -Force | Out-Null;
     Set-ItemProperty -Path $k -Name 'path' -Value $crx;
-    Set-ItemProperty -Path $k -Name 'version' -Value '1.0.0';
+    Set-ItemProperty -Path $k -Name 'version' -Value '{EXTENSION_VERSION}';
     Set-ItemProperty -Path $k -Name 'update_url' -Value $upd;
 }}
 $policyRoots = @('Software\Policies\Google\Chrome', 'Software\Policies\Microsoft\Edge', 'Software\Policies\BraveSoftware\Brave', 'Software\Policies\BraveSoftware\Brave-Browser');
@@ -246,17 +246,24 @@ foreach ($pr in $policyRoots) {{
 "#
         );
 
-        let status = std::process::Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                &format!(
-                    "Start-Process powershell -WindowStyle Hidden -Verb RunAs -ArgumentList '-NoProfile -Command \"{}\"'",
-                    script.replace('"', "\\\"")
-                ),
-            ])
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args([
+            "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &format!(
+                "Start-Process powershell -WindowStyle Hidden -Verb RunAs -ArgumentList '-NoProfile -Command \"{}\"'",
+                script.replace('"', "\\\"")
+            ),
+        ]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let status = cmd
             .status()
             .map_err(|e| format!("Failed to spawn elevated PowerShell: {e}"))?;
 
@@ -621,14 +628,21 @@ Write-Output $count
 "#
         );
 
-        let output = std::process::Command::new("powershell.exe")
-            .args([
-                "-NoProfile",
-                "-WindowStyle",
-                "Hidden",
-                "-Command",
-                &ps_script,
-            ])
+        let mut cmd = std::process::Command::new("powershell.exe");
+        cmd.args([
+            "-NoProfile",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+            &ps_script,
+        ]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let output = cmd
             .output()
             .map_err(|e| format!("Failed to execute PowerShell shortcut injector: {e}"))?;
 
@@ -662,6 +676,124 @@ pub fn launch_browser_with_extension(url: Option<&str>) -> Result<(), String> {
     cmd.spawn()
         .map_err(|e| format!("Failed to spawn browser: {e}"))?;
     Ok(())
+}
+
+/// Detection status for a single Chromium-based browser.
+#[derive(Debug, Clone)]
+pub struct BrowserDetection {
+    pub name: String,
+    pub exe_path: Option<String>,
+    pub registered: bool,
+}
+
+/// Overall browser companion extension installation and registration status.
+#[derive(Debug, Clone)]
+pub struct ExtensionStatus {
+    pub registered: bool,
+    pub crx_available: bool,
+    pub crx_path: Option<String>,
+    pub unpacked_available: bool,
+    pub browsers: Vec<BrowserDetection>,
+    pub extension_id: String,
+    pub version: String,
+}
+
+#[cfg(windows)]
+fn is_reg_key_present(subkey: &str) -> bool {
+    let wide_key: Vec<u16> = std::ffi::OsStr::new(subkey)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut hkey = HKEY::default();
+    unsafe {
+        for root in [HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE] {
+            if RegOpenKeyExW(root, PCWSTR(wide_key.as_ptr()), 0, KEY_READ, &mut hkey).is_ok() {
+                let _ = RegCloseKey(hkey);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+fn find_browser_exe_in_roots(rel_path: &str) -> Option<String> {
+    let roots = ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"];
+    for var in roots {
+        if let Some(base) = std::env::var_os(var) {
+            let candidate = PathBuf::from(base).join(rel_path);
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Returns the current browser companion extension status across supported browsers.
+pub fn get_extension_status() -> ExtensionStatus {
+    let crx = find_crx_candidate();
+    let crx_available = crx.is_some();
+    let crx_path = crx.map(|p| p.to_string_lossy().into_owned());
+    let unpacked_available = find_unpacked_candidate().is_some();
+
+    #[cfg(windows)]
+    let browsers = {
+        let specs = [
+            (
+                "Google Chrome",
+                r"Google\Chrome\Application\chrome.exe",
+                r"Software\Google\Chrome\Extensions",
+            ),
+            (
+                "Microsoft Edge",
+                r"Microsoft\Edge\Application\msedge.exe",
+                r"Software\Microsoft\Edge\Extensions",
+            ),
+            (
+                "Brave",
+                r"BraveSoftware\Brave-Browser\Application\brave.exe",
+                r"Software\BraveSoftware\Brave-Browser\Extensions",
+            ),
+        ];
+        specs
+            .into_iter()
+            .map(|(name, exe_rel, reg_base)| {
+                let full_key = format!(r"{reg_base}\{EXTENSION_ID}");
+                BrowserDetection {
+                    name: name.to_string(),
+                    exe_path: find_browser_exe_in_roots(exe_rel),
+                    registered: is_reg_key_present(&full_key),
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    #[cfg(not(windows))]
+    let browsers = Vec::new();
+
+    ExtensionStatus {
+        registered: is_browser_extension_registered(),
+        crx_available,
+        crx_path,
+        unpacked_available,
+        browsers,
+        extension_id: EXTENSION_ID.to_string(),
+        version: EXTENSION_VERSION.to_string(),
+    }
+}
+
+/// Enables and registers the browser companion extension, returning the number of browsers registered.
+pub fn enable_extension() -> Result<usize, String> {
+    register_browser_extension(None)?;
+    let status = get_extension_status();
+    let count = status.browsers.iter().filter(|b| b.registered).count();
+    Ok(count.max(usize::from(status.registered)))
+}
+
+/// Disables and unregisters the browser companion extension from all supported browsers.
+pub fn disable_extension() {
+    unregister_browser_extension();
 }
 
 #[cfg(test)]

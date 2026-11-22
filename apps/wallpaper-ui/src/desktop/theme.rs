@@ -39,11 +39,11 @@ impl ThemePreset {
 
     fn palette(self) -> Option<(&'static str, &'static str, bool)> {
         match self {
-            Self::Midnight => Some(("#5B8CFF", "#121826", true)),
-            Self::Graphite => Some(("#B0BEC5", "#1B1D1F", true)),
-            Self::Aurora => Some(("#35C6A0", "#0E1C1B", true)),
-            Self::Ember => Some(("#FF7A59", "#201614", true)),
-            Self::Frost => Some(("#2563EB", "#F5F7FB", false)),
+            Self::Midnight => Some(("#6366F1", "#111216", true)),
+            Self::Graphite => Some(("#38BDF8", "#121214", true)),
+            Self::Aurora => Some(("#10B981", "#0D1514", true)),
+            Self::Ember => Some(("#F59E0B", "#171412", true)),
+            Self::Frost => Some(("#3B82F6", "#F8FAFC", false)),
             Self::Custom => None,
         }
     }
@@ -62,8 +62,8 @@ impl Default for UiTheme {
     fn default() -> Self {
         Self {
             preset: ThemePreset::Midnight,
-            accent: "#5B8CFF".into(),
-            background: "#121826".into(),
+            accent: "#6366F1".into(),
+            background: "#111216".into(),
             dark_mode: true,
             scale: 1.0,
         }
@@ -155,33 +155,66 @@ impl UiTheme {
 
         visuals.widgets.open = visuals.widgets.hovered;
 
+        visuals.window_rounding = egui::Rounding::same(10.0);
+        visuals.menu_rounding = egui::Rounding::same(8.0);
+        visuals.widgets.noninteractive.rounding = egui::Rounding::same(6.0);
+        visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
+        visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
+        visuals.widgets.active.rounding = egui::Rounding::same(6.0);
+        visuals.widgets.open.rounding = egui::Rounding::same(6.0);
+
         ctx.set_visuals(visuals);
         ctx.set_zoom_factor(self.scale.clamp(0.8, 1.3));
+        ctx.style_mut(|s| {
+            s.spacing.item_spacing = egui::vec2(8.0, 8.0);
+            s.spacing.button_padding = egui::vec2(10.0, 6.0);
+            s.spacing.window_margin = egui::Margin::same(10.0);
+        });
     }
 }
 
 /// Raised surface used for cards, settings groups and status tiles.
 pub fn card_frame(theme: &UiTheme) -> egui::Frame {
-    let (_, background, dark) = theme.colors();
+    let (_, _background, dark) = theme.colors();
     egui::Frame::none()
-        .fill(shade(background, if dark { 0.055 } else { -0.02 }))
+        .fill(if dark {
+            egui::Color32::from_rgb(26, 27, 35)
+        } else {
+            egui::Color32::from_rgb(246, 248, 252)
+        })
         .stroke(egui::Stroke::new(
-            0.5_f32,
-            shade(background, if dark { 0.22 } else { -0.16 }),
+            1.0_f32,
+            if dark {
+                egui::Color32::from_rgb(40, 42, 54)
+            } else {
+                egui::Color32::from_rgb(220, 224, 235)
+            },
         ))
-        .rounding(egui::Rounding::same(12.0))
-        .inner_margin(egui::Margin::same(14.0))
-        .outer_margin(egui::Margin::symmetric(0.0, 6.0))
+        .rounding(egui::Rounding::same(8.0))
+        .inner_margin(egui::Margin::same(8.0))
+        .outer_margin(egui::Margin::same(3.0))
 }
 
 /// Quieter surface for secondary content such as filters or helper text.
 pub fn subtle_frame(theme: &UiTheme) -> egui::Frame {
-    let (_, background, dark) = theme.colors();
+    let (_, _background, dark) = theme.colors();
     egui::Frame::none()
-        .fill(shade(background, if dark { 0.025 } else { -0.012 }))
+        .fill(if dark {
+            egui::Color32::from_rgb(19, 20, 26)
+        } else {
+            egui::Color32::from_rgb(240, 243, 248)
+        })
+        .stroke(egui::Stroke::new(
+            1.0_f32,
+            if dark {
+                egui::Color32::from_rgb(33, 34, 44)
+            } else {
+                egui::Color32::from_rgb(222, 226, 236)
+            },
+        ))
         .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::same(10.0))
-        .outer_margin(egui::Margin::symmetric(0.0, 4.0))
+        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+        .outer_margin(egui::Margin::symmetric(0.0, 3.0))
 }
 
 pub fn accent_color(theme: &UiTheme) -> egui::Color32 {
@@ -204,6 +237,7 @@ pub fn monitor_fill(theme: &UiTheme, selected: bool, primary: bool) -> egui::Col
     }
 }
 
+#[allow(dead_code)]
 pub fn muted_color(theme: &UiTheme) -> egui::Color32 {
     let (_, _, dark) = theme.colors();
     if dark {
@@ -220,6 +254,64 @@ fn config_path() -> Option<std::path::PathBuf> {
             .join("RustWallpaper")
             .join("ui-theme.json"),
     )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiPrefs {
+    pub hotkey_next_char: String,
+    pub hotkey_pause_char: String,
+    pub hotkey_mute_char: String,
+    pub view_mode_list: bool,
+    pub thumb_scale: u8,
+    pub master_volume: u32,
+    pub master_muted: bool,
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        Self {
+            hotkey_next_char: "N".into(),
+            hotkey_pause_char: "W".into(),
+            hotkey_mute_char: "M".into(),
+            view_mode_list: false,
+            thumb_scale: 1,
+            master_volume: 100,
+            master_muted: false,
+        }
+    }
+}
+
+impl UiPrefs {
+    fn prefs_path() -> Option<std::path::PathBuf> {
+        let app_data = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("APPDATA"))?;
+        Some(
+            std::path::PathBuf::from(app_data)
+                .join("RustWallpaper")
+                .join("ui-prefs.json"),
+        )
+    }
+
+    pub fn load() -> Self {
+        let Some(path) = Self::prefs_path() else {
+            return Self::default();
+        };
+        let Ok(bytes) = std::fs::read(path) else {
+            return Self::default();
+        };
+        serde_json::from_slice(&bytes).unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let Some(path) = Self::prefs_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(self) {
+            let _ = std::fs::write(path, bytes);
+        }
+    }
 }
 
 fn parse_hex(value: &str) -> egui::Color32 {

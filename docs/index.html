@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>RustWallpaper — Ultra-Low Overhead Windows Live Wallpaper Engine</title>
+  <meta name="description" content="Hardware-accelerated multi-monitor live wallpaper engine for Windows 10 and 11 written in pure Rust.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="container nav-bar">
+      <a class="brand" href="index.html">
+        <span class="brand-mark" aria-hidden="true">RW</span>
+        <span>RustWallpaper</span>
+      </a>
+      <nav class="nav-links" aria-label="Main navigation">
+        <a href="index.html" aria-current="page">Home</a>
+        <a href="install.html">Installation</a>
+        <a href="#features">Features</a>
+        <a href="#screenshots">Screenshots</a>
+        <a href="https://github.com/hakimnouira/rust-wallpaper">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="container hero-grid">
+        <div>
+          <span class="badge">Pure Rust • Windows 10 / 11 x64 • GPU Accelerated</span>
+          <h1>Live Desktop Wallpapers Without the Overhead</h1>
+          <p>
+            <strong>RustWallpaper</strong> re-parents hardware-accelerated MPV video streams behind your
+            Windows desktop icons via native Win32 <code>WorkerW</code> hooks—delivering smooth 60+ FPS
+            playback, multi-monitor layouts, Steam Workshop integration, and one-click browser capture.
+          </p>
+          <div class="cta-row">
+            <a class="btn btn-primary" href="install.html">Install RustWallpaper</a>
+            <a class="btn btn-secondary" href="https://github.com/hakimnouira/rust-wallpaper/releases/latest">Download Release</a>
+          </div>
+        </div>
+        <figure class="hero-media">
+          <img src="screenshots/01_overview.png" alt="RustWallpaper desktop control panel overview" fetchpriority="high">
+        </figure>
+      </div>
+    </section>
+
+    <section id="features" class="section">
+      <div class="container">
+        <div class="section-header">
+          <h2>Engineered for Speed and Multi-Monitor Control</h2>
+          <p>Built from the ground up in Rust with decoupled background supervision and GPU decoding.</p>
+        </div>
+        <div class="cards-wrap">
+          <div class="cards-grid">
+            <article class="card">
+              <h3>Native Win32 WorkerW Integration</h3>
+              <p>Renders directly behind desktop icons while preserving selection boxes, context menus, and automatic recovery when Explorer restarts.</p>
+            </article>
+            <article class="card">
+              <h3>GPU-Accelerated MPV Engine</h3>
+              <p>Offloads decoding to DXVA2 / D3D11VA hardware decoders for near-zero CPU usage across MP4, WebM, MKV, MOV, AVI, and animated GIFs.</p>
+            </article>
+            <article class="card">
+              <h3>Wallpaper Engine-Style Tuning</h3>
+              <p>Configure FPS caps (15 to Uncapped), demuxer RAM cache (32–256 MB), scaling filters, and automatic pause on fullscreen apps or lock screen.</p>
+            </article>
+            <article class="card">
+              <h3>Multi-Monitor Topology &amp; Playlists</h3>
+              <p>Assign independent wallpapers and audio levels per monitor, or enable auto-rotating playlists with global hotkeys (<code>Alt+W</code>, <code>Alt+M</code>).</p>
+            </article>
+            <article class="card">
+              <h3>Browser Companion Extension</h3>
+              <p>Sniff and apply web videos directly from Chrome, Edge, or Brave over the authenticated local loopback API on <code>127.0.0.1:24242</code>.</p>
+            </article>
+            <article class="card">
+              <h3>Steam Workshop &amp; Online Catalog</h3>
+              <p>Browse curated online wallpapers or sync compatible Steam Wallpaper Engine video items right inside the desktop library.</p>
+            </article>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="screenshots" class="section">
+      <div class="container">
+        <div class="section-header">
+          <h2>Control Panel Preview</h2>
+          <p>Hardware-accelerated <code>egui</code> desktop interface backed by Named Pipe IPC.</p>
+        </div>
+        <div class="gallery-grid">
+          <figure class="shot-card">
+            <img src="screenshots/01_overview.png" alt="Overview dashboard showing active wallpaper and controls" loading="lazy">
+            <figcaption>Overview — Live playback status and quick controls</figcaption>
+          </figure>
+          <figure class="shot-card">
+            <img src="screenshots/02_library.png" alt="Grid library view of imported wallpapers" loading="lazy">
+            <figcaption>Library — Local collection, search, and playlists</figcaption>
+          </figure>
+          <figure class="shot-card">
+            <img src="screenshots/03_browse.png" alt="Browse view for online wallpapers and Steam Workshop" loading="lazy">
+            <figcaption>Browse — Curated online catalog &amp; direct URL download</figcaption>
+          </figure>
+          <figure class="shot-card">
+            <img src="screenshots/04_monitors.png" alt="Multi-monitor topology and per-screen assignment" loading="lazy">
+            <figcaption>Monitors — Display topology &amp; per-screen assignment</figcaption>
+          </figure>
+          <figure class="shot-card">
+            <img src="screenshots/06_settings.png" alt="Settings view with performance tuning and browser extension controls" loading="lazy">
+            <figcaption>Settings — Performance tuning &amp; browser extension setup</figcaption>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <div class="container">
+        <div class="section-header">
+          <h2>Decoupled Architecture</h2>
+          <p>
+            <strong>wallpaper-daemon</strong> manages Win32 <code>WorkerW</code> desktop embedding, monitor lifecycle,
+            SQLite state (<code>library.db</code>), and the extension Web API bridge, while
+            <strong>wallpaper-ui</strong> connects over versioned Win32 Named Pipes (<code>\\.\pipe\rust-wallpaper-ipc</code>).
+          </p>
+        </div>
+        <div class="cta-banner">
+          <div>
+            <h3>Ready to install on Windows 10 or 11?</h3>
+            <p>Follow the step-by-step installer, portable, or source build guide.</p>
+          </div>
+          <a class="btn btn-primary" href="install.html">Go to Installation Guide</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container footer-inner">
+      <span>RustWallpaper — Windows Live Wallpaper Engine</span>
+      <nav class="nav-links" aria-label="Footer navigation">
+        <a href="install.html">Installation</a>
+        <a href="https://github.com/hakimnouira/rust-wallpaper">Repository</a>
+        <a href="https://github.com/hakimnouira/rust-wallpaper/releases">Releases</a>
+      </nav>
+    </div>
+  </footer>
+</body>
+</html>

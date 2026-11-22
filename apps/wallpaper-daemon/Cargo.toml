@@ -22,6 +22,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+image.workspace = true
 wallpaper-protocol = { path = "../../crates/wallpaper-protocol" }
 wallpaper-core = { path = "../../crates/wallpaper-core" }
 wallpaper-windows = { path = "../../crates/wallpaper-windows" }

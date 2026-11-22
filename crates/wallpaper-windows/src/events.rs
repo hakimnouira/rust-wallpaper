@@ -53,6 +53,10 @@ pub enum SystemPlatformEvent {
     SystemResume,
     DisplayTopologyChanged,
     ExplorerRestarted,
+    PowerSourceChanged {
+        on_battery: bool,
+        percent: u8,
+    },
 }
 
 impl From<SystemPlatformEvent> for RuntimeEvent {
@@ -66,8 +70,30 @@ impl From<SystemPlatformEvent> for RuntimeEvent {
             SystemPlatformEvent::SystemResume => RuntimeEvent::SystemResume,
             SystemPlatformEvent::DisplayTopologyChanged => RuntimeEvent::DisplayTopologyChanged,
             SystemPlatformEvent::ExplorerRestarted => RuntimeEvent::ExplorerRestarted,
+            SystemPlatformEvent::PowerSourceChanged { on_battery, .. } => {
+                RuntimeEvent::PowerSourceChanged { on_battery }
+            }
         }
     }
+}
+
+/// Queries whether the system is running on battery power and the battery percentage.
+/// Returns `Some((on_battery, percent))` on Windows.
+pub fn query_power_status() -> Option<(bool, u8)> {
+    #[cfg(windows)]
+    unsafe {
+        let mut status = windows::Win32::System::Power::SYSTEM_POWER_STATUS::default();
+        if windows::Win32::System::Power::GetSystemPowerStatus(&mut status).is_ok() {
+            let on_battery = status.ACLineStatus == 0;
+            let percent = if status.BatteryLifePercent <= 100 {
+                status.BatteryLifePercent
+            } else {
+                100
+            };
+            return Some((on_battery, percent));
+        }
+    }
+    None
 }
 
 /// Result of polling the listener.
@@ -240,6 +266,7 @@ mod platform {
     pub(super) const PBT_APMRESUMESUSPEND: usize = 0x0007;
     pub(super) const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
     pub(super) const PBT_POWERSETTINGCHANGE: usize = 0x8013;
+    pub(super) const PBT_APMPOWERSTATUSCHANGE: usize = 0x000A;
 
     /// `GUID_CONSOLE_DISPLAY_STATE` = {6fe69556-704a-47a0-8f24-c28d936fda47}.
     ///
@@ -270,6 +297,7 @@ mod platform {
         last_locked: Option<bool>,
         last_display_on: Option<bool>,
         last_suspended: Option<bool>,
+        last_on_battery: Option<bool>,
     }
 
     impl ListenerState {
@@ -316,6 +344,19 @@ mod platform {
             } else {
                 SystemPlatformEvent::SystemResume
             });
+        }
+
+        fn check_power_status(&mut self) {
+            if let Some((on_battery, percent)) = super::query_power_status() {
+                if self.last_on_battery != Some(on_battery) {
+                    self.last_on_battery = Some(on_battery);
+                    info!(on_battery, percent, "Power source state updated");
+                    self.emit(SystemPlatformEvent::PowerSourceChanged {
+                        on_battery,
+                        percent,
+                    });
+                }
+            }
         }
     }
 
@@ -497,6 +538,11 @@ mod platform {
                     PBT_APMRESUMEAUTOMATIC | PBT_APMRESUMESUSPEND | PBT_APMRESUMECRITICAL => {
                         info!(code = wparam.0, "Received resume notification");
                         state.set_suspended(false);
+                        state.check_power_status();
+                    }
+                    PBT_APMPOWERSTATUSCHANGE => {
+                        info!("Received PBT_APMPOWERSTATUSCHANGE: power source or battery status changed");
+                        state.check_power_status();
                     }
                     PBT_POWERSETTINGCHANGE if lparam.0 != 0 => {
                         let setting = &*(lparam.0 as *const PowerBroadcastSetting);
@@ -657,6 +703,7 @@ mod platform {
                 last_locked: None,
                 last_display_on: None,
                 last_suspended: None,
+                last_on_battery: super::query_power_status().map(|(b, _)| b),
             });
             state.publish_registration_report();
             let retry_pending = state.registration.has_pending_retries();

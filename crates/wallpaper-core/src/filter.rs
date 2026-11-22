@@ -255,6 +255,8 @@ pub struct LibraryQuery {
     pub aspect_ratio: AspectRatioFilter,
     pub codec: CodecFilter,
     pub status: StatusFilter,
+    #[serde(default)]
+    pub favorites_only: bool,
 }
 
 impl LibraryQuery {
@@ -265,6 +267,7 @@ impl LibraryQuery {
         self.aspect_ratio = AspectRatioFilter::All;
         self.codec = CodecFilter::All;
         self.status = StatusFilter::All;
+        self.favorites_only = false;
     }
 
     /// Returns `true` if any filter or search query is currently active.
@@ -274,6 +277,7 @@ impl LibraryQuery {
             || self.aspect_ratio != AspectRatioFilter::All
             || self.codec != CodecFilter::All
             || self.status != StatusFilter::All
+            || self.favorites_only
     }
 
     /// Evaluates whether a wallpaper satisfies the current search and filter criteria.
@@ -284,6 +288,10 @@ impl LibraryQuery {
     }
 
     fn matches_with_tokens(&self, wallpaper: &Wallpaper, tokens: &[&str]) -> bool {
+        if self.favorites_only && !wallpaper.metadata.is_favorite {
+            return false;
+        }
+
         // 1. Status filter
         if !self.status.matches(wallpaper.metadata.processing_state) {
             return false;
@@ -620,5 +628,44 @@ mod tests {
         assert_eq!(sorted[0].title(), "Beta"); // 500
         assert_eq!(sorted[1].title(), "Gamma"); // 250
         assert_eq!(sorted[2].title(), "Alpha"); // 100
+    }
+
+    #[test]
+    fn test_favorites_filter() {
+        let mut wp_fav = make_test_wallpaper(
+            "Fav",
+            "fav.mp4",
+            1920,
+            1080,
+            "h264",
+            10.0,
+            100,
+            ProcessingStatus::Completed,
+        );
+        wp_fav.metadata.is_favorite = true;
+        let wp_normal = make_test_wallpaper(
+            "Normal",
+            "norm.mp4",
+            1920,
+            1080,
+            "h264",
+            10.0,
+            100,
+            ProcessingStatus::Completed,
+        );
+
+        let mut query = LibraryQuery::default();
+        assert!(!query.is_filtered());
+        assert!(query.matches(&wp_fav));
+        assert!(query.matches(&wp_normal));
+
+        query.favorites_only = true;
+        assert!(query.is_filtered());
+        assert!(query.matches(&wp_fav));
+        assert!(!query.matches(&wp_normal));
+
+        query.reset_filters();
+        assert!(!query.is_filtered());
+        assert!(query.matches(&wp_normal));
     }
 }

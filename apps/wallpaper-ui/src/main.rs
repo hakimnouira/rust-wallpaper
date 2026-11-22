@@ -12,6 +12,7 @@ mod tray;
 mod desktop {
     mod appearance;
     mod browse;
+    mod extension;
     mod library;
     mod monitors;
     mod overview;
@@ -23,7 +24,7 @@ mod desktop {
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
     use theme::{
-        accent_color, card_frame, monitor_fill, muted_color, soft_accent, subtle_frame, UiTheme,
+        accent_color, card_frame, monitor_fill, soft_accent, subtle_frame, UiPrefs, UiTheme,
     };
     use tokio::runtime::Builder;
     use tokio::time::timeout;
@@ -41,13 +42,38 @@ mod desktop {
         last_error: Option<String>,
         monitors: Vec<MonitorInfo>,
         wallpapers: Vec<Wallpaper>,
+        playlists: Vec<wallpaper_core::WallpaperPlaylist>,
         players: Vec<PlayerStatusInfo>,
         profile: PerformanceProfile,
         playback_settings: PlaybackSettings,
         target_fps: Option<u32>,
         ram_budget_mb: Option<u32>,
         quality: wallpaper_core::VideoQuality,
+        extension_status: ExtensionStatusSnapshot,
+        active_playlist_id: Option<String>,
+        auto_cycle_enabled: bool,
+        auto_cycle_interval_secs: u64,
+        auto_cycle_shuffle: bool,
         last_updated: Option<Instant>,
+    }
+
+    #[derive(Default, Clone, PartialEq)]
+    struct ExtensionStatusSnapshot {
+        registered: bool,
+        crx_available: bool,
+        crx_path: Option<String>,
+        unpacked_available: bool,
+        browsers: Vec<BrowserStatusEntry>,
+        extension_id: String,
+        version: String,
+        fetched: bool,
+    }
+
+    #[derive(Default, Clone, PartialEq)]
+    struct BrowserStatusEntry {
+        name: String,
+        installed: bool,
+        registered: bool,
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,14 +83,58 @@ mod desktop {
         Browse,
         Monitors,
         Appearance,
+        Extension,
         Settings,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    enum BrowseTab {
+    pub(crate) enum LibrarySubtab {
         #[default]
-        OnlineWallpapers,
+        Wallpapers,
+        Playlists,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub(crate) enum FilterOrientation {
+        #[default]
+        All,
+        Horizontal,
+        Vertical,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub(crate) enum BrowseTab {
+        #[default]
+        FeaturedThemes,
+        VerticalShelf,
+        InteractiveWidgets,
+        LiveStreams,
+        WebHub,
         LocalWorkshop,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub(crate) enum SteamWorkshopSubtab {
+        #[default]
+        LiveWorkshop,
+        InstalledOnDisk,
+    }
+
+    pub(crate) struct SteamSearchRequest {
+        pub(crate) search_id: u64,
+        pub(crate) query: String,
+        pub(crate) sort: String,
+    }
+
+    pub(crate) enum SteamSearchResponse {
+        Success {
+            search_id: u64,
+            items: Vec<wallpaper_core::SteamWorkshopOnlineItem>,
+        },
+        Error {
+            search_id: u64,
+            error: String,
+        },
     }
 
     enum DownloadMessage {
@@ -130,6 +200,7 @@ mod desktop {
 
     struct ThumbnailRequest {
         path: std::path::PathBuf,
+        #[allow(dead_code)]
         frame_requested: u64,
     }
 
@@ -137,7 +208,28 @@ mod desktop {
         path: std::path::PathBuf,
         image: egui::ColorImage,
         byte_size: usize,
+    }
+
+    enum ThumbnailDecodeResult {
+        Ready(DecodedThumbnail),
+        Failed(std::path::PathBuf),
+    }
+
+    struct OnlineThumbRequest {
+        url: String,
+        cache_path: std::path::PathBuf,
         frame_requested: u64,
+    }
+
+    enum OnlineThumbResult {
+        Saved {
+            url: String,
+            cache_path: std::path::PathBuf,
+            frame_requested: u64,
+        },
+        Failed {
+            url: String,
+        },
     }
 
     struct CachedTexture {
@@ -165,9 +257,42 @@ mod desktop {
 
     const MAX_TEXTURE_CACHE_BYTES: usize = 32 * 1024 * 1024; // 32 MB
     const TARGET_TEXTURE_CACHE_BYTES: usize = 24 * 1024 * 1024; // 24 MB low watermark
+    const MAX_ONLINE_THUMB_DISK_BYTES: u64 = 100 * 1024 * 1024; // 100 MB disk cap
+
+    fn prune_online_thumb_disk_cache(dir: &std::path::Path, max_bytes: u64) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut files: Vec<(std::path::PathBuf, u64, std::time::SystemTime)> = Vec::new();
+        let mut total_bytes = 0u64;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata() {
+                let len = meta.len();
+                total_bytes = total_bytes.saturating_add(len);
+                let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                files.push((path, len, modified));
+            }
+        }
+        if total_bytes <= max_bytes {
+            return;
+        }
+        files.sort_by_key(|(_, _, modified)| *modified);
+        for (path, len, _) in files {
+            if total_bytes <= max_bytes {
+                break;
+            }
+            if std::fs::remove_file(path).is_ok() {
+                total_bytes = total_bytes.saturating_sub(len);
+            }
+        }
+    }
 
     struct DesktopApp {
-        snapshot: Arc<Mutex<Snapshot>>,
+        snapshot: Arc<Mutex<Arc<Snapshot>>>,
         commands: mpsc::Sender<Command>,
         page: Page,
         theme: UiTheme,
@@ -185,12 +310,23 @@ mod desktop {
         current_cache_bytes: usize,
         visible_thumbnails: HashSet<std::path::PathBuf>,
         in_flight_thumbnails: HashSet<std::path::PathBuf>,
+        failed_thumbnails: HashSet<std::path::PathBuf>,
         thumb_req_tx: mpsc::SyncSender<ThumbnailRequest>,
-        thumb_res_rx: mpsc::Receiver<DecodedThumbnail>,
+        thumb_res_rx: mpsc::Receiver<ThumbnailDecodeResult>,
+        online_thumb_cache_dir: std::path::PathBuf,
+        known_online_files: HashSet<std::path::PathBuf>,
+        in_flight_online_thumbs: HashSet<String>,
+        failed_online_thumbs: HashSet<String>,
+        online_thumb_req_tx: mpsc::SyncSender<OnlineThumbRequest>,
+        online_thumb_res_rx: mpsc::Receiver<OnlineThumbResult>,
         frame_counter: u64,
         browse_tab: BrowseTab,
         workshop_items: Vec<wallpaper_core::WorkshopItem>,
         workshop_scanned: bool,
+        workshop_scanning: bool,
+        last_workshop_auto_scan: Option<Instant>,
+        workshop_scan_tx: mpsc::Sender<Vec<std::path::PathBuf>>,
+        workshop_scan_rx: mpsc::Receiver<Vec<wallpaper_core::WorkshopItem>>,
         workshop_filter_video_only: bool,
         workshop_search: String,
         custom_steam_path: String,
@@ -207,8 +343,10 @@ mod desktop {
         online_is_searching: bool,
         online_search_cache: HashMap<(String, String), Vec<wallpaper_core::OnlineWallpaper>>,
         pending_apply_source: Option<String>,
+        pending_delete_wallpaper: Option<(WallpaperId, String)>,
         tray_rx: crate::tray::TrayReceiver,
-        _tray_icon: Option<crate::tray::TrayIcon>,
+        tray_icon: Option<crate::tray::TrayIcon>,
+        last_tray_state: Option<(bool, bool, PerformanceProfile)>,
         quitting: bool,
         quit_after: Option<Instant>,
         window_visible: bool,
@@ -221,26 +359,49 @@ mod desktop {
         auto_cycle_enabled: bool,
         auto_cycle_interval_secs: u64,
         auto_cycle_shuffle: bool,
-        auto_cycle_last_time: Option<Instant>,
         auto_cycle_index: usize,
+        rotation_dirty_until: Option<Instant>,
+        last_synced_snapshot_at: Option<Instant>,
         master_volume: u32,
         master_muted: bool,
+        pub(crate) active_playlist_id: Option<String>,
+        pub(crate) active_playlist_index: usize,
+        pub(crate) library_subtab: LibrarySubtab,
+        pub(crate) new_playlist_name: String,
+        pub(crate) new_playlist_interval_mins: u32,
+        pub(crate) new_playlist_shuffle: bool,
+        pub(crate) new_playlist_time_slot: wallpaper_core::ScheduleTimeSlot,
+        pub(crate) filter_orientation: FilterOrientation,
+        pub(crate) hotkey_next_char: String,
+        pub(crate) hotkey_pause_char: String,
+        pub(crate) hotkey_mute_char: String,
+        pub(crate) steam_workshop_subtab: SteamWorkshopSubtab,
+        pub(crate) steam_online_items: Vec<wallpaper_core::SteamWorkshopOnlineItem>,
+        pub(crate) steam_online_search: String,
+        pub(crate) steam_online_sort: String,
+        pub(crate) steam_online_searching: bool,
+        pub(crate) steam_online_search_id: u64,
+        pub(crate) steam_search_tx: mpsc::Sender<SteamSearchRequest>,
+        pub(crate) steam_search_rx: mpsc::Receiver<SteamSearchResponse>,
+        pub(crate) steam_search_cache:
+            HashMap<(String, String), Vec<wallpaper_core::SteamWorkshopOnlineItem>>,
     }
 
     impl DesktopApp {
         fn new(
-            snapshot: Arc<Mutex<Snapshot>>,
+            snapshot: Arc<Mutex<Arc<Snapshot>>>,
             commands: mpsc::Sender<Command>,
             tray_rx: crate::tray::TrayReceiver,
             tray_icon: Option<crate::tray::TrayIcon>,
             theme: UiTheme,
+            prefs: UiPrefs,
             visibility_flag: Arc<AtomicBool>,
         ) -> Self {
             let (download_tx, download_rx) = mpsc::channel();
 
             // A single decoder limits peak CPU and memory while browsing large libraries.
             let (thumb_req_tx, thumb_req_rx) = mpsc::sync_channel::<ThumbnailRequest>(32);
-            let (thumb_res_tx, thumb_res_rx) = mpsc::channel::<DecodedThumbnail>();
+            let (thumb_res_tx, thumb_res_rx) = mpsc::channel::<ThumbnailDecodeResult>();
             let thumb_req_rx = Arc::new(Mutex::new(thumb_req_rx));
 
             for i in 0..1 {
@@ -261,32 +422,123 @@ mod desktop {
                                 }
                             };
 
-                            if let Ok(bytes) = std::fs::read(&req.path) {
-                                if let Ok(img) = image::load_from_memory(&bytes) {
-                                    // Downsample large preview images to max 320x240 to conserve GPU memory
-                                    let thumb = if img.width() > 320 || img.height() > 240 {
-                                        img.thumbnail(320, 240)
-                                    } else {
-                                        img
-                                    };
-                                    let rgba = thumb.to_rgba8();
-                                    let size = [rgba.width() as usize, rgba.height() as usize];
-                                    let byte_size = size[0] * size[1] * 4;
-                                    let pixels = rgba.into_raw();
-                                    let color_image =
-                                        egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
-                                    let _ = res_tx.send(DecodedThumbnail {
+                            let decoded = std::fs::read(&req.path)
+                                .ok()
+                                .and_then(|bytes| image::load_from_memory(&bytes).ok());
+
+                            if let Some(img) = decoded {
+                                // Downsample large preview images to max 320x240 to conserve GPU memory
+                                let thumb = if img.width() > 320 || img.height() > 240 {
+                                    img.thumbnail(320, 240)
+                                } else {
+                                    img
+                                };
+                                let rgba = thumb.to_rgba8();
+                                let size = [rgba.width() as usize, rgba.height() as usize];
+                                let byte_size = size[0] * size[1] * 4;
+                                let pixels = rgba.into_raw();
+                                let color_image =
+                                    egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+                                let _ =
+                                    res_tx.send(ThumbnailDecodeResult::Ready(DecodedThumbnail {
                                         path: req.path,
                                         image: color_image,
                                         byte_size,
-                                        frame_requested: req.frame_requested,
-                                    });
-                                }
+                                    }));
+                            } else {
+                                let _ = res_tx.send(ThumbnailDecodeResult::Failed(req.path));
                             }
                         }
                     })
                     .expect("failed to spawn thumbnail worker thread");
             }
+
+            // Initialize online thumbnail cache directory once & pre-index existing files
+            let local_app_data = std::env::var_os("LOCALAPPDATA").unwrap_or_default();
+            let online_thumb_cache_dir = std::path::PathBuf::from(local_app_data)
+                .join("RustWallpaper")
+                .join("thumbnails")
+                .join("online");
+            let _ = std::fs::create_dir_all(&online_thumb_cache_dir);
+            let mut known_online_files = HashSet::new();
+            if let Ok(entries) = std::fs::read_dir(&online_thumb_cache_dir) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.is_file() {
+                        known_online_files.insert(p);
+                    }
+                }
+            }
+            {
+                let prune_dir = online_thumb_cache_dir.clone();
+                std::thread::Builder::new()
+                    .name("online-thumb-prune".into())
+                    .spawn(move || {
+                        prune_online_thumb_disk_cache(&prune_dir, MAX_ONLINE_THUMB_DISK_BYTES);
+                    })
+                    .ok();
+            }
+
+            // Bounded 4-worker pool for online thumbnail downloads
+            let (online_thumb_req_tx, online_thumb_req_rx) =
+                mpsc::sync_channel::<OnlineThumbRequest>(64);
+            let (online_thumb_res_tx, online_thumb_res_rx) = mpsc::channel::<OnlineThumbResult>();
+            let online_thumb_req_rx = Arc::new(Mutex::new(online_thumb_req_rx));
+            for i in 0..4 {
+                let req_rx = Arc::clone(&online_thumb_req_rx);
+                let res_tx = online_thumb_res_tx.clone();
+                std::thread::Builder::new()
+                    .name(format!("online-thumb-worker-{i}"))
+                    .spawn(move || loop {
+                        let req = {
+                            let Ok(guard) = req_rx.lock() else {
+                                break;
+                            };
+                            match guard.recv() {
+                                Ok(r) => r,
+                                Err(_) => break,
+                            }
+                        };
+                        let mut saved = false;
+                        if let Ok(bytes) = wallpaper_core::fetch_thumbnail_bytes(&req.url) {
+                            if !bytes.is_empty() {
+                                let temp_file = req.cache_path.with_extension("tmp");
+                                if std::fs::write(&temp_file, &bytes).is_ok()
+                                    && std::fs::rename(&temp_file, &req.cache_path).is_ok()
+                                {
+                                    saved = true;
+                                } else {
+                                    let _ = std::fs::remove_file(&temp_file);
+                                }
+                            }
+                        }
+                        if saved {
+                            let _ = res_tx.send(OnlineThumbResult::Saved {
+                                url: req.url,
+                                cache_path: req.cache_path,
+                                frame_requested: req.frame_requested,
+                            });
+                        } else {
+                            let _ = res_tx.send(OnlineThumbResult::Failed { url: req.url });
+                        }
+                    })
+                    .expect("failed to spawn online thumb worker");
+            }
+
+            // Asynchronous background Steam Workshop disk scanner
+            let (workshop_scan_tx, workshop_scan_incoming) =
+                mpsc::channel::<Vec<std::path::PathBuf>>();
+            let (workshop_scan_res_tx, workshop_scan_rx) =
+                mpsc::channel::<Vec<wallpaper_core::WorkshopItem>>();
+            std::thread::Builder::new()
+                .name("workshop-disk-scanner".into())
+                .spawn(move || {
+                    while let Ok(custom_paths) = workshop_scan_incoming.recv() {
+                        let items = wallpaper_core::scan_wallpaper_engine_items(&custom_paths);
+                        let _ = workshop_scan_res_tx.send(items);
+                    }
+                })
+                .expect("failed to spawn workshop scanner worker");
 
             // Asynchronous online search background worker
             let (online_search_tx, online_search_incoming) = mpsc::channel::<OnlineSearchRequest>();
@@ -319,6 +571,32 @@ mod desktop {
                 })
                 .expect("failed to spawn online search worker");
 
+            // Asynchronous Steam Workshop search background worker
+            let (steam_search_tx, steam_search_incoming) = mpsc::channel::<SteamSearchRequest>();
+            let (steam_search_res_tx, steam_search_rx) = mpsc::channel::<SteamSearchResponse>();
+
+            std::thread::Builder::new()
+                .name("steam-workshop-search-worker".into())
+                .spawn(move || {
+                    while let Ok(req) = steam_search_incoming.recv() {
+                        match wallpaper_core::fetch_steam_workshop_items(&req.query, &req.sort) {
+                            Ok(items) => {
+                                let _ = steam_search_res_tx.send(SteamSearchResponse::Success {
+                                    search_id: req.search_id,
+                                    items,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = steam_search_res_tx.send(SteamSearchResponse::Error {
+                                    search_id: req.search_id,
+                                    error: e,
+                                });
+                            }
+                        }
+                    }
+                })
+                .expect("failed to spawn steam workshop search worker");
+
             // Run extension registration off the UI thread to avoid blocking startup.
             #[cfg(windows)]
             std::thread::Builder::new()
@@ -340,23 +618,42 @@ mod desktop {
                 import_path: String::new(),
                 import_title: String::new(),
                 query: LibraryQuery::default(),
-                view_mode: ViewMode::Grid,
-                thumb_scale: ThumbnailScale::Medium,
+                view_mode: if prefs.view_mode_list {
+                    ViewMode::List
+                } else {
+                    ViewMode::Grid
+                },
+                thumb_scale: match prefs.thumb_scale {
+                    0 => ThumbnailScale::Small,
+                    2 => ThumbnailScale::Large,
+                    _ => ThumbnailScale::Medium,
+                },
                 notice: "Connect to the wallpaper daemon to get started.".into(),
                 textures: HashMap::new(),
                 current_cache_bytes: 0,
                 visible_thumbnails: HashSet::new(),
                 in_flight_thumbnails: HashSet::new(),
+                failed_thumbnails: HashSet::new(),
                 thumb_req_tx,
                 thumb_res_rx,
+                online_thumb_cache_dir,
+                known_online_files,
+                in_flight_online_thumbs: HashSet::new(),
+                failed_online_thumbs: HashSet::new(),
+                online_thumb_req_tx,
+                online_thumb_res_rx,
                 frame_counter: 0,
-                browse_tab: BrowseTab::OnlineWallpapers,
+                browse_tab: BrowseTab::FeaturedThemes,
                 workshop_items: Vec::new(),
                 workshop_scanned: false,
+                workshop_scanning: false,
+                last_workshop_auto_scan: None,
+                workshop_scan_tx,
+                workshop_scan_rx,
                 workshop_filter_video_only: true,
                 workshop_search: String::new(),
                 custom_steam_path: String::new(),
-                online_items: Vec::new(),
+                online_items: wallpaper_core::get_curated_video_wallpapers(),
                 online_search_query: String::new(),
                 online_category: "Videos (Free Loops)".to_string(),
                 online_download_status: HashMap::new(),
@@ -369,8 +666,10 @@ mod desktop {
                 online_is_searching: false,
                 online_search_cache: HashMap::new(),
                 pending_apply_source: None,
+                pending_delete_wallpaper: None,
                 tray_rx,
-                _tray_icon: tray_icon,
+                tray_icon,
+                last_tray_state: None,
                 quitting: false,
                 quit_after: None,
                 window_visible: visibility_flag.load(Ordering::Relaxed),
@@ -386,10 +685,63 @@ mod desktop {
                 auto_cycle_enabled: false,
                 auto_cycle_interval_secs: 900,
                 auto_cycle_shuffle: true,
-                auto_cycle_last_time: None,
                 auto_cycle_index: 0,
-                master_volume: 100,
-                master_muted: false,
+                rotation_dirty_until: None,
+                last_synced_snapshot_at: None,
+                master_volume: prefs.master_volume,
+                master_muted: prefs.master_muted,
+                active_playlist_id: None,
+                active_playlist_index: 0,
+                library_subtab: LibrarySubtab::Wallpapers,
+                new_playlist_name: "My Playlist".into(),
+                new_playlist_interval_mins: 30,
+                new_playlist_shuffle: false,
+                new_playlist_time_slot: wallpaper_core::ScheduleTimeSlot::AllDay,
+                filter_orientation: FilterOrientation::All,
+                hotkey_next_char: prefs.hotkey_next_char,
+                hotkey_pause_char: prefs.hotkey_pause_char,
+                hotkey_mute_char: prefs.hotkey_mute_char,
+                steam_workshop_subtab: SteamWorkshopSubtab::LiveWorkshop,
+                steam_online_items: wallpaper_core::get_curated_steam_workshop_items(),
+                steam_online_search: String::new(),
+                steam_online_sort: "Trending".to_string(),
+                steam_online_searching: false,
+                steam_online_search_id: 0,
+                steam_search_tx,
+                steam_search_rx,
+                steam_search_cache: HashMap::new(),
+            }
+        }
+
+        pub(crate) fn save_prefs(&self) {
+            let prefs = UiPrefs {
+                hotkey_next_char: self.hotkey_next_char.clone(),
+                hotkey_pause_char: self.hotkey_pause_char.clone(),
+                hotkey_mute_char: self.hotkey_mute_char.clone(),
+                view_mode_list: self.view_mode == ViewMode::List,
+                thumb_scale: match self.thumb_scale {
+                    ThumbnailScale::Small => 0,
+                    ThumbnailScale::Medium => 1,
+                    ThumbnailScale::Large => 2,
+                },
+                master_volume: self.master_volume,
+                master_muted: self.master_muted,
+            };
+            prefs.save();
+        }
+
+        pub(crate) fn request_workshop_scan(&mut self) {
+            if self.workshop_scanning {
+                return;
+            }
+            let custom = if !self.custom_steam_path.trim().is_empty() {
+                vec![std::path::PathBuf::from(self.custom_steam_path.trim())]
+            } else {
+                Vec::new()
+            };
+            if self.workshop_scan_tx.send(custom).is_ok() {
+                self.workshop_scanning = true;
+                self.last_workshop_auto_scan = Some(Instant::now());
             }
         }
 
@@ -425,17 +777,86 @@ mod desktop {
                 },
                 &format!("Rotated to wallpaper: '{title}'"),
             );
-            self.auto_cycle_last_time = Some(Instant::now());
         }
 
-        fn nav_button(&self, ui: &mut egui::Ui, page: Page, label: &str) -> bool {
-            let active = self.page == page;
-            let mut button = egui::Button::new(label).frame(true);
-            if active {
-                button = button.fill(soft_accent(&self.theme));
+        pub(crate) fn cycle_playlist_wallpaper(&mut self, snapshot: &Snapshot) {
+            // Check if there is a playlist explicitly scheduled for the current hour
+            let scheduled_pl = snapshot.playlists.iter().find(|p| {
+                p.time_slot != wallpaper_core::ScheduleTimeSlot::AllDay
+                    && p.time_slot.is_active_now()
+            });
+
+            let playlist = if let Some(scheduled) = scheduled_pl {
+                self.active_playlist_id = Some(scheduled.id.clone());
+                scheduled.clone()
+            } else {
+                match self
+                    .active_playlist_id
+                    .as_ref()
+                    .and_then(|id| snapshot.playlists.iter().find(|p| &p.id == id))
+                {
+                    Some(p) => p.clone(),
+                    None => {
+                        self.active_playlist_id = None;
+                        return;
+                    }
+                }
+            };
+
+            if playlist.wallpaper_ids.is_empty() {
+                self.notice = format!("Playlist '{}' has no wallpapers.", playlist.name);
+                return;
             }
-            let width = ui.available_width().max(120.0);
-            ui.add_sized(egui::vec2(width, 30.0), button).clicked()
+
+            let next_wp_id = if playlist.shuffle {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos() as usize;
+                let idx = (nanos ^ (self.frame_counter as usize)) % playlist.wallpaper_ids.len();
+                playlist.wallpaper_ids[idx]
+            } else {
+                self.active_playlist_index =
+                    (self.active_playlist_index + 1) % playlist.wallpaper_ids.len();
+                playlist.wallpaper_ids[self.active_playlist_index]
+            };
+
+            let title = snapshot
+                .wallpapers
+                .iter()
+                .find(|w| w.id == next_wp_id)
+                .map(|w| w.title().to_string())
+                .unwrap_or_else(|| "wallpaper".to_string());
+
+            self.selected_wallpaper = Some(next_wp_id);
+            self.send(
+                Command::ApplyWallpaper {
+                    wallpaper_id: next_wp_id,
+                    monitor: self.selected_monitor.clone(),
+                },
+                &format!("Playlist '{}' switched to: '{title}'", playlist.name),
+            );
+        }
+
+        fn nav_tab(&self, ui: &mut egui::Ui, page: Page, icon: &str, label: &str) -> bool {
+            let active = self.page == page;
+            let text = egui::RichText::new(format!("{icon} {label}"))
+                .strong()
+                .size(12.5)
+                .color(if active {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::from_gray(185)
+                });
+            let btn = egui::Button::new(text)
+                .fill(if active {
+                    accent_color(&self.theme)
+                } else {
+                    egui::Color32::TRANSPARENT
+                })
+                .min_size(egui::vec2(0.0, 28.0))
+                .rounding(egui::Rounding::same(6.0));
+            ui.add(btn).clicked()
         }
 
         fn send(&mut self, command: Command, message: &str) {
@@ -480,8 +901,9 @@ mod desktop {
             }
 
             if !self.in_flight_thumbnails.contains(path)
-                && path.is_file()
+                && !self.failed_thumbnails.contains(path)
                 && self.in_flight_thumbnails.len() < 8
+                && path.is_file()
                 && self
                     .thumb_req_tx
                     .try_send(ThumbnailRequest {
@@ -495,10 +917,52 @@ mod desktop {
 
             None
         }
+
+        pub(crate) fn get_or_load_online_thumbnail(
+            &mut self,
+            url: &str,
+        ) -> Option<egui::TextureId> {
+            if url.trim().is_empty() {
+                return None;
+            }
+
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&url, &mut hasher);
+            let hash = std::hash::Hasher::finish(&hasher);
+            let cache_path = self
+                .online_thumb_cache_dir
+                .join(format!("online_{hash:016x}.jpg"));
+
+            self.visible_thumbnails.insert(cache_path.clone());
+
+            if self.known_online_files.contains(&cache_path) {
+                return self.get_or_load_texture(&cache_path);
+            }
+
+            if !self.in_flight_online_thumbs.contains(url)
+                && !self.failed_online_thumbs.contains(url)
+                && self.in_flight_online_thumbs.len() < 12
+                && self
+                    .online_thumb_req_tx
+                    .try_send(OnlineThumbRequest {
+                        url: url.to_string(),
+                        cache_path,
+                        frame_requested: self.frame_counter,
+                    })
+                    .is_ok()
+            {
+                self.in_flight_online_thumbs.insert(url.to_string());
+            }
+
+            None
+        }
     }
 
     impl eframe::App for DesktopApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+            self.frame_counter = self.frame_counter.wrapping_add(1);
+            self.visible_thumbnails.clear();
+
             let minimized = ctx
                 .input(|input| input.viewport().minimized)
                 .unwrap_or(false);
@@ -512,11 +976,37 @@ mod desktop {
                 Duration::from_secs(30)
             });
 
-            let snapshot = self
+            let snapshot: Arc<Snapshot> = self
                 .snapshot
                 .lock()
-                .map(|state| state.clone())
+                .map(|state| Arc::clone(&state))
                 .unwrap_or_default();
+
+            // Sync daemon-persisted rotation state into UI when refreshed
+            if snapshot.last_updated != self.last_synced_snapshot_at {
+                self.last_synced_snapshot_at = snapshot.last_updated;
+                let dirty = self
+                    .rotation_dirty_until
+                    .is_some_and(|until| Instant::now() < until);
+                if !dirty && snapshot.connected {
+                    self.active_playlist_id = snapshot.active_playlist_id.clone();
+                    self.auto_cycle_enabled = snapshot.auto_cycle_enabled;
+                    if snapshot.auto_cycle_interval_secs >= 10 {
+                        self.auto_cycle_interval_secs = snapshot.auto_cycle_interval_secs;
+                    }
+                    self.auto_cycle_shuffle = snapshot.auto_cycle_shuffle;
+                }
+            }
+
+            // Keep tray menu labels & profile checkmarks in sync with runtime state
+            let any_paused = snapshot.players.iter().any(|p| p.suspended);
+            let cur_tray_state = (any_paused, self.master_muted, snapshot.profile);
+            if self.last_tray_state != Some(cur_tray_state) {
+                if let Some(ref tray) = self.tray_icon {
+                    tray.update_state(cur_tray_state.0, cur_tray_state.1, cur_tray_state.2);
+                }
+                self.last_tray_state = Some(cur_tray_state);
+            }
 
             while let Ok(action) = self.tray_rx.try_recv() {
                 match action {
@@ -531,7 +1021,6 @@ mod desktop {
                         self.cycle_next_wallpaper(&snapshot);
                     }
                     crate::tray::TrayAction::TogglePause => {
-                        let any_paused = snapshot.players.iter().any(|p| p.suspended);
                         if any_paused {
                             self.send(Command::Resume { monitor: None }, "Resumed playback…");
                         } else {
@@ -541,6 +1030,7 @@ mod desktop {
                     crate::tray::TrayAction::ToggleMute => {
                         self.master_muted = !self.master_muted;
                         let muted = self.master_muted;
+                        self.save_prefs();
                         self.send(
                             Command::SetMute {
                                 monitor: None,
@@ -551,6 +1041,12 @@ mod desktop {
                             } else {
                                 "Unmuted all audio…"
                             },
+                        );
+                    }
+                    crate::tray::TrayAction::SetProfile(profile) => {
+                        self.send(
+                            Command::SetProfile { profile },
+                            &format!("Performance profile switched to {profile:?}"),
                         );
                     }
                     crate::tray::TrayAction::Quit => {
@@ -581,7 +1077,7 @@ mod desktop {
             // The window close button minimizes to the notification area. A real
             // exit is available from the tray menu (or after a tray quit request).
             if ctx.input(|input| input.viewport().close_requested()) && !self.quitting {
-                if self._tray_icon.is_some() {
+                if self.tray_icon.is_some() {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     self.window_visible = false;
@@ -598,71 +1094,121 @@ mod desktop {
                 }
             }
 
-            // Drain completed asynchronous thumbnail decodes and upload to GPU
-            while let Ok(decoded) = self.thumb_res_rx.try_recv() {
-                self.in_flight_thumbnails.remove(&decoded.path);
-                let is_recent = self.frame_counter.saturating_sub(decoded.frame_requested) < 180;
-                if is_recent || self.visible_thumbnails.contains(&decoded.path) {
-                    let handle = ctx.load_texture(
-                        decoded.path.to_string_lossy(),
-                        decoded.image,
-                        egui::TextureOptions::LINEAR,
-                    );
-                    self.current_cache_bytes += decoded.byte_size;
-                    self.textures.insert(
-                        decoded.path,
-                        CachedTexture {
-                            handle,
-                            byte_size: decoded.byte_size,
-                            last_accessed_frame: self.frame_counter,
-                        },
-                    );
-                    ctx.request_repaint();
-                }
-            }
-
-            // Hotkeys: Alt+W (Pause/Resume), Alt+N (Next Wallpaper), Alt+M (Mute/Unmute)
-            if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::W)) {
-                let any_paused = snapshot.players.iter().any(|p| p.suspended);
-                if any_paused {
-                    self.send(Command::Resume { monitor: None }, "Resumed playback…");
-                } else {
-                    self.send(Command::Pause { monitor: None }, "Paused playback…");
-                }
-            }
-            if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::N)) {
-                self.cycle_next_wallpaper(&snapshot);
-            }
-            if ctx.input(|i| i.modifiers.alt && i.key_pressed(egui::Key::M)) {
-                self.master_muted = !self.master_muted;
-                let muted = self.master_muted;
-                self.send(
-                    Command::SetMute {
-                        monitor: None,
-                        muted,
-                    },
-                    if muted {
-                        "Muted all audio…"
-                    } else {
-                        "Unmuted all audio…"
-                    },
-                );
-            }
-
-            // Automatic wallpaper rotation timer
-            if self.auto_cycle_enabled && snapshot.connected && !snapshot.wallpapers.is_empty() {
-                let interval = Duration::from_secs(self.auto_cycle_interval_secs.max(10));
-                let should_rotate = match self.auto_cycle_last_time {
-                    Some(last) => last.elapsed() >= interval,
-                    None => {
-                        self.auto_cycle_last_time = Some(Instant::now());
-                        false
+            // Drain completed online thumbnail downloads and submit to local decoder pool
+            let mut online_events = false;
+            while let Ok(res) = self.online_thumb_res_rx.try_recv() {
+                online_events = true;
+                match res {
+                    OnlineThumbResult::Saved {
+                        url,
+                        cache_path,
+                        frame_requested,
+                    } => {
+                        self.in_flight_online_thumbs.remove(&url);
+                        self.failed_online_thumbs.remove(&url);
+                        self.known_online_files.insert(cache_path.clone());
+                        if !self.in_flight_thumbnails.contains(&cache_path)
+                            && self
+                                .thumb_req_tx
+                                .try_send(ThumbnailRequest {
+                                    path: cache_path.clone(),
+                                    frame_requested,
+                                })
+                                .is_ok()
+                        {
+                            self.in_flight_thumbnails.insert(cache_path);
+                        }
                     }
-                };
-                if should_rotate {
-                    self.cycle_next_wallpaper(&snapshot);
+                    OnlineThumbResult::Failed { url } => {
+                        self.in_flight_online_thumbs.remove(&url);
+                        if self.failed_online_thumbs.len() < 1024 {
+                            self.failed_online_thumbs.insert(url);
+                        }
+                    }
                 }
-                ctx.request_repaint_after(Duration::from_secs(5));
+            }
+            if online_events {
+                ctx.request_repaint();
+            }
+
+            // Drain completed asynchronous thumbnail decodes and upload to GPU
+            while let Ok(res) = self.thumb_res_rx.try_recv() {
+                match res {
+                    ThumbnailDecodeResult::Ready(decoded) => {
+                        self.in_flight_thumbnails.remove(&decoded.path);
+                        self.failed_thumbnails.remove(&decoded.path);
+                        let handle = ctx.load_texture(
+                            decoded.path.to_string_lossy(),
+                            decoded.image,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.current_cache_bytes += decoded.byte_size;
+                        self.textures.insert(
+                            decoded.path,
+                            CachedTexture {
+                                handle,
+                                byte_size: decoded.byte_size,
+                                last_accessed_frame: self.frame_counter,
+                            },
+                        );
+                        ctx.request_repaint();
+                    }
+                    ThumbnailDecodeResult::Failed(path) => {
+                        self.in_flight_thumbnails.remove(&path);
+                        if self.failed_thumbnails.len() < 1024 {
+                            self.failed_thumbnails.insert(path);
+                        }
+                    }
+                }
+            }
+
+            // Handle OS drag-and-drop import into library
+            let (has_hover_files, dropped_files) =
+                ctx.input(|i| (!i.raw.hovered_files.is_empty(), i.raw.dropped_files.clone()));
+            if !dropped_files.is_empty() && snapshot.connected {
+                let mut imported = 0usize;
+                for file in dropped_files {
+                    if let Some(path) = file.path {
+                        let ext = path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|s| s.to_ascii_lowercase())
+                            .unwrap_or_default();
+                        if matches!(
+                            ext.as_str(),
+                            "mp4"
+                                | "webm"
+                                | "mkv"
+                                | "mov"
+                                | "gif"
+                                | "jpg"
+                                | "jpeg"
+                                | "png"
+                                | "webp"
+                                | "bmp"
+                                | "html"
+                                | "htm"
+                        ) {
+                            let _ = self.commands.send(Command::ImportWallpaper {
+                                path: path.to_string_lossy().to_string(),
+                                title: None,
+                            });
+                            imported += 1;
+                        }
+                    }
+                }
+                if imported > 0 {
+                    self.page = Page::Library;
+                    self.library_subtab = LibrarySubtab::Wallpapers;
+                    self.notice = format!(
+                        "Importing {imported} dropped wallpaper{} into library…",
+                        if imported == 1 { "" } else { "s" }
+                    );
+                } else {
+                    self.notice =
+                        "Dropped files did not match supported video, image, or HTML formats."
+                            .into();
+                }
             }
 
             // Auto-apply newly imported wallpaper if requested
@@ -682,109 +1228,252 @@ mod desktop {
                     self.pending_apply_download_id = None;
                 }
             }
-            egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
-                ui.add_space(5.0);
-                ui.horizontal(|ui| {
-                    ui.colored_label(accent_color(&self.theme), "◆");
-                    ui.strong("Rust Wallpaper");
-                    ui.add_space(10.0);
-                    let (color, label) = if snapshot.connected {
-                        (egui::Color32::from_rgb(90, 200, 140), "Daemon connected")
-                    } else {
-                        (
-                            egui::Color32::from_rgb(230, 110, 110),
-                            "Daemon disconnected",
-                        )
-                    };
-                    ui.colored_label(color, format!("● {label}"));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.small(format!(
-                            "{} displays  ·  {} wallpapers",
-                            snapshot.monitors.len(),
-                            snapshot.wallpapers.len()
-                        ));
-                    });
-                });
-                ui.add_space(5.0);
-            });
-            egui::SidePanel::left("navigation")
-                .resizable(false)
-                .min_width(186.0)
-                .max_width(186.0)
+            // Top Navigation Bar (Wallpaper Engine Style)
+            egui::TopBottomPanel::top("topbar")
+                .frame(
+                    egui::Frame::none()
+                        .fill(if self.theme.dark_mode {
+                            egui::Color32::from_rgb(18, 19, 25)
+                        } else {
+                            egui::Color32::from_rgb(240, 243, 248)
+                        })
+                        .stroke(egui::Stroke::new(
+                            1.0_f32,
+                            if self.theme.dark_mode {
+                                egui::Color32::from_rgb(34, 36, 46)
+                            } else {
+                                egui::Color32::from_rgb(220, 224, 235)
+                            },
+                        ))
+                        .inner_margin(egui::Margin::symmetric(14.0, 8.0)),
+                )
                 .show(ctx, |ui| {
-                    ui.add_space(14.0);
-                    ui.colored_label(muted_color(&self.theme), "WORKSPACE");
-                    ui.add_space(4.0);
-                    if self.nav_button(ui, Page::Overview, "⌂  Overview") {
-                        self.page = Page::Overview;
-                    }
-                    if self.nav_button(ui, Page::Library, "▦  Library") {
-                        self.page = Page::Library;
-                    }
-                    if self.nav_button(ui, Page::Browse, "◈  Browse & Workshop") {
-                        self.page = Page::Browse;
-                    }
-                    if self.nav_button(ui, Page::Monitors, "▣  Monitors") {
-                        self.page = Page::Monitors;
-                    }
+                    ui.horizontal(|ui| {
+                        // Brand Icon & Title (clickable home button -> Overview)
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("❖ Rust Wallpaper")
+                                        .strong()
+                                        .size(15.5)
+                                        .color(accent_color(&self.theme)),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("Go to Overview home")
+                            .clicked()
+                        {
+                            self.page = Page::Overview;
+                        }
 
-                    ui.add_space(14.0);
-                    ui.separator();
-                    ui.colored_label(muted_color(&self.theme), "PERSONALIZE");
-                    ui.add_space(4.0);
-                    if self.nav_button(ui, Page::Appearance, "◐  Appearance") {
-                        self.page = Page::Appearance;
-                    }
-                    if self.nav_button(ui, Page::Settings, "⚙  Settings") {
-                        self.page = Page::Settings;
-                    }
+                        ui.add_space(6.0);
 
-                    ui.add_space(14.0);
-                    ui.separator();
-                    ui.small("Assignment target");
-                    egui::ComboBox::from_id_salt("target_monitor")
-                        .selected_text(
-                            self.selected_monitor
-                                .clone()
-                                .unwrap_or_else(|| "All monitors".into()),
-                        )
-                        .show_ui(ui, |ui| {
+                        // Live Engine Status Pill
+                        let (dot_color, status_text) = if snapshot.connected {
+                            let any_playing = snapshot.players.iter().any(|p| !p.suspended);
+                            if any_playing {
+                                (egui::Color32::from_rgb(16, 185, 129), "Engine Active")
+                            } else {
+                                (egui::Color32::from_rgb(245, 158, 11), "Engine Paused")
+                            }
+                        } else {
+                            (egui::Color32::from_rgb(239, 68, 68), "Daemon Offline")
+                        };
+                        egui::Frame::none()
+                            .fill(if self.theme.dark_mode {
+                                egui::Color32::from_rgb(26, 28, 36)
+                            } else {
+                                egui::Color32::from_rgb(230, 234, 242)
+                            })
+                            .rounding(egui::Rounding::same(12.0))
+                            .inner_margin(egui::Margin::symmetric(8.0, 3.0))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(dot_color, "●");
+                                    ui.small(status_text);
+                                });
+                            });
+
+                        ui.add_space(8.0);
+
+                        // Top Navigation Tabs
+                        if self.nav_tab(ui, Page::Overview, "🏠", "Home") {
+                            self.page = Page::Overview;
+                        }
+                        if self.nav_tab(ui, Page::Library, "▦", "Library") {
+                            self.page = Page::Library;
+                        }
+                        if self.nav_tab(ui, Page::Browse, "🌐", "Discover") {
+                            self.page = Page::Browse;
+                        }
+                        if self.nav_tab(ui, Page::Monitors, "🖥", "Displays") {
+                            self.page = Page::Monitors;
+                        }
+                        if self.nav_tab(ui, Page::Extension, "🧩", "Extension") {
+                            self.page = Page::Extension;
+                        }
+                        if self.nav_tab(ui, Page::Appearance, "🎨", "Theme") {
+                            self.page = Page::Appearance;
+                        }
+                        if self.nav_tab(ui, Page::Settings, "⚙", "Settings") {
+                            self.page = Page::Settings;
+                        }
+
+                        // Right-aligned controls
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // Minimize to Tray
                             if ui
-                                .selectable_label(self.selected_monitor.is_none(), "All monitors")
+                                .button("⏷ Tray")
+                                .on_hover_text("Minimize to Windows system notification area")
                                 .clicked()
                             {
-                                self.selected_monitor = None;
+                                self.window_visible = false;
+                                self.visibility_flag.store(false, Ordering::SeqCst);
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                             }
-                            for monitor in &snapshot.monitors {
-                                ui.selectable_value(
-                                    &mut self.selected_monitor,
-                                    Some(monitor.device_name.clone()),
-                                    &monitor.device_name,
+
+                            ui.separator();
+
+                            // Master Mute
+                            let mute_icon = if self.master_muted { "🔇" } else { "🔊" };
+                            if ui
+                                .button(mute_icon)
+                                .on_hover_text("Toggle master audio (Alt+M)")
+                                .clicked()
+                            {
+                                self.master_muted = !self.master_muted;
+                                let muted = self.master_muted;
+                                self.send(
+                                    Command::SetMute {
+                                        monitor: None,
+                                        muted,
+                                    },
+                                    if muted {
+                                        "Muted all audio…"
+                                    } else {
+                                        "Unmuted all audio…"
+                                    },
                                 );
                             }
+
+                            // Quick Monitor Selector
+                            egui::ComboBox::from_id_salt("quick_target_monitor")
+                                .selected_text(
+                                    self.selected_monitor.as_deref().unwrap_or("All Displays"),
+                                )
+                                .show_ui(ui, |ui| {
+                                    if ui
+                                        .selectable_label(
+                                            self.selected_monitor.is_none(),
+                                            "All Displays",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.selected_monitor = None;
+                                    }
+                                    for m in &snapshot.monitors {
+                                        ui.selectable_value(
+                                            &mut self.selected_monitor,
+                                            Some(m.device_name.clone()),
+                                            format!("{}: {}x{}", m.device_name, m.width, m.height),
+                                        );
+                                    }
+                                    if snapshot.monitors.len() > 1 {
+                                        ui.selectable_value(
+                                            &mut self.selected_monitor,
+                                            Some(wallpaper_windows::SPAN_DEVICE_NAME.to_string()),
+                                            "🔲 Span All Displays (Panoramic)".to_string(),
+                                        );
+                                    }
+                                });
+                            ui.small("Target Display:");
                         });
-                    ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                        ui.small("v0.1 · UI build 3 · Early access");
                     });
                 });
+
             egui::CentralPanel::default().show(ctx, |ui| match self.page {
                 Page::Overview => self.render_overview(ui, &snapshot),
                 Page::Library => self.render_library(ui, &snapshot),
                 Page::Browse => self.render_browse(ui, &snapshot),
                 Page::Monitors => self.render_monitors(ui, &snapshot),
                 Page::Appearance => self.render_appearance(ui),
+                Page::Extension => self.render_extension(ui, &snapshot),
                 Page::Settings => self.render_settings(ui, &snapshot),
             });
-            egui::TopBottomPanel::bottom("statusbar").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(&self.notice);
-                    if let Some(updated) = snapshot.last_updated {
+
+            egui::TopBottomPanel::bottom("statusbar")
+                .frame(
+                    egui::Frame::none()
+                        .fill(if self.theme.dark_mode {
+                            egui::Color32::from_rgb(14, 15, 20)
+                        } else {
+                            egui::Color32::from_rgb(238, 241, 246)
+                        })
+                        .stroke(egui::Stroke::new(
+                            1.0_f32,
+                            if self.theme.dark_mode {
+                                egui::Color32::from_rgb(28, 30, 40)
+                            } else {
+                                egui::Color32::from_rgb(220, 224, 235)
+                            },
+                        ))
+                        .inner_margin(egui::Margin::symmetric(14.0, 4.0)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if !self.notice.is_empty() {
+                            ui.small(&self.notice);
+                        } else {
+                            ui.small("Ready");
+                        }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.small(format!("Updated {}s ago", updated.elapsed().as_secs()));
+                            ui.small(format!(
+                                "{} Displays  ·  {} Wallpapers in Library",
+                                snapshot.monitors.len(),
+                                snapshot.wallpapers.len()
+                            ));
                         });
-                    }
+                    });
                 });
-            });
+
+            // Keep GPU texture memory bounded and retain only thumbnails used by this frame.
+            self.prune_texture_cache();
+
+            // Drag-and-drop overlay indicator
+            if has_hover_files {
+                let screen_rect = ctx.screen_rect();
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("drop_files_overlay"),
+                ));
+                painter.rect_filled(
+                    screen_rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(15, 23, 42, 185),
+                );
+                let box_rect =
+                    egui::Rect::from_center_size(screen_rect.center(), egui::vec2(460.0, 140.0));
+                painter.rect(
+                    box_rect,
+                    egui::Rounding::same(12.0),
+                    egui::Color32::from_rgb(22, 30, 46),
+                    egui::Stroke::new(2.0_f32, accent_color(&self.theme)),
+                );
+                painter.text(
+                    box_rect.center() - egui::vec2(0.0, 14.0),
+                    egui::Align2::CENTER_CENTER,
+                    "📂 Drop files to import into Wallpaper Library",
+                    egui::FontId::proportional(18.0),
+                    egui::Color32::WHITE,
+                );
+                painter.text(
+                    box_rect.center() + egui::vec2(0.0, 16.0),
+                    egui::Align2::CENTER_CENTER,
+                    "Supports MP4, WebM, MKV, MOV, GIF, images, and HTML5 widgets",
+                    egui::FontId::proportional(12.5),
+                    egui::Color32::from_rgb(160, 175, 200),
+                );
+            }
         }
     }
 
@@ -838,7 +1527,7 @@ mod desktop {
     }
 
     fn spawn_worker(
-        snapshot: Arc<Mutex<Snapshot>>,
+        snapshot: Arc<Mutex<Arc<Snapshot>>>,
         visibility: Arc<AtomicBool>,
     ) -> mpsc::Sender<Command> {
         let (tx, rx) = mpsc::channel::<Command>();
@@ -849,7 +1538,9 @@ mod desktop {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         if let Ok(mut state) = snapshot.lock() {
-                            state.last_error = Some(error.to_string());
+                            let mut next = (**state).clone();
+                            next.last_error = Some(error.to_string());
+                            *state = Arc::new(next);
                         }
                         return;
                     }
@@ -870,8 +1561,10 @@ mod desktop {
                                 Ok(connection) => {
                                     client = Some(connection);
                                     if let Ok(mut state) = snapshot.lock() {
-                                        state.connected = true;
-                                        state.last_error = None;
+                                        let mut next = (**state).clone();
+                                        next.connected = true;
+                                        next.last_error = None;
+                                        *state = Arc::new(next);
                                     }
                                     next_refresh = Instant::now();
                                 }
@@ -883,8 +1576,10 @@ mod desktop {
                                         continue;
                                     }
                                     if let Ok(mut state) = snapshot.lock() {
-                                        state.connected = false;
-                                        state.last_error = Some(error.to_string());
+                                        let mut next = (**state).clone();
+                                        next.connected = false;
+                                        next.last_error = Some(error.to_string());
+                                        *state = Arc::new(next);
                                     }
                                     tokio::time::sleep(if active {
                                         Duration::from_secs(1)
@@ -898,98 +1593,109 @@ mod desktop {
                         }
                         if let Some(connection) = client.as_mut() {
                             let mut disconnected = false;
+                            let mut had_commands = false;
                             while let Ok(command) = rx.try_recv() {
+                                had_commands = true;
                                 match send(connection, command).await {
                                     Ok(Response::Error { message, .. }) => {
                                         if let Ok(mut state) = snapshot.lock() {
-                                            state.last_error = Some(message);
+                                            let mut next = (**state).clone();
+                                            next.last_error = Some(message);
+                                            *state = Arc::new(next);
                                         }
                                     }
                                     Ok(_) => {}
                                     Err(error) => {
                                         if let Ok(mut state) = snapshot.lock() {
-                                            state.last_error = Some(error);
+                                            let mut next = (**state).clone();
+                                            next.last_error = Some(error);
+                                            *state = Arc::new(next);
                                         }
                                         disconnected = true;
                                         break;
                                     }
                                 }
                             }
+                            if had_commands && !disconnected {
+                                // Refresh dashboard right after mutating commands for instant feedback.
+                                next_refresh = Instant::now();
+                            }
                             if !disconnected && Instant::now() >= next_refresh {
-                                for command in [
-                                    Command::ListMonitors,
-                                    Command::ListWallpapers,
-                                    Command::GetStatus { monitor: None },
-                                    Command::GetProfile,
-                                    Command::GetPlaybackSettings,
-                                    Command::GetPerformanceSettings,
-                                ] {
-                                    match send(connection, command).await {
-                                        Ok(Response::MonitorList(items)) => {
-                                            if let Ok(mut state) = snapshot.lock() {
-                                                state.monitors = items;
-                                            }
-                                        }
-                                        Ok(Response::WallpaperList(items)) => {
-                                            if let Ok(mut state) = snapshot.lock() {
-                                                state.wallpapers = items;
-                                            }
-                                        }
-                                        Ok(Response::PlayerStatus(items)) => {
-                                            if let Ok(mut state) = snapshot.lock() {
-                                                state.players = items;
-                                            }
-                                        }
-                                        Ok(Response::Profile(profile)) => {
-                                            if let Ok(mut state) = snapshot.lock() {
-                                                state.profile = profile;
-                                            }
-                                        }
-                                        Ok(Response::PlaybackSettings(settings)) => {
-                                            if let Ok(mut state) = snapshot.lock() {
-                                                state.playback_settings = settings;
-                                            }
-                                        }
-                                        Ok(Response::PerformanceSettings {
-                                            target_fps,
-                                            ram_budget_mb,
-                                            quality,
-                                        }) => {
-                                            if let Ok(mut state) = snapshot.lock() {
-                                                state.target_fps = target_fps;
-                                                state.ram_budget_mb = ram_budget_mb;
-                                                state.quality = quality;
-                                            }
-                                        }
-                                        Ok(Response::Error { message, .. }) => {
-                                            if let Ok(mut state) = snapshot.lock() {
-                                                state.last_error = Some(message);
-                                            }
-                                        }
-                                        Ok(_) => {}
-                                        Err(error) => {
-                                            if let Ok(mut state) = snapshot.lock() {
-                                                state.last_error = Some(error);
-                                            }
-                                            disconnected = true;
-                                            break;
+                                match send(connection, Command::GetDashboardSnapshot).await {
+                                    Ok(Response::DashboardSnapshot(dash)) => {
+                                        let new_snap = Snapshot {
+                                            connected: true,
+                                            last_error: None,
+                                            monitors: dash.monitors,
+                                            wallpapers: dash.wallpapers,
+                                            playlists: dash.playlists,
+                                            players: dash.players,
+                                            profile: dash.profile,
+                                            playback_settings: dash.playback_settings,
+                                            target_fps: dash.target_fps,
+                                            ram_budget_mb: dash.ram_budget_mb,
+                                            quality: dash.quality,
+                                            extension_status: ExtensionStatusSnapshot {
+                                                registered: dash.extension_registered,
+                                                crx_available: dash.extension_crx_available,
+                                                crx_path: dash.extension_crx_path,
+                                                unpacked_available: dash
+                                                    .extension_unpacked_available,
+                                                browsers: dash
+                                                    .extension_browsers
+                                                    .into_iter()
+                                                    .map(|b| BrowserStatusEntry {
+                                                        name: b.name,
+                                                        installed: b.exe_path.is_some(),
+                                                        registered: b.registered,
+                                                    })
+                                                    .collect(),
+                                                extension_id: dash.extension_id,
+                                                version: dash.extension_version,
+                                                fetched: true,
+                                            },
+                                            active_playlist_id: dash.active_playlist_id,
+                                            auto_cycle_enabled: dash.auto_cycle_enabled,
+                                            auto_cycle_interval_secs: dash.auto_cycle_interval_secs,
+                                            auto_cycle_shuffle: dash.auto_cycle_shuffle,
+                                            last_updated: Some(Instant::now()),
+                                        };
+                                        if let Ok(mut state) = snapshot.lock() {
+                                            *state = Arc::new(new_snap);
                                         }
                                     }
+                                    Ok(Response::Error { message, .. }) => {
+                                        if let Ok(mut state) = snapshot.lock() {
+                                            let mut next = (**state).clone();
+                                            next.last_error = Some(message);
+                                            *state = Arc::new(next);
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => {
+                                        if let Ok(mut state) = snapshot.lock() {
+                                            let mut next = (**state).clone();
+                                            next.last_error = Some(error);
+                                            *state = Arc::new(next);
+                                        }
+                                        disconnected = true;
+                                    }
                                 }
-                                next_refresh = Instant::now()
-                                    + if active {
-                                        Duration::from_secs(2)
-                                    } else {
-                                        Duration::from_secs(30)
-                                    };
-                                if let Ok(mut state) = snapshot.lock() {
-                                    state.last_updated = Some(Instant::now());
+                                if !disconnected {
+                                    next_refresh = Instant::now()
+                                        + if active {
+                                            Duration::from_secs(2)
+                                        } else {
+                                            Duration::from_secs(30)
+                                        };
                                 }
                             }
                             if disconnected {
                                 client = None;
                                 if let Ok(mut state) = snapshot.lock() {
-                                    state.connected = false;
+                                    let mut next = (**state).clone();
+                                    next.connected = false;
+                                    *state = Arc::new(next);
                                 }
                             }
                         }
@@ -1036,7 +1742,8 @@ mod desktop {
         wallpaper_daemon::logging::init("ui", true);
         tracing::info!(start_hidden, "Rust Wallpaper UI starting");
         let theme = UiTheme::load();
-        let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+        let prefs = UiPrefs::load();
+        let snapshot = Arc::new(Mutex::new(Arc::new(Snapshot::default())));
         let visibility = Arc::new(AtomicBool::new(!start_hidden));
         let commands = spawn_worker(snapshot.clone(), visibility.clone());
         let (tray_tx, tray_rx) = mpsc::channel();
@@ -1076,14 +1783,20 @@ mod desktop {
             Box::new(move |cc| {
                 configure_fonts(&cc.egui_ctx);
                 theme.apply(&cc.egui_ctx);
-                let tray_icon = crate::tray::TrayIcon::start(cc.egui_ctx.clone(), tray_tx)
-                    .map_err(|error| {
-                        tracing::warn!(%error, "Could not create notification-area icon");
-                        error
-                    })
-                    .ok();
+                let tray_icon = crate::tray::TrayIcon::start(
+                    cc.egui_ctx.clone(),
+                    tray_tx,
+                    &prefs.hotkey_next_char,
+                    &prefs.hotkey_pause_char,
+                    &prefs.hotkey_mute_char,
+                )
+                .map_err(|error| {
+                    tracing::warn!(%error, "Could not create notification-area icon");
+                    error
+                })
+                .ok();
                 Ok(Box::new(DesktopApp::new(
-                    snapshot, commands, tray_rx, tray_icon, theme, visibility,
+                    snapshot, commands, tray_rx, tray_icon, theme, prefs, visibility,
                 )))
             }),
         );

@@ -1,8 +1,8 @@
 //! SQLite persistence for wallpaper metadata and library management.
 
 use crate::{
-    HardwareAcceleration, PlaybackConfig, ProcessingStatus, Wallpaper, WallpaperId, WallpaperKind,
-    WallpaperMetadata,
+    HardwareAcceleration, PlaybackConfig, ProcessingStatus, ScheduleTimeSlot, Wallpaper,
+    WallpaperId, WallpaperKind, WallpaperMetadata, WallpaperPlaylist,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -52,6 +52,11 @@ impl WallpaperLibrary {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA mmap_size = 268435456;
+            PRAGMA temp_store = MEMORY;
+
             CREATE TABLE IF NOT EXISTS wallpapers (
                 id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -73,6 +78,10 @@ impl WallpaperLibrary {
                 mute INTEGER NOT NULL DEFAULT 1,
                 volume INTEGER NOT NULL DEFAULT 100,
                 hwdec TEXT NOT NULL DEFAULT 'auto',
+                peak_ram_mb INTEGER,
+                peak_cpu_percent REAL,
+                video_rotation INTEGER DEFAULT 0,
+                is_favorite INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
@@ -88,6 +97,16 @@ impl WallpaperLibrary {
                 assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
                 FOREIGN KEY(wallpaper_id) REFERENCES wallpapers(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS playlists (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                wallpaper_ids_json TEXT NOT NULL,
+                interval_secs INTEGER NOT NULL DEFAULT 1800,
+                shuffle INTEGER NOT NULL DEFAULT 0,
+                time_slot TEXT NOT NULL DEFAULT 'all_day',
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
             "#,
         )?;
 
@@ -97,6 +116,19 @@ impl WallpaperLibrary {
             .query_map([], |row| row.get::<_, String>(1))?
             .filter_map(Result::ok)
             .collect();
+
+        // Migrate playlists table if time_slot column is missing
+        let mut pl_pragma = conn.prepare("PRAGMA table_info(playlists);")?;
+        let pl_cols: Vec<String> = pl_pragma
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .collect();
+        if !pl_cols.contains(&"time_slot".to_string()) {
+            let _ = conn.execute(
+                "ALTER TABLE playlists ADD COLUMN time_slot TEXT NOT NULL DEFAULT 'all_day';",
+                [],
+            );
+        }
 
         let migrations = [
             ("aspect_ratio", "ALTER TABLE wallpapers ADD COLUMN aspect_ratio REAL;"),
@@ -110,6 +142,10 @@ impl WallpaperLibrary {
             ),
             ("processing_error", "ALTER TABLE wallpapers ADD COLUMN processing_error TEXT;"),
             ("source_mtime", "ALTER TABLE wallpapers ADD COLUMN source_mtime INTEGER;"),
+            ("peak_ram_mb", "ALTER TABLE wallpapers ADD COLUMN peak_ram_mb INTEGER;"),
+            ("peak_cpu_percent", "ALTER TABLE wallpapers ADD COLUMN peak_cpu_percent REAL;"),
+            ("video_rotation", "ALTER TABLE wallpapers ADD COLUMN video_rotation INTEGER DEFAULT 0;"),
+            ("is_favorite", "ALTER TABLE wallpapers ADD COLUMN is_favorite INTEGER NOT NULL DEFAULT 0;"),
         ];
 
         for (col_name, sql) in migrations {
@@ -213,8 +249,8 @@ impl WallpaperLibrary {
             INSERT INTO wallpapers (
                 id, title, source, kind, duration_secs, width, height, aspect_ratio, fps, codec,
                 file_size, resolution_category, processing_state, processing_error, thumbnail_path,
-                source_mtime, loop_playback, mute, volume, hwdec
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                source_mtime, loop_playback, mute, volume, hwdec, peak_ram_mb, peak_cpu_percent, video_rotation, is_favorite
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
             ON CONFLICT(id) DO UPDATE SET
                 title = excluded.title,
                 source = excluded.source,
@@ -234,7 +270,11 @@ impl WallpaperLibrary {
                 loop_playback = excluded.loop_playback,
                 mute = excluded.mute,
                 volume = excluded.volume,
-                hwdec = excluded.hwdec;
+                hwdec = excluded.hwdec,
+                peak_ram_mb = COALESCE(excluded.peak_ram_mb, wallpapers.peak_ram_mb),
+                peak_cpu_percent = COALESCE(excluded.peak_cpu_percent, wallpapers.peak_cpu_percent),
+                video_rotation = COALESCE(excluded.video_rotation, wallpapers.video_rotation),
+                is_favorite = excluded.is_favorite;
             "#,
             params![
                 wp.id.to_string(),
@@ -261,6 +301,10 @@ impl WallpaperLibrary {
                 if wp.config.mute { 1 } else { 0 },
                 wp.config.volume,
                 hwdec_str,
+                wp.metadata.peak_ram_mb,
+                wp.metadata.peak_cpu_percent,
+                wp.config.video_rotation,
+                if wp.metadata.is_favorite { 1 } else { 0 },
             ],
         )?;
         Ok(())
@@ -273,7 +317,7 @@ impl WallpaperLibrary {
             r#"
             SELECT id, title, source, kind, duration_secs, width, height, aspect_ratio, fps, codec,
                    file_size, resolution_category, processing_state, processing_error, thumbnail_path,
-                   source_mtime, loop_playback, mute, volume, hwdec
+                   source_mtime, loop_playback, mute, volume, hwdec, peak_ram_mb, peak_cpu_percent, video_rotation, is_favorite
             FROM wallpapers WHERE id = ?1;
             "#,
         )?;
@@ -292,7 +336,7 @@ impl WallpaperLibrary {
             r#"
             SELECT id, title, source, kind, duration_secs, width, height, aspect_ratio, fps, codec,
                    file_size, resolution_category, processing_state, processing_error, thumbnail_path,
-                   source_mtime, loop_playback, mute, volume, hwdec
+                   source_mtime, loop_playback, mute, volume, hwdec, peak_ram_mb, peak_cpu_percent, video_rotation, is_favorite
             FROM wallpapers ORDER BY created_at DESC;
             "#,
         )?;
@@ -312,7 +356,7 @@ impl WallpaperLibrary {
             r#"
             SELECT id, title, source, kind, duration_secs, width, height, aspect_ratio, fps, codec,
                    file_size, resolution_category, processing_state, processing_error, thumbnail_path,
-                   source_mtime, loop_playback, mute, volume, hwdec
+                   source_mtime, loop_playback, mute, volume, hwdec, peak_ram_mb, peak_cpu_percent, video_rotation, is_favorite
             FROM wallpapers
             WHERE processing_state IN ('pending', 'processing')
             ORDER BY created_at ASC;
@@ -439,10 +483,13 @@ impl WallpaperLibrary {
             .unwrap_or("")
             .to_lowercase();
 
-        if !matches!(
-            extension.as_str(),
-            "mp4" | "webm" | "mkv" | "mov" | "gif" | "jpg" | "jpeg" | "png" | "webp" | "bmp"
-        ) {
+        let is_web = matches!(extension.as_str(), "html" | "htm");
+        if !is_web
+            && !matches!(
+                extension.as_str(),
+                "mp4" | "webm" | "mkv" | "mov" | "gif" | "jpg" | "jpeg" | "png" | "webp" | "bmp"
+            )
+        {
             return Err(LibraryError::UnsupportedFormat(extension));
         }
 
@@ -455,7 +502,12 @@ impl WallpaperLibrary {
         });
 
         let source = path_ref.to_string_lossy().to_string();
-        let mut wp = Wallpaper::new(title, source, WallpaperKind::Video);
+        let kind = if is_web {
+            WallpaperKind::Web
+        } else {
+            WallpaperKind::Video
+        };
+        let mut wp = Wallpaper::new(title, source, kind);
         if let Ok(meta) = std::fs::metadata(path_ref) {
             wp.metadata.file_size = Some(meta.len());
             if let Ok(mtime) = meta.modified() {
@@ -493,6 +545,10 @@ impl WallpaperLibrary {
         let mute: i32 = row.get(17)?;
         let volume: u32 = row.get(18)?;
         let hwdec_str: String = row.get(19)?;
+        let peak_ram_mb: Option<u32> = row.get(20).ok();
+        let peak_cpu_percent: Option<f64> = row.get(21).ok();
+        let video_rotation: Option<u32> = row.get(22).ok();
+        let is_favorite: bool = row.get::<_, i32>(23).unwrap_or(0) != 0;
 
         let id = id_str.parse::<WallpaperId>().map_err(|e| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -540,15 +596,133 @@ impl WallpaperLibrary {
                 processing_error,
                 thumbnail_path,
                 source_mtime,
+                peak_ram_mb,
+                peak_cpu_percent,
+                is_favorite,
             },
             config: PlaybackConfig {
                 loop_playback: loop_playback != 0,
                 mute: mute != 0,
                 volume,
                 hardware_acceleration: hwdec,
+                video_rotation,
                 ..Default::default()
             },
         })
+    }
+
+    /// Records initial 10-second peak RAM and CPU benchmark metrics for a wallpaper.
+    pub fn update_benchmark(
+        &self,
+        id: WallpaperId,
+        peak_ram_mb: u32,
+        peak_cpu_percent: f64,
+    ) -> Result<bool, LibraryError> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute(
+            "UPDATE wallpapers SET peak_ram_mb = ?2, peak_cpu_percent = ?3 WHERE id = ?1;",
+            params![id.to_string(), peak_ram_mb, peak_cpu_percent],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Updates playback rotation (e.g. 0, 90, 180, 270) for a wallpaper.
+    pub fn update_rotation(&self, id: WallpaperId, rotation: u32) -> Result<bool, LibraryError> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute(
+            "UPDATE wallpapers SET video_rotation = ?2 WHERE id = ?1;",
+            params![id.to_string(), rotation],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Marks or unmarks a wallpaper as a favorite.
+    pub fn set_favorite(&self, id: WallpaperId, favorite: bool) -> Result<bool, LibraryError> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute(
+            "UPDATE wallpapers SET is_favorite = ?2 WHERE id = ?1;",
+            params![id.to_string(), if favorite { 1 } else { 0 }],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Creates or updates a saved wallpaper playlist.
+    pub fn save_playlist(&self, pl: &WallpaperPlaylist) -> Result<(), LibraryError> {
+        let conn = self.conn.lock().unwrap();
+        let json_ids = serde_json::to_string(&pl.wallpaper_ids).unwrap_or_else(|_| "[]".into());
+        let time_slot_str = match pl.time_slot {
+            ScheduleTimeSlot::AllDay => "all_day",
+            ScheduleTimeSlot::Daytime => "daytime",
+            ScheduleTimeSlot::Sunset => "sunset",
+            ScheduleTimeSlot::Nighttime => "nighttime",
+        };
+        conn.execute(
+            r#"
+            INSERT INTO playlists (id, name, wallpaper_ids_json, interval_secs, shuffle, time_slot, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                wallpaper_ids_json = excluded.wallpaper_ids_json,
+                interval_secs = excluded.interval_secs,
+                shuffle = excluded.shuffle,
+                time_slot = excluded.time_slot;
+            "#,
+            params![
+                pl.id,
+                pl.name,
+                json_ids,
+                pl.interval_secs,
+                if pl.shuffle { 1 } else { 0 },
+                time_slot_str,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Retrieves all saved playlists in chronological order.
+    pub fn list_playlists(&self) -> Result<Vec<WallpaperPlaylist>, LibraryError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, wallpaper_ids_json, interval_secs, shuffle, created_at, time_slot FROM playlists ORDER BY created_at ASC;",
+        )?;
+        let iter = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let json_ids: String = row.get(2)?;
+            let interval_secs: u64 = row.get(3)?;
+            let shuffle: i32 = row.get(4)?;
+            let created_at: String = row.get(5)?;
+            let time_slot_str: Option<String> = row.get(6).ok();
+            let time_slot = match time_slot_str.as_deref() {
+                Some("daytime") => ScheduleTimeSlot::Daytime,
+                Some("sunset") => ScheduleTimeSlot::Sunset,
+                Some("nighttime") => ScheduleTimeSlot::Nighttime,
+                _ => ScheduleTimeSlot::AllDay,
+            };
+            let wallpaper_ids: Vec<WallpaperId> =
+                serde_json::from_str(&json_ids).unwrap_or_default();
+            Ok(WallpaperPlaylist {
+                id,
+                name,
+                wallpaper_ids,
+                interval_secs,
+                shuffle: shuffle != 0,
+                created_at,
+                time_slot,
+            })
+        })?;
+        let mut playlists = Vec::new();
+        for pl in iter {
+            playlists.push(pl?);
+        }
+        Ok(playlists)
+    }
+
+    /// Deletes a saved playlist by ID.
+    pub fn delete_playlist(&self, id: &str) -> Result<bool, LibraryError> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute("DELETE FROM playlists WHERE id = ?1;", params![id])?;
+        Ok(affected > 0)
     }
 }
 
@@ -750,5 +924,24 @@ mod tests {
         assert_eq!(categorize_resolution(1280, 720), "720p HD");
         assert_eq!(categorize_resolution(854, 480), "480p SD");
         assert_eq!(categorize_resolution(640, 360), "SD");
+    }
+
+    #[test]
+    fn test_set_favorite_persistence() {
+        let library = WallpaperLibrary::in_memory().unwrap();
+        let wp = Wallpaper::new("Favorite Loop", "fav.mp4", WallpaperKind::Video);
+        library.insert(&wp).unwrap();
+
+        let fetched = library.get(wp.id).unwrap().unwrap();
+        assert!(!fetched.metadata.is_favorite);
+
+        assert!(library.set_favorite(wp.id, true).unwrap());
+        let fetched = library.get(wp.id).unwrap().unwrap();
+        assert!(fetched.metadata.is_favorite);
+        let listed = library.list().unwrap();
+        assert!(listed[0].metadata.is_favorite);
+
+        assert!(library.set_favorite(wp.id, false).unwrap());
+        assert!(!library.get(wp.id).unwrap().unwrap().metadata.is_favorite);
     }
 }

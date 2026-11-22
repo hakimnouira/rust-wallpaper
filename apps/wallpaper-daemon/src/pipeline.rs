@@ -20,10 +20,22 @@ pub fn cleanup_orphaned_thumbnails(library: &WallpaperLibrary, thumb_dir: &Path)
         return;
     }
     let existing_wallpapers = library.list().unwrap_or_default();
-    let known_ids: std::collections::HashSet<String> = existing_wallpapers
-        .iter()
-        .map(|w| w.id.to_string())
-        .collect();
+    cleanup_orphaned_thumbnails_for_ids(
+        existing_wallpapers
+            .iter()
+            .map(|wallpaper| wallpaper.id.to_string()),
+        thumb_dir,
+    );
+}
+
+fn cleanup_orphaned_thumbnails_for_ids(
+    known_ids: impl IntoIterator<Item = String>,
+    thumb_dir: &Path,
+) {
+    if !thumb_dir.is_dir() {
+        return;
+    }
+    let known_ids: std::collections::HashSet<String> = known_ids.into_iter().collect();
 
     if let Ok(entries) = std::fs::read_dir(thumb_dir) {
         for entry in entries.flatten() {
@@ -36,7 +48,7 @@ pub fn cleanup_orphaned_thumbnails(library: &WallpaperLibrary, thumb_dir: &Path)
                     .unwrap_or(false)
             {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if !known_ids.contains(stem) {
+                    if !stem.starts_with("online_") && !known_ids.contains(stem) {
                         info!(thumbnail = %path.display(), "Pruning orphaned thumbnail during startup cleanup");
                         let _ = std::fs::remove_file(&path);
                     }
@@ -93,8 +105,11 @@ impl ExtractionPipeline {
         if let Err(error) = thread::Builder::new()
             .name("thumbnail-startup-recovery".into())
             .spawn(move || {
-                cleanup_orphaned_thumbnails(&library, &thumbnail_dir);
                 if let Ok(wallpapers) = library.list() {
+                    cleanup_orphaned_thumbnails_for_ids(
+                        wallpapers.iter().map(|wallpaper| wallpaper.id.to_string()),
+                        &thumbnail_dir,
+                    );
                     for wallpaper in wallpapers {
                         let thumb_missing = wallpaper
                             .metadata

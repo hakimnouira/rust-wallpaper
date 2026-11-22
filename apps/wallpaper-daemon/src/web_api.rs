@@ -16,6 +16,24 @@ use crate::ipc::PendingRequest;
 
 pub const DEFAULT_PORT: u16 = 24242;
 
+/// Retrieves the existing API bearer token or securely generates and persists a new 32-hex secret token.
+pub fn get_or_create_api_token() -> String {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData\RustWallpaper"));
+    let token_file = local_app_data.join("RustWallpaper").join("api_token.txt");
+    if let Ok(token) = std::fs::read_to_string(&token_file) {
+        let trimmed = token.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let new_token = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+    let _ = std::fs::create_dir_all(token_file.parent().unwrap_or(&local_app_data));
+    let _ = std::fs::write(&token_file, &new_token);
+    new_token
+}
+
 /// Starts the embedded Web API HTTP server in a background thread.
 pub fn start(tx: SyncSender<PendingRequest>, port: u16) {
     std::thread::Builder::new()
@@ -179,6 +197,52 @@ async fn handle_connection(
     }
 
     match (method, path) {
+        ("GET", "/api/auth/token") => {
+            let token = get_or_create_api_token();
+            let json = serde_json::json!({ "token": token });
+            send_json_response(&mut stream, 200, "OK", &json).await?;
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Verify Bearer authorization token or our exact signed companion extension Origin
+    if path.starts_with("/api/wallpaper") || path.starts_with("/api/action") {
+        let expected = get_or_create_api_token();
+        let expected_ext_origin = format!("chrome-extension://{}", wallpaper_windows::EXTENSION_ID);
+        let auth_header = header_str.lines().find_map(|line| {
+            line.split_once(':')
+                .filter(|(name, _)| name.trim().eq_ignore_ascii_case("authorization"))
+                .map(|(_, value)| value.trim().to_owned())
+        });
+        let token_header = header_str.lines().find_map(|line| {
+            line.split_once(':')
+                .filter(|(name, _)| name.trim().eq_ignore_ascii_case("x-rustwallpaper-token"))
+                .map(|(_, value)| value.trim().to_owned())
+        });
+        let is_authed = origin.as_deref() == Some(expected_ext_origin.as_str())
+            || auth_header.as_deref().is_some_and(|h| {
+                h.strip_prefix("Bearer ")
+                    .map_or(false, |tok| tok.trim() == expected)
+            })
+            || token_header.as_deref().is_some_and(|h| h == expected)
+            || path.contains(&format!("token={expected}"));
+
+        if !is_authed {
+            warn!(
+                path,
+                "Rejected Web API request: missing or invalid bearer token"
+            );
+            let json = serde_json::json!({
+                "error": "Unauthorized",
+                "message": "Missing or invalid Bearer authorization token"
+            });
+            send_json_response(&mut stream, 401, "Unauthorized", &json).await?;
+            return Ok(());
+        }
+    }
+
+    match (method, path) {
         ("GET", "/api/status") | ("GET", "/api/status/") => {
             handle_status(&mut stream, &tx).await?;
         }
@@ -279,98 +343,175 @@ async fn handle_wallpaper(
         return Ok(());
     }
 
-    let resolved = wallpaper_core::resolve_web_media_info(&raw_url);
-    let url = resolved.media_url;
-
-    // Determine filename
-    let parsed_filename = url
-        .split('?')
-        .next()
-        .and_then(|u| u.split('/').next_back())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("web_wallpaper.mp4");
-
-    let has_ext = parsed_filename.ends_with(".mp4")
-        || parsed_filename.ends_with(".webm")
-        || parsed_filename.ends_with(".mkv")
-        || parsed_filename.ends_with(".mov")
-        || parsed_filename.ends_with(".gif")
-        || parsed_filename.ends_with(".jpg")
-        || parsed_filename.ends_with(".png")
-        || parsed_filename.ends_with(".webp");
-
-    let stem = if has_ext {
-        parsed_filename
-            .rsplit_once('.')
-            .map(|(s, _)| s)
-            .unwrap_or(parsed_filename)
+    let (final_dest, title) = if let Some((steam_path, steam_title)) = {
+        if raw_url.contains("steamcommunity.com") && raw_url.contains("id=") {
+            raw_url
+                .split("id=")
+                .nth(1)
+                .and_then(|s| s.split('&').next())
+                .and_then(|id_str| {
+                    wallpaper_core::scan_wallpaper_engine_items(&[])
+                        .into_iter()
+                        .find(|i| i.id == id_str && i.is_compatible_video)
+                        .map(|i| (i.file_path, i.title))
+                })
+        } else {
+            None
+        }
+    } {
+        let title = req
+            .title
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or(steam_title);
+        (steam_path, title)
     } else {
-        parsed_filename
-    };
-
-    let ext = if has_ext {
-        parsed_filename
-            .rsplit_once('.')
-            .map(|(_, e)| e)
-            .unwrap_or("mp4")
-    } else {
-        "mp4"
-    };
-
-    let safe_stem: String = stem
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '_'
+        let resolved = match tokio::task::spawn_blocking({
+            let raw_url = raw_url.clone();
+            move || {
+                wallpaper_core::resolve_web_media_info_with_policy(
+                    &raw_url,
+                    &std::sync::atomic::AtomicBool::new(false),
+                    false,
+                )
             }
         })
-        .collect();
-    let safe_name = if safe_stem.is_empty() {
-        "web_wallpaper".to_string()
-    } else {
-        safe_stem
-    };
+        .await
+        {
+            Ok(Ok(resolved)) => resolved,
+            Ok(Err(error)) => {
+                let json = serde_json::json!({
+                    "error": "Media Resolution Failed",
+                    "message": error.to_string()
+                });
+                send_json_response(stream, 422, "Unprocessable Entity", &json).await?;
+                return Ok(());
+            }
+            Err(error) => {
+                let json = serde_json::json!({
+                    "error": "Media Resolution Failed",
+                    "message": format!("Media resolver failed: {error}")
+                });
+                send_json_response(stream, 502, "Bad Gateway", &json).await?;
+                return Ok(());
+            }
+        };
+        let url = resolved.media_url;
 
-    let local_app_data = std::env::var_os("LOCALAPPDATA").unwrap_or_default();
-    let downloads_dir = PathBuf::from(local_app_data)
-        .join("RustWallpaper")
-        .join("downloads");
-    let dest = downloads_dir.join(format!("{safe_name}.{ext}"));
+        // Determine filename
+        let parsed_filename = url
+            .split('?')
+            .next()
+            .and_then(|u| u.split('/').next_back())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("web_wallpaper.mp4");
 
-    let title = req
-        .title
-        .filter(|t| !t.trim().is_empty())
-        .or(resolved.title)
-        .unwrap_or_else(|| safe_name.replace('_', " "));
+        let parsed_filename_lower = parsed_filename.to_ascii_lowercase();
+        let has_ext = [
+            ".mp4", ".webm", ".mkv", ".mov", ".gif", ".jpg", ".jpeg", ".png", ".webp", ".bmp",
+        ]
+        .iter()
+        .any(|extension| parsed_filename_lower.ends_with(extension));
 
-    // Download in blocking task
-    let download_url = url.clone();
-    let dest_clone = dest.clone();
-    let download_result = tokio::task::spawn_blocking(move || {
-        wallpaper_core::download_online_file(&download_url, &dest_clone)
-    })
-    .await?;
+        let stem = if has_ext {
+            parsed_filename
+                .rsplit_once('.')
+                .map(|(s, _)| s)
+                .unwrap_or(parsed_filename)
+        } else {
+            parsed_filename
+        };
 
-    if let Err(e) = download_result {
-        let json = serde_json::json!({
-            "error": "Download Failed",
-            "message": format!("Failed to download video file: {e}")
-        });
-        send_json_response(stream, 502, "Bad Gateway", &json).await?;
-        return Ok(());
-    }
+        let ext = if has_ext {
+            parsed_filename_lower
+                .rsplit_once('.')
+                .map(|(_, e)| e)
+                .unwrap_or("mp4")
+        } else if url.to_ascii_lowercase().contains("image") {
+            "jpg"
+        } else {
+            "mp4"
+        };
 
-    let mut final_dest = dest.clone();
-    if let Some(detected_ext) = wallpaper_core::detect_media_extension_from_magic_bytes(&dest) {
-        let candidate = dest.with_extension(detected_ext);
-        if candidate != dest {
-            if let Ok(()) = std::fs::rename(&dest, &candidate) {
-                final_dest = candidate;
+        let safe_stem: String = stem
+            .chars()
+            .map(|c| {
+                if c.is_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let safe_name = if safe_stem.is_empty() {
+            "web_wallpaper".to_string()
+        } else {
+            safe_stem
+        };
+
+        let local_app_data = std::env::var_os("LOCALAPPDATA").unwrap_or_default();
+        let downloads_dir = PathBuf::from(local_app_data)
+            .join("RustWallpaper")
+            .join("downloads");
+        let dest = downloads_dir.join(format!("{safe_name}.{ext}"));
+
+        let title = req
+            .title
+            .filter(|t| !t.trim().is_empty())
+            .or(resolved.title)
+            .unwrap_or_else(|| safe_name.replace('_', " "));
+
+        // Download in blocking task
+        let download_url = url.clone();
+        let dest_clone = dest.clone();
+        let download_result = tokio::task::spawn_blocking(move || {
+            wallpaper_core::download_online_file(&download_url, &dest_clone)
+        })
+        .await?;
+
+        if let Err(e) = download_result {
+            let json = serde_json::json!({
+                "error": "Download Failed",
+                "message": format!("Failed to download video file: {e}")
+            });
+            send_json_response(stream, 502, "Bad Gateway", &json).await?;
+            return Ok(());
+        }
+
+        let is_html = if let Ok(mut f) = std::fs::File::open(&dest) {
+            let mut buf = [0u8; 128];
+            if let Ok(n) = std::io::Read::read(&mut f, &mut buf) {
+                let s = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                s.contains("<!doctype")
+                    || s.contains("<html")
+                    || s.contains("<body")
+                    || s.contains("<head")
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if is_html {
+            let _ = std::fs::remove_file(&dest);
+            let json = serde_json::json!({
+                "error": "Invalid Media Format",
+                "message": "Downloaded content is a web page HTML document, not a playable video or wallpaper file."
+            });
+            send_json_response(stream, 422, "Unprocessable Entity", &json).await?;
+            return Ok(());
+        }
+
+        let mut final_dest = dest.clone();
+        if let Some(detected_ext) = wallpaper_core::detect_media_extension_from_magic_bytes(&dest) {
+            let candidate = dest.with_extension(detected_ext);
+            if candidate != dest {
+                if let Ok(()) = std::fs::rename(&dest, &candidate) {
+                    final_dest = candidate;
+                }
             }
         }
-    }
+        (final_dest, title)
+    };
 
     // Import into library via IPC
     let import_cmd = Command::ImportWallpaper {
@@ -403,36 +544,118 @@ async fn handle_wallpaper(
     // Find the newly imported wallpaper in the library
     let mut wallpaper_id = None;
     let mut resolved_title = title.clone();
-    if let Ok(Response::WallpaperList(list)) = dispatch_command(tx, Command::ListWallpapers).await {
-        let dest_str = dest.to_string_lossy();
-        if let Some(wp) = list
-            .iter()
-            .find(|w| w.source() == dest_str || std::path::Path::new(w.source()) == dest)
+    let mut width = None;
+    let mut height = None;
+    let mut media_type = "video";
+    let downloaded_ext = final_dest
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if matches!(
+        downloaded_ext.as_str(),
+        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp"
+    ) {
+        media_type = "image";
+    }
+
+    // Metadata extraction is asynchronous in the library. Wait briefly for the actual
+    // dimensions so the extension can report what was downloaded, not just the URL hint.
+    let metadata_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(Response::WallpaperList(list)) =
+            dispatch_command(tx, Command::ListWallpapers).await
         {
-            wallpaper_id = Some(wp.id);
-            resolved_title = wp.title().to_string();
+            let final_dest_str = final_dest.to_string_lossy();
+            if let Some(wp) = list.iter().find(|w| {
+                w.source() == final_dest_str
+                    || std::path::Path::new(w.source()) == final_dest.as_path()
+            }) {
+                wallpaper_id = Some(wp.id);
+                resolved_title = wp.title().to_string();
+                width = wp.metadata.width;
+                height = wp.metadata.height;
+                if (width.is_some() && height.is_some() && !wp.metadata.is_processing())
+                    || wp.metadata.is_failed()
+                {
+                    break;
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= metadata_deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Read image dimensions directly if the asynchronous worker has not finished yet.
+    if media_type == "image" && (width.is_none() || height.is_none()) {
+        if let Ok(reader) = image::ImageReader::open(&final_dest) {
+            if let Ok(reader) = reader.with_guessed_format() {
+                if let Ok(image) = reader.decode() {
+                    width = Some(image.width());
+                    height = Some(image.height());
+                }
+            }
         }
     }
 
     // Apply wallpaper if requested (defaults to true)
     let should_apply = req.apply.unwrap_or(true);
+    let mut applied = false;
     if should_apply {
         if let Some(id) = wallpaper_id {
             let apply_cmd = Command::ApplyWallpaper {
                 wallpaper_id: id,
                 monitor: req.monitor.clone(),
             };
-            let _ = dispatch_command(tx, apply_cmd).await;
+            match dispatch_command(tx, apply_cmd).await {
+                Ok(Response::Accepted) => applied = true,
+                Ok(Response::Error { message, .. }) => {
+                    let json = serde_json::json!({
+                        "error": "Wallpaper Apply Failed",
+                        "message": format!("Downloaded and added to the library, but could not apply it: {message}"),
+                        "downloaded": true,
+                        "wallpaper_id": id.to_string(),
+                        "media_type": media_type,
+                        "width": width,
+                        "height": height
+                    });
+                    send_json_response(stream, 422, "Unprocessable Entity", &json).await?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    let json = serde_json::json!({
+                        "error": "Wallpaper Apply Failed",
+                        "message": format!("Downloaded and added to the library, but the app could not apply it: {error}"),
+                        "downloaded": true,
+                        "wallpaper_id": id.to_string(),
+                        "media_type": media_type,
+                        "width": width,
+                        "height": height
+                    });
+                    send_json_response(stream, 502, "Bad Gateway", &json).await?;
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
     }
 
     let payload = serde_json::json!({
         "success": true,
-        "message": if should_apply { "Wallpaper downloaded and applied successfully" } else { "Wallpaper downloaded and added to library" },
+        "message": if applied { "Wallpaper downloaded and applied successfully" } else { "Wallpaper downloaded and added to library" },
+        "applied": applied,
         "wallpaper_id": wallpaper_id.map(|id| id.to_string()),
         "title": resolved_title,
-        "source": dest.to_string_lossy(),
-        "applied": should_apply,
+        "media_type": media_type,
+        "width": width,
+        "height": height,
+        "resolution": match (width, height) {
+            (Some(width), Some(height)) => format!("{width} × {height}"),
+            _ => "Resolution unavailable".to_string()
+        },
+        "source": final_dest.to_string_lossy(),
         "monitor": req.monitor.unwrap_or_else(|| "all".into())
     });
 
@@ -754,7 +977,7 @@ async fn send_cors_preflight(
         "HTTP/1.1 204 No Content\r\n\
 Access-Control-Allow-Origin: chrome-extension://{}\r\n\
 Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
+Access-Control-Allow-Headers: Content-Type, Authorization, X-RustWallpaper-Token\r\n\
 Access-Control-Max-Age: 86400\r\n\
 Vary: Origin\r\n\
 Content-Length: 0\r\n\
@@ -778,7 +1001,7 @@ async fn send_json_response(
 Content-Type: application/json; charset=utf-8\r\n\
 Access-Control-Allow-Origin: chrome-extension://{}\r\n\
 Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
-Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
+Access-Control-Allow-Headers: Content-Type, Authorization, X-RustWallpaper-Token\r\n\
 Vary: Origin\r\n\
 Content-Length: {}\r\n\
 Connection: close\r\n\r\n\

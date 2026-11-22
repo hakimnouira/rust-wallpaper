@@ -12,25 +12,26 @@ pub mod manager;
 pub mod mpv;
 pub mod policy;
 pub mod single_instance;
+pub mod web_player;
 pub mod window;
 
 pub use autostart::{
     get_autostart_command, is_autostart_enabled, set_autostart, set_autostart_for,
 };
 pub use browser_extension::{
-    enable_browser_shortcut_integration, ensure_canonical_crx, ensure_canonical_unpacked,
-    find_crx_candidate, find_installed_browser, find_unpacked_candidate,
-    is_browser_extension_registered, launch_browser_with_extension, register_browser_extension,
-    register_browser_extension_elevated, unregister_browser_extension, EXTENSION_ID,
-    EXTENSION_VERSION, UPDATE_URL,
+    disable_extension, enable_browser_shortcut_integration, enable_extension, ensure_canonical_crx,
+    ensure_canonical_unpacked, find_crx_candidate, find_installed_browser, find_unpacked_candidate,
+    get_extension_status, is_browser_extension_registered, launch_browser_with_extension,
+    register_browser_extension, register_browser_extension_elevated, unregister_browser_extension,
+    BrowserDetection, ExtensionStatus, EXTENSION_ID, EXTENSION_VERSION, UPDATE_URL,
 };
 
 pub use desktop_host::{ensure_desktop_host, DesktopHost, DesktopHostDiagnostics, DesktopHostKind};
-pub use events::{ListenerPoll, SystemEventListener, SystemPlatformEvent};
+pub use events::{query_power_status, ListenerPoll, SystemEventListener, SystemPlatformEvent};
 pub use fullscreen::{
     check_foreground_fullscreen, FullscreenProbe, FullscreenStatus, FullscreenTracker,
 };
-pub use manager::{WallpaperManager, WallpaperManagerError};
+pub use manager::{WallpaperManager, WallpaperManagerError, SPAN_DEVICE_NAME};
 pub use mpv::{find_mpv_executable, MpvError, MpvLaunchConfig, MpvPlayer};
 pub use policy::{
     ActualPlayback, ControlCommand, ForegroundObservation, MonitorStatus, PendingWork,
@@ -40,6 +41,7 @@ pub use policy::{
 pub use single_instance::{
     focus_existing_ui_window, SingleInstanceGuard, SingleInstanceRole, UI_WINDOW_TITLE,
 };
+pub use web_player::{find_web_browser_executable, WebPlayer, WebPlayerError};
 pub use window::WallpaperWindow;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

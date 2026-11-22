@@ -101,8 +101,46 @@ pub enum Command {
         quality: VideoQuality,
     },
     GetPerformanceSettings,
+    SetWallpaperRotation {
+        wallpaper_id: WallpaperId,
+        rotation: u32,
+    },
+    BenchmarkWallpaper {
+        wallpaper_id: WallpaperId,
+        monitor: Option<String>,
+    },
+    SavePlaylist {
+        playlist: wallpaper_core::WallpaperPlaylist,
+    },
+    ListPlaylists,
+    DeletePlaylist {
+        playlist_id: String,
+    },
     /// Stop the daemon and all wallpaper players after acknowledging the request.
     Quit,
+    /// Query the full status of the browser companion extension.
+    GetExtensionStatus,
+    /// Enable or disable the browser companion extension.
+    SetExtensionEnabled {
+        enabled: bool,
+    },
+    /// Fetch all dashboard state in a single batched IPC round-trip.
+    GetDashboardSnapshot,
+    /// Mark or unmark a wallpaper as favorite.
+    SetFavorite {
+        wallpaper_id: WallpaperId,
+        favorite: bool,
+    },
+    /// Persist and activate a playlist (or clear with `None`) in the daemon.
+    SetActivePlaylist {
+        playlist_id: Option<String>,
+    },
+    /// Persist auto-cycle rotation settings in the daemon.
+    SetAutoCycle {
+        enabled: bool,
+        interval_secs: u64,
+        shuffle: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +162,44 @@ pub struct PlayerStatusInfo {
     pub memory_bytes: u64,
     pub suspended: bool,
     pub suspension_reasons: Vec<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Complete batched snapshot returned by `Command::GetDashboardSnapshot`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DashboardSnapshot {
+    pub monitors: Vec<MonitorInfo>,
+    pub wallpapers: Vec<Wallpaper>,
+    pub playlists: Vec<wallpaper_core::WallpaperPlaylist>,
+    pub players: Vec<PlayerStatusInfo>,
+    pub profile: PerformanceProfile,
+    pub playback_settings: PlaybackSettings,
+    pub target_fps: Option<u32>,
+    pub ram_budget_mb: Option<u32>,
+    pub quality: VideoQuality,
+    pub extension_registered: bool,
+    pub extension_crx_available: bool,
+    pub extension_crx_path: Option<String>,
+    pub extension_unpacked_available: bool,
+    pub extension_browsers: Vec<BrowserInfo>,
+    pub extension_id: String,
+    pub extension_version: String,
+    #[serde(default)]
+    pub active_playlist_id: Option<String>,
+    #[serde(default)]
+    pub auto_cycle_enabled: bool,
+    #[serde(default)]
+    pub auto_cycle_interval_secs: u64,
+    #[serde(default)]
+    pub auto_cycle_shuffle: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserInfo {
+    pub name: String,
+    pub exe_path: Option<String>,
+    pub registered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -151,6 +227,10 @@ impl ResponseEnvelope {
             request_id,
             result,
         }
+    }
+
+    pub fn success(request_id: Uuid, result: Response) -> Self {
+        Self::new(request_id, result)
     }
 
     pub fn error(request_id: Uuid, code: ErrorCode, message: impl Into<String>) -> Self {
@@ -183,6 +263,18 @@ pub enum Response {
         ram_budget_mb: Option<u32>,
         quality: VideoQuality,
     },
+    PlaylistList(Vec<wallpaper_core::WallpaperPlaylist>),
+    /// Browser companion extension status — serialized from wallpaper_windows::ExtensionStatus.
+    ExtensionStatus {
+        registered: bool,
+        crx_available: bool,
+        crx_path: Option<String>,
+        unpacked_available: bool,
+        browsers: Vec<BrowserInfo>,
+        extension_id: String,
+        version: String,
+    },
+    DashboardSnapshot(Box<DashboardSnapshot>),
     Accepted,
     Error {
         code: ErrorCode,
@@ -309,6 +401,7 @@ mod tests {
             pause_on_lock: false,
             pause_on_display_off: true,
             pause_on_suspend: false,
+            pause_on_battery: false,
         };
         let request = RequestEnvelope::new(Command::SetPlaybackSettings(settings));
         let encoded = serde_json::to_vec(&request).unwrap();
@@ -361,5 +454,65 @@ mod tests {
         let decoded: ResponseEnvelope =
             serde_json::from_slice(&output[..output.len() - 1]).unwrap();
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn dashboard_and_rotation_commands_round_trip() {
+        for command in [
+            Command::GetDashboardSnapshot,
+            Command::SetFavorite {
+                wallpaper_id: WallpaperId::new(),
+                favorite: true,
+            },
+            Command::SetActivePlaylist {
+                playlist_id: Some("pl-1".into()),
+            },
+            Command::SetAutoCycle {
+                enabled: true,
+                interval_secs: 600,
+                shuffle: false,
+            },
+        ] {
+            let req = RequestEnvelope::new(command);
+            let encoded = serde_json::to_vec(&req).unwrap();
+            let decoded: RequestEnvelope = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, req);
+        }
+
+        let snap = DashboardSnapshot {
+            monitors: Vec::new(),
+            wallpapers: Vec::new(),
+            playlists: Vec::new(),
+            players: vec![PlayerStatusInfo {
+                monitor: r"\\.\DISPLAY1".into(),
+                state: PlaybackState::Playing,
+                active_decoder: "d3d11va".into(),
+                memory_bytes: 1024,
+                suspended: false,
+                suspension_reasons: Vec::new(),
+                source: Some("video.mp4".into()),
+            }],
+            profile: PerformanceProfile::Balanced,
+            playback_settings: PlaybackSettings::default(),
+            target_fps: Some(30),
+            ram_budget_mb: Some(64),
+            quality: VideoQuality::Balanced,
+            extension_registered: false,
+            extension_crx_available: false,
+            extension_crx_path: None,
+            extension_unpacked_available: false,
+            extension_browsers: Vec::new(),
+            extension_id: "id".into(),
+            extension_version: "1.0.0".into(),
+            active_playlist_id: None,
+            auto_cycle_enabled: false,
+            auto_cycle_interval_secs: 900,
+            auto_cycle_shuffle: true,
+        };
+        let resp =
+            ResponseEnvelope::new(Uuid::new_v4(), Response::DashboardSnapshot(Box::new(snap)));
+        let encoded = serde_json::to_vec(&resp).unwrap();
+        let decoded: ResponseEnvelope = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, resp);
     }
 }

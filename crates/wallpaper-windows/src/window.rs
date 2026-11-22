@@ -34,10 +34,11 @@ mod platform {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, IsWindow,
-        RegisterClassExW, SetWindowLongPtrW, SetWindowPos, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE,
-        HWND_BOTTOM, MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW, WM_DESTROY,
-        WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_PAINT, WM_SETFOCUS, WNDCLASSEXW, WS_CHILD,
-        WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
+        RegisterClassExW, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA, GWL_EXSTYLE,
+        GWL_STYLE, HWND_BOTTOM, MA_NOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW,
+        SW_HIDE, SW_SHOW, WM_DESTROY, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_PAINT, WM_SETFOCUS,
+        WNDCLASSEXW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOACTIVATE,
+        WS_EX_TOOLWINDOW, WS_POPUP, WS_VISIBLE,
     };
 
     const WINDOW_CLASS_NAME: PCWSTR = w!("RustWallpaperWindow");
@@ -471,6 +472,20 @@ mod platform {
                 let _ = InvalidateRect(self.hwnd, None, true);
             }
         }
+
+        /// Hides the wallpaper window without destroying it.
+        pub fn hide(&self) {
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
+        }
+
+        /// Shows the wallpaper window.
+        pub fn show(&self) {
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_SHOW);
+            }
+        }
     }
 
     impl Drop for WallpaperWindow {
@@ -528,4 +543,6 @@ impl WallpaperWindow {
     }
 
     pub fn destroy(&mut self) {}
+    pub fn hide(&self) {}
+    pub fn show(&self) {}
 }

@@ -2617,6 +2617,7 @@ dependencies = [
 name = "wallpaper-core"
 version = "0.1.0"
 dependencies = [
+ "image",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2633,6 +2634,7 @@ name = "wallpaper-daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "image",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

@@ -107,6 +107,12 @@ impl DesktopApp {
                 "Pause while the system is suspended",
             )
             .changed();
+        automation_changed |= ui
+            .checkbox(
+                &mut automation.pause_on_battery,
+                "Pause while running on battery power (Laptop Saver)",
+            )
+            .changed();
         if automation_changed {
             self.send(
                 Command::SetPlaybackSettings(automation),
@@ -116,7 +122,7 @@ impl DesktopApp {
 
         ui.add_space(6.0);
         ui.separator();
-        ui.label("Wallpaper Engine Performance & Quality");
+        ui.label("Performance & Quality Presets");
         ui.add_space(4.0);
 
         let mut settings_changed = false;
@@ -179,12 +185,12 @@ impl DesktopApp {
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label("RAM Cache / Demuxer Limit:");
+            ui.label("Memory Usage (RAM Limit):");
             let current_ram_text = match ram_budget {
-                Some(32) => "32 MB (Minimal / Low RAM)",
-                Some(64) => "64 MB (Standard)",
+                Some(32) => "32 MB (Low Memory)",
+                Some(64) => "64 MB (Balanced)",
                 Some(128) => "128 MB (High Performance)",
-                Some(256) => "256 MB (Ultra / Instant Seek)",
+                Some(256) => "256 MB (Instant Seeking)",
                 None | Some(0) => "Default (Auto)",
                 Some(_) => "Custom",
             };
@@ -198,13 +204,13 @@ impl DesktopApp {
                         settings_changed = true;
                     }
                     if ui
-                        .selectable_value(&mut ram_budget, Some(32), "32 MB (Minimal / Low RAM)")
+                        .selectable_value(&mut ram_budget, Some(32), "32 MB (Low Memory)")
                         .clicked()
                     {
                         settings_changed = true;
                     }
                     if ui
-                        .selectable_value(&mut ram_budget, Some(64), "64 MB (Standard)")
+                        .selectable_value(&mut ram_budget, Some(64), "64 MB (Balanced)")
                         .clicked()
                     {
                         settings_changed = true;
@@ -216,11 +222,7 @@ impl DesktopApp {
                         settings_changed = true;
                     }
                     if ui
-                        .selectable_value(
-                            &mut ram_budget,
-                            Some(256),
-                            "256 MB (Ultra / Instant Seek)",
-                        )
+                        .selectable_value(&mut ram_budget, Some(256), "256 MB (Instant Seeking)")
                         .clicked()
                     {
                         settings_changed = true;
@@ -230,11 +232,11 @@ impl DesktopApp {
 
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            ui.label("Video Scaling Filter:");
+            ui.label("Video Scaling Quality:");
             let current_q_text = match quality {
-                wallpaper_core::VideoQuality::Fast => "Fast (Bilinear - Low CPU)",
-                wallpaper_core::VideoQuality::Balanced => "Balanced (Spline36 - Sharp)",
-                wallpaper_core::VideoQuality::High => "High Quality (EWA Lanczos)",
+                wallpaper_core::VideoQuality::Fast => "Performance (Fast / Low GPU)",
+                wallpaper_core::VideoQuality::Balanced => "Balanced (Sharp & Efficient)",
+                wallpaper_core::VideoQuality::High => "Maximum Quality (Sharp Lanczos)",
             };
             egui::ComboBox::from_id_salt("quality_combo")
                 .selected_text(current_q_text)
@@ -243,7 +245,7 @@ impl DesktopApp {
                         .selectable_value(
                             &mut quality,
                             wallpaper_core::VideoQuality::Fast,
-                            "Fast (Bilinear - Low CPU)",
+                            "Performance (Fast / Low GPU)",
                         )
                         .clicked()
                     {
@@ -253,7 +255,7 @@ impl DesktopApp {
                         .selectable_value(
                             &mut quality,
                             wallpaper_core::VideoQuality::Balanced,
-                            "Balanced (Spline36 - Sharp)",
+                            "Balanced (Sharp & Efficient)",
                         )
                         .clicked()
                     {
@@ -263,7 +265,7 @@ impl DesktopApp {
                         .selectable_value(
                             &mut quality,
                             wallpaper_core::VideoQuality::High,
-                            "High Quality (EWA Lanczos)",
+                            "Maximum Quality (Sharp Lanczos)",
                         )
                         .clicked()
                     {
@@ -290,6 +292,9 @@ impl DesktopApp {
         ui.add_space(4.0);
 
         ui.horizontal(|ui| {
+            let prev_enabled = self.auto_cycle_enabled;
+            let prev_interval = self.auto_cycle_interval_secs;
+            let prev_shuffle = self.auto_cycle_shuffle;
             ui.checkbox(&mut self.auto_cycle_enabled, "Enable auto-cycle rotation");
             if self.auto_cycle_enabled {
                 ui.label("· Every:");
@@ -323,6 +328,20 @@ impl DesktopApp {
 
                 ui.checkbox(&mut self.auto_cycle_shuffle, "Shuffle (Random order)");
             }
+            if self.auto_cycle_enabled != prev_enabled
+                || self.auto_cycle_interval_secs != prev_interval
+                || self.auto_cycle_shuffle != prev_shuffle
+            {
+                self.rotation_dirty_until = Some(Instant::now() + Duration::from_secs(2));
+                self.send(
+                    Command::SetAutoCycle {
+                        enabled: self.auto_cycle_enabled,
+                        interval_secs: self.auto_cycle_interval_secs,
+                        shuffle: self.auto_cycle_shuffle,
+                    },
+                    "Auto-cycle rotation settings saved…",
+                );
+            }
         });
 
         ui.horizontal(|ui| {
@@ -336,7 +355,7 @@ impl DesktopApp {
             {
                 self.cycle_next_wallpaper(snapshot);
             }
-            ui.small("(Hotkey: Alt+N)");
+            ui.small(format!("(Hotkey: Alt+{})", self.hotkey_next_char));
         });
 
         ui.add_space(6.0);
@@ -354,6 +373,7 @@ impl DesktopApp {
                 .changed()
             {
                 self.master_volume = vol;
+                self.save_prefs();
                 self.send(
                     Command::SetVolume {
                         monitor: None,
@@ -364,10 +384,14 @@ impl DesktopApp {
             }
             let mut muted = self.master_muted;
             if ui
-                .checkbox(&mut muted, "Mute all audio (Hotkey: Alt+M)")
+                .checkbox(
+                    &mut muted,
+                    format!("Mute all audio (Hotkey: Alt+{})", self.hotkey_mute_char),
+                )
                 .changed()
             {
                 self.master_muted = muted;
+                self.save_prefs();
                 self.send(
                     Command::SetMute {
                         monitor: None,
@@ -380,6 +404,59 @@ impl DesktopApp {
                     },
                 );
             }
+        });
+
+        ui.add_space(6.0);
+        ui.separator();
+        ui.label("⌨️ Global Keyboard Hotkeys");
+        ui.small("Trigger playback actions system-wide using Alt + Key combinations:");
+        ui.add_space(4.0);
+        card_frame(&self.theme).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let mut hotkeys_changed = false;
+                ui.label("Next Wallpaper:");
+                ui.label("Alt +");
+                hotkeys_changed |= ui
+                    .add(egui::TextEdit::singleline(&mut self.hotkey_next_char).desired_width(24.0))
+                    .changed();
+                ui.add_space(12.0);
+
+                ui.label("Pause / Resume:");
+                ui.label("Alt +");
+                hotkeys_changed |= ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.hotkey_pause_char).desired_width(24.0),
+                    )
+                    .changed();
+                ui.add_space(12.0);
+
+                ui.label("Mute / Unmute:");
+                ui.label("Alt +");
+                hotkeys_changed |= ui
+                    .add(egui::TextEdit::singleline(&mut self.hotkey_mute_char).desired_width(24.0))
+                    .changed();
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Reset to Defaults").clicked() {
+                        self.hotkey_next_char = "N".into();
+                        self.hotkey_pause_char = "W".into();
+                        self.hotkey_mute_char = "M".into();
+                        hotkeys_changed = true;
+                    }
+                });
+
+                if hotkeys_changed {
+                    self.save_prefs();
+                    if let Some(ref tray) = self.tray_icon {
+                        tray.update_hotkeys(
+                            &self.hotkey_next_char,
+                            &self.hotkey_pause_char,
+                            &self.hotkey_mute_char,
+                        );
+                    }
+                    self.notice = "Global hotkeys updated & saved.".into();
+                }
+            });
         });
 
         ui.add_space(6.0);
@@ -419,65 +496,9 @@ impl DesktopApp {
         }
 
         ui.separator();
-        ui.label("Browser Companion Integration (Chrome, Edge, Brave)");
+        ui.label("About Rust Wallpaper");
+        ui.small("High-performance live wallpaper engine for Windows. GPU accelerated video decoding ensures fluid playback with near-zero CPU and battery usage.");
         ui.add_space(4.0);
-
-        let mut ext_registered = wallpaper_windows::is_browser_extension_registered();
-        if ui
-            .checkbox(
-                &mut ext_registered,
-                "Integrate with web browsers (Chrome, Edge, Brave)",
-            )
-            .changed()
-        {
-            if ext_registered {
-                let _ = wallpaper_windows::register_browser_extension(None);
-                self.notice = "Browser extension registered. When you launch your browser, accept the prompt to enable it.".into();
-            } else {
-                wallpaper_windows::unregister_browser_extension();
-                self.notice = "Browser extension uninstalled from registry.".into();
-            }
-        }
-
-        ui.horizontal(|ui| {
-            if ui.button("🚀 Launch Browser with Extension").clicked() {
-                match wallpaper_windows::launch_browser_with_extension(None) {
-                    Ok(()) => {
-                        self.notice = "Browser launched with RustWallpaper companion extension active!".into();
-                    }
-                    Err(e) => {
-                        self.notice = format!("Launch failed: {e}");
-                    }
-                }
-            }
-
-            if ui.button("⚡ Auto-Configure Shortcuts").clicked() {
-                match wallpaper_windows::enable_browser_shortcut_integration() {
-                    Ok(count) => {
-                        self.notice = format!("Injected extension auto-load into {count} browser shortcut(s)! Restart your browser to see it.");
-                    }
-                    Err(e) => {
-                        self.notice = format!("Shortcut configuration error: {e}");
-                    }
-                }
-            }
-
-            if ui.button("🌐 Browser Setup & Info").clicked() {
-                let _ = std::process::Command::new("rundll32")
-                    .args(["url.dll,FileProtocolHandler", "http://127.0.0.1:24242/extension/install"])
-                    .spawn();
-            }
-        });
-
-        ui.add_space(2.0);
-        ui.small("💡 Chromium (Brave/Chrome) requires a browser restart for shortcut or policy changes to activate.");
-
-        ui.separator();
-        ui.label("Current implementation");
-        ui.label("The daemon owns Win32 desktop integration, monitor lifecycle and MPV processes.");
-        ui.label("Playback commands are sent through the versioned named-pipe protocol.");
-        ui.separator();
-        ui.label("Future Roadmap");
-        ui.label("WebView2 interactive HTML/web wallpapers, audio visualizer scenes, and automatic updater.");
+        ui.small("Browser extension management moved to the 'Extension' page in the sidebar.");
     }
 }

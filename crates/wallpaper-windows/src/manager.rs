@@ -11,7 +11,7 @@ use crate::mpv::{MpvError, MpvLaunchConfig, MpvPlayer};
 use crate::policy::ProcessBackoff;
 use crate::window::{WallpaperWindow, WindowError};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 use wallpaper_core::{PlaybackConfig, PlaybackState, PlayerTelemetry};
@@ -81,6 +81,9 @@ const MONITOR_PALETTE: &[(u8, u8, u8)] = &[
     (32, 42, 30), // Dark forest slate
 ];
 
+/// Virtual display device name representing all monitors spanned into a single canvas.
+pub const SPAN_DEVICE_NAME: &str = r"\\.\SPAN";
+
 #[cfg(windows)]
 fn color_to_colorref(r: u8, g: u8, b: u8) -> windows::Win32::Foundation::COLORREF {
     windows::Win32::Foundation::COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
@@ -90,6 +93,7 @@ pub struct WallpaperManager {
     host: DesktopHost,
     windows: HashMap<String, WallpaperWindow>,
     players: HashMap<String, MpvPlayer>,
+    web_players: HashMap<String, crate::web_player::WebPlayer>,
     active_sources: HashMap<String, (PathBuf, PlaybackConfig)>,
     backoffs: HashMap<String, ProcessBackoff>,
     disconnected_failed_players: HashSet<String>,
@@ -109,6 +113,7 @@ impl WallpaperManager {
             host,
             windows: HashMap::new(),
             players: HashMap::new(),
+            web_players: HashMap::new(),
             active_sources: HashMap::new(),
             backoffs: HashMap::new(),
             disconnected_failed_players: HashSet::new(),
@@ -470,13 +475,16 @@ impl WallpaperManager {
         Ok(())
     }
 
-    /// Plays a video wallpaper on a specific monitor.
+    /// Plays a video wallpaper on a specific monitor, or across all displays if SPAN.
     pub fn play_video_on_monitor(
         &mut self,
         device: &str,
         video_path: PathBuf,
         config: PlaybackConfig,
     ) -> Result<(), WallpaperManagerError> {
+        if device == SPAN_DEVICE_NAME {
+            return self.play_video_span(video_path, config);
+        }
         // 1. Explicit video-file existence and accessibility validation before modifying window state
         if let Err(err) = std::fs::File::open(&video_path) {
             return Err(WallpaperManagerError::VideoFileInaccessible {
@@ -587,6 +595,9 @@ impl WallpaperManager {
 
     /// Pauses all active video players.
     pub fn pause_all(&mut self) {
+        for player in self.web_players.values_mut() {
+            player.pause();
+        }
         for (dev, player) in &self.players {
             if let Err(err) = player.queue_state_command(
                 &[
@@ -603,6 +614,11 @@ impl WallpaperManager {
 
     /// Resumes all paused video players.
     pub fn resume_all(&mut self) {
+        for (dev, player) in &mut self.web_players {
+            if let Some(win) = self.windows.get(dev) {
+                player.resume(win.width, win.height);
+            }
+        }
         for (dev, player) in &self.players {
             if let Err(err) = player.queue_state_command(
                 &[
@@ -617,7 +633,138 @@ impl WallpaperManager {
         }
     }
 
-    /// Pauses a specific video player.
+    /// Checks whether an ultra-wide panoramic spanned wallpaper is currently active.
+    pub fn is_spanned_active(&self) -> bool {
+        self.active_sources.contains_key(SPAN_DEVICE_NAME)
+    }
+
+    /// Plays a video wallpaper spanning across all active monitors seamlessly.
+    pub fn play_video_span(
+        &mut self,
+        video_path: PathBuf,
+        config: PlaybackConfig,
+    ) -> Result<(), WallpaperManagerError> {
+        if let Err(err) = std::fs::File::open(&video_path) {
+            return Err(WallpaperManagerError::VideoFileInaccessible {
+                path: video_path,
+                error: err.to_string(),
+            });
+        }
+
+        let monitors = crate::enumerate_monitors()
+            .map_err(|e| WallpaperManagerError::MonitorError(e.to_string()))?;
+        if monitors.is_empty() {
+            return Err(WallpaperManagerError::MonitorNotFound(
+                "No monitors connected to span".into(),
+            ));
+        }
+
+        let min_x = monitors.iter().map(|m| m.x).min().unwrap_or(0);
+        let min_y = monitors.iter().map(|m| m.y).min().unwrap_or(0);
+        let max_x = monitors
+            .iter()
+            .map(|m| m.x + m.width as i32)
+            .max()
+            .unwrap_or(1920);
+        let max_y = monitors
+            .iter()
+            .map(|m| m.y + m.height as i32)
+            .max()
+            .unwrap_or(1080);
+        let width = (max_x - min_x) as u32;
+        let height = (max_y - min_y) as u32;
+
+        // Stop per-monitor players and hide their windows
+        for (_, mut player) in self.players.drain() {
+            let _ = player.stop();
+        }
+        for (_, mut wp) in self.web_players.drain() {
+            let _ = wp.stop();
+        }
+        for (dev, win) in &self.windows {
+            if dev != SPAN_DEVICE_NAME {
+                win.hide();
+            }
+        }
+
+        let (client_x, client_y) = self.host.screen_to_client(min_x, min_y);
+        let span_win = if let Some(win) = self.windows.get_mut(SPAN_DEVICE_NAME) {
+            win.update_geometry(client_x, client_y, width, height);
+            win.show();
+            win
+        } else {
+            let bg = color_to_colorref(18, 20, 24);
+            let win = WallpaperWindow::create(
+                self.host.hwnd,
+                SPAN_DEVICE_NAME.to_string(),
+                client_x,
+                client_y,
+                width,
+                height,
+                false,
+                bg,
+            )
+            .map_err(WallpaperManagerError::Window)?;
+            self.windows.insert(SPAN_DEVICE_NAME.to_string(), win);
+            self.windows.get_mut(SPAN_DEVICE_NAME).unwrap()
+        };
+
+        let wid = span_win.hwnd.0 as isize;
+        self.pump_messages();
+
+        let launch_cfg = MpvLaunchConfig {
+            video_path: video_path.clone(),
+            wid,
+            config: config.clone(),
+        };
+
+        let player = MpvPlayer::launch(launch_cfg).map_err(WallpaperManagerError::Player)?;
+        self.players.insert(SPAN_DEVICE_NAME.to_string(), player);
+        self.active_sources
+            .insert(SPAN_DEVICE_NAME.to_string(), (video_path, config));
+
+        info!(
+            width,
+            height, "Ultra-wide spanned video wallpaper running across displays"
+        );
+        Ok(())
+    }
+
+    /// Plays an interactive web/shader/HTML5 wallpaper on a monitor.
+    pub fn play_web_on_monitor(
+        &mut self,
+        device: &str,
+        source: &str,
+    ) -> Result<(), WallpaperManagerError> {
+        let win = self
+            .windows
+            .get(device)
+            .ok_or_else(|| WallpaperManagerError::MonitorNotFound(device.to_string()))?;
+
+        if !win.is_valid() {
+            return Err(WallpaperManagerError::Window(WindowError::ApiError(
+                format!("Wallpaper window for monitor '{device}' has become invalid"),
+            )));
+        }
+
+        if let Some(mut existing_player) = self.players.remove(device) {
+            let _ = existing_player.stop();
+        }
+        if let Some(mut existing_web) = self.web_players.remove(device) {
+            let _ = existing_web.stop();
+        }
+
+        let wid = win.hwnd.0 as isize;
+        let (w, h) = (win.width, win.height);
+        let player = crate::web_player::WebPlayer::launch(wid, source, w, h)
+            .map_err(|e| WallpaperManagerError::Player(MpvError::Player(e.to_string())))?;
+
+        self.web_players.insert(device.to_string(), player);
+        info!(device = %device, source = %source, "Interactive web wallpaper player attached to display");
+        Ok(())
+    }
+
+    /// Pauses a specific video or web wallpaper player.
     pub fn pause_monitor(&mut self, device: &str) {
         if let Some(player) = self.players.get(device) {
             if let Err(err) = player.queue_state_command(
@@ -631,9 +778,12 @@ impl WallpaperManager {
                 warn!(device = %device, %err, "Failed to queue pause command");
             }
         }
+        if let Some(web) = self.web_players.get_mut(device) {
+            web.pause();
+        }
     }
 
-    /// Resumes a specific video player.
+    /// Resumes a specific video or web wallpaper player.
     pub fn resume_monitor(&mut self, device: &str) {
         if let Some(player) = self.players.get(device) {
             if let Err(err) = player.queue_state_command(
@@ -646,6 +796,13 @@ impl WallpaperManager {
             ) {
                 warn!(device = %device, %err, "Failed to queue resume command");
             }
+        }
+        if let Some((web, win)) = self
+            .web_players
+            .get_mut(device)
+            .zip(self.windows.get(device))
+        {
+            web.resume(win.width, win.height);
         }
     }
 
@@ -716,6 +873,11 @@ impl WallpaperManager {
             self.disconnected_failed_players.remove(dev);
         }
 
+        for web in self.web_players.values_mut() {
+            let _ = web.stop();
+        }
+        self.web_players.clear();
+
         let failed_ids: Vec<&str> = summary.failed.iter().map(|(d, _)| d.as_str()).collect();
         if summary.failed.is_empty() {
             info!(
@@ -746,7 +908,54 @@ impl WallpaperManager {
                 player.get_memory_bytes(),
             ));
         }
+        for (dev, web) in &self.web_players {
+            if !self.players.contains_key(dev) {
+                list.push((
+                    dev.clone(),
+                    "chromium-kiosk".to_string(),
+                    if web.is_paused() {
+                        PlaybackState::Paused
+                    } else {
+                        PlaybackState::Playing
+                    },
+                    web.get_memory_bytes(),
+                ));
+            }
+        }
         list
+    }
+
+    /// Queries working set RAM bytes of a player process for a given monitor device.
+    pub fn get_player_memory(&self, device: &str) -> u64 {
+        self.players
+            .get(device)
+            .map(|p| p.get_memory_bytes())
+            .unwrap_or(0)
+    }
+
+    /// Samples the current CPU percentage of a player process for a given monitor device.
+    pub fn sample_player_cpu(&self, device: &str) -> f64 {
+        self.players
+            .get(device)
+            .map(|p| p.sample_cpu())
+            .unwrap_or(0.0)
+    }
+
+    /// Dynamically changes the video rotation (0, 90, 180, 270) of a running player.
+    pub fn set_player_rotation(
+        &mut self,
+        device: &str,
+        rotation: u32,
+    ) -> Result<(), WallpaperManagerError> {
+        if let Some(player) = self.players.get_mut(device) {
+            player
+                .set_video_rotation(rotation)
+                .map_err(WallpaperManagerError::Player)?;
+        }
+        if let Some((_, ref mut cfg)) = self.active_sources.get_mut(device) {
+            cfg.video_rotation = Some(rotation);
+        }
+        Ok(())
     }
 
     /// Checks if a player for a specific monitor is running and recovers if crashed.
@@ -999,6 +1208,19 @@ impl WallpaperManager {
     /// Returns whether a monitor device has an active video source configured.
     pub fn has_active_source(&self, device: &str) -> bool {
         self.active_sources.contains_key(device)
+    }
+
+    /// Returns the active video source path for a monitor device if active.
+    pub fn active_source_path(&self, device: &str) -> Option<&Path> {
+        self.active_sources.get(device).map(|(p, _)| p.as_path())
+    }
+
+    /// Returns the active source string (video path or web URL) for a monitor device if active.
+    pub fn active_source_string(&self, device: &str) -> Option<String> {
+        self.active_sources
+            .get(device)
+            .map(|(p, _)| p.to_string_lossy().to_string())
+            .or_else(|| self.web_players.get(device).map(|w| w.url().to_string()))
     }
 
     /// Returns the number of configured active video sources.

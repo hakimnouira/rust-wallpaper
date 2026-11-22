@@ -4,6 +4,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use wallpaper_core::categorize_resolution;
 
+#[inline]
+fn silent_command<P: AsRef<std::ffi::OsStr>>(program: P) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// Extracted video properties and representative thumbnail location.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtractedMetadata {
@@ -193,18 +205,68 @@ pub fn extract_video_metadata_and_thumbnail(
             .map_err(|e| format!("Failed to create thumbnail directory: {e}"))?;
     }
 
-    let ffmpeg_bin = find_ffmpeg_executable();
-    let mpv_bin = wallpaper_windows::find_mpv_executable().ok();
-
     let ext = source_path
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
+    let is_web = matches!(ext.as_str(), "html" | "htm");
+    if is_web {
+        let mut img = image::RgbImage::new(480, 270);
+        for (x, y, pixel) in img.enumerate_pixels_mut() {
+            let r = (18.0 + (x as f32 / 480.0) * 15.0) as u8;
+            let g = (22.0 + (y as f32 / 270.0) * 20.0) as u8;
+            let b = (36.0 + ((x + y) as f32 / 750.0) * 35.0) as u8;
+            *pixel = image::Rgb([r, g, b]);
+        }
+        let _ = img.save_with_format(thumbnail_path, image::ImageFormat::Jpeg);
+        return Ok(ExtractedMetadata {
+            duration_secs: None,
+            width: Some(1920),
+            height: Some(1080),
+            aspect_ratio: Some(16.0 / 9.0),
+            fps: Some(60.0),
+            codec: Some("html5".into()),
+            resolution_category: Some("1080p".into()),
+            thumbnail_path: thumbnail_path.to_string_lossy().to_string(),
+            file_size: Some(file_size),
+            source_mtime,
+        });
+    }
+
     let is_image = matches!(
         ext.as_str(),
         "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp"
     );
+
+    if is_image {
+        let image = image::ImageReader::open(source_path)
+            .map_err(|error| format!("Failed to open image: {error}"))?
+            .with_guessed_format()
+            .map_err(|error| format!("Could not determine image format: {error}"))?
+            .decode()
+            .map_err(|error| format!("Could not decode image: {error}"))?;
+        let (width, height) = (image.width(), image.height());
+        image
+            .thumbnail(480, 270)
+            .save_with_format(thumbnail_path, image::ImageFormat::Jpeg)
+            .map_err(|error| format!("Failed to write image thumbnail: {error}"))?;
+        return Ok(ExtractedMetadata {
+            duration_secs: None,
+            width: Some(width),
+            height: Some(height),
+            aspect_ratio: (height > 0).then_some(width as f64 / height as f64),
+            fps: None,
+            codec: Some(ext),
+            resolution_category: Some(categorize_resolution(width, height).to_string()),
+            thumbnail_path: thumbnail_path.to_string_lossy().to_string(),
+            file_size: Some(file_size),
+            source_mtime,
+        });
+    }
+
+    let ffmpeg_bin = find_ffmpeg_executable();
+    let mpv_bin = wallpaper_windows::find_mpv_executable().ok();
 
     let result = if let Some(ref ffmpeg) = ffmpeg_bin {
         extract_via_ffmpeg(ffmpeg, source_path, thumbnail_path, file_size, source_mtime)
@@ -213,25 +275,6 @@ pub fn extract_video_metadata_and_thumbnail(
     } else {
         Err("Neither ffmpeg nor mpv executable found on system".into())
     };
-
-    if result.is_err() && is_image {
-        // Fallback for static image / GIF files if ffmpeg/mpv extraction fails or isn't installed
-        if !thumbnail_path.exists() {
-            let _ = std::fs::copy(source_path, thumbnail_path);
-        }
-        return Ok(ExtractedMetadata {
-            duration_secs: None,
-            width: None,
-            height: None,
-            aspect_ratio: None,
-            fps: None,
-            codec: Some(ext),
-            resolution_category: None,
-            thumbnail_path: thumbnail_path.to_string_lossy().to_string(),
-            file_size: Some(file_size),
-            source_mtime,
-        });
-    }
 
     result
 }
@@ -244,7 +287,7 @@ fn extract_via_ffmpeg(
     source_mtime: Option<u64>,
 ) -> Result<ExtractedMetadata, String> {
     // 1. First probe file to get duration and metadata
-    let probe_output = Command::new(ffmpeg)
+    let probe_output = silent_command(ffmpeg)
         .arg("-i")
         .arg(source_path)
         .output()
@@ -265,7 +308,7 @@ fn extract_via_ffmpeg(
     };
 
     // 2. Extract thumbnail frame
-    let _thumb_output = Command::new(ffmpeg)
+    let _thumb_output = silent_command(ffmpeg)
         .arg("-ss")
         .arg(&seek_time)
         .arg("-i")
@@ -288,7 +331,7 @@ fn extract_via_ffmpeg(
             == 0
     {
         // Fallback: try seeking to 0s without timestamp offset
-        let fallback_output = Command::new(ffmpeg)
+        let fallback_output = silent_command(ffmpeg)
             .arg("-ss")
             .arg("00:00:00")
             .arg("-i")
@@ -378,7 +421,7 @@ fn extract_via_mpv(
     std::fs::create_dir_all(&temp_dir)
         .map_err(|e| format!("Failed to create temporary directory: {e}"))?;
 
-    let output = Command::new(mpv)
+    let output = silent_command(mpv)
         .arg("--no-audio")
         .arg("--no-config")
         .arg("--start=10%")
@@ -396,7 +439,7 @@ fn extract_via_mpv(
         let _ = std::fs::remove_dir_all(&temp_dir);
     } else {
         // Fallback to start=0
-        let _ = Command::new(mpv)
+        let _ = silent_command(mpv)
             .arg("--no-audio")
             .arg("--no-config")
             .arg("--start=0")
@@ -531,6 +574,28 @@ Input #0, matroska,webm, from 'sample.webm':
         assert!(std::fs::metadata(&temp_thumb).unwrap().len() > 0);
 
         let _ = std::fs::remove_file(temp_thumb);
+    }
+
+    #[test]
+    fn extracts_real_resolution_and_thumbnail_for_static_image() {
+        let temp_dir = std::env::temp_dir().join(format!("rw-image-meta-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let source = temp_dir.join("pin.png");
+        let thumbnail = temp_dir.join("thumb.jpg");
+        image::RgbImage::from_pixel(2560, 1440, image::Rgb([12, 34, 56]))
+            .save(&source)
+            .unwrap();
+
+        let metadata = extract_video_metadata_and_thumbnail(&source, &thumbnail).unwrap();
+        assert_eq!(metadata.width, Some(2560));
+        assert_eq!(metadata.height, Some(1440));
+        assert_eq!(metadata.resolution_category.as_deref(), Some("1440p QHD"));
+        assert!(thumbnail.is_file());
+        assert!(image::ImageReader::open(&thumbnail)
+            .unwrap()
+            .decode()
+            .is_ok());
+        std::fs::remove_dir_all(temp_dir).unwrap();
     }
 
     #[test]

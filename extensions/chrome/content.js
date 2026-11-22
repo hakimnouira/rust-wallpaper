@@ -1,14 +1,45 @@
 /**
  * RustWallpaper Companion - Content Script
  * Injects a floating "Set as Wallpaper" button over HTML5 video elements.
+ * Handles SPA navigation, debounced scanning, and connection-aware error states.
  */
 
 (function () {
   const BADGE_CLASS = "rust-wallpaper-overlay-btn";
   const CONTAINER_CLASS = "rust-wallpaper-wrapper-relative";
 
+  // --- Connection state (updated from background) ---
+  let daemonOnline = false;
+
+  chrome.runtime.onMessage.addListener((message) => {
+    if (message.action === "HEALTH_UPDATE") {
+      const wasOffline = !daemonOnline;
+      daemonOnline = message.online;
+      // If daemon just came back online, re-scan to update button states
+      if (wasOffline && daemonOnline) {
+        scanAll();
+      }
+    }
+  });
+
+  // Check initial health
+  chrome.runtime.sendMessage({ action: "CHECK_HEALTH" }).then((resp) => {
+    if (resp) daemonOnline = resp.online;
+    scanAll();
+  }).catch(() => {
+    scanAll();
+  });
+
   function extractBestVideoUrl(video) {
     let direct = video.currentSrc || video.src || (video.querySelector("source")?.src);
+    // On Pinterest, use the canonical pin page so the daemon can resolve the
+    // original image or best available video rendition rather than a feed preview.
+    if (window.location.hostname.includes("pinterest.")) {
+      const pinLink = video.closest('a[href*="/pin/"]');
+      if (pinLink && pinLink.href) return pinLink.href;
+      if (window.location.pathname.includes("/pin/")) return window.location.href;
+    }
+
     if (direct && !direct.startsWith("blob:") && (direct.includes(".mp4") || direct.includes(".webm") || direct.includes("cdn.pixabay.com"))) {
       return direct;
     }
@@ -82,6 +113,12 @@
         return;
       }
 
+      // If blob: URL, warn the user
+      if (mediaUrl.startsWith("blob:")) {
+        showStatus(btn, "Blob URL - try context menu", false);
+        return;
+      }
+
       showStatus(btn, "Sending...", null);
 
       try {
@@ -92,12 +129,20 @@
         });
 
         if (response && response.success) {
-          showStatus(btn, "Applied! ✨", true);
+          showStatus(btn, successLabel(response.data), true);
+        } else if (response && response.daemonOffline) {
+          showStatus(btn, "App Offline", false);
+          // Update connection state
+          daemonOnline = false;
         } else {
-          showStatus(btn, "Failed", false);
+          showStatus(btn, failureLabel(response), false);
         }
       } catch (err) {
-        showStatus(btn, "Offline", false);
+        if (err && err.message && err.message.includes("Could not establish connection")) {
+          showStatus(btn, "Extension reloading...", false);
+        } else {
+          showStatus(btn, "Offline", false);
+        }
       }
     });
 
@@ -125,7 +170,7 @@
     const label = btn.querySelector(".rust-wp-label") || btn.querySelector("span") || btn;
     if (!label) return;
 
-    const originalText = label.textContent;
+    const originalText = "Set as Wallpaper";
     label.textContent = text;
 
     if (success === true) {
@@ -134,10 +179,11 @@
       btn.classList.add("error");
     }
 
+    const duration = success === true ? 2500 : 3500;
     setTimeout(() => {
       label.textContent = originalText;
       btn.classList.remove("success", "error");
-    }, 2500);
+    }, duration);
   }
 
   // --- Steam Workshop Integration ---
@@ -148,7 +194,6 @@
       const onclickAttr = enlargedLink.getAttribute("onclick") || "";
       const match = onclickAttr.match(/ShowEnlargedImagePreview\(\s*'([^']+)'/);
       if (match && match[1]) {
-        // Strip query params to get full raw image / animated gif
         return match[1].split("?")[0];
       }
     }
@@ -217,9 +262,12 @@
           });
 
           if (response && response.success) {
-            showStatus(overlayBtn, "Applied! ✨", true);
+            showStatus(overlayBtn, successLabel(response.data), true);
+          } else if (response && response.daemonOffline) {
+            showStatus(overlayBtn, "App Offline", false);
+            daemonOnline = false;
           } else {
-            showStatus(overlayBtn, "Failed", false);
+            showStatus(overlayBtn, failureLabel(response), false);
           }
         } catch (_) {
           showStatus(overlayBtn, "Offline", false);
@@ -250,9 +298,12 @@
             });
 
             if (response && response.success) {
-              showStatus(steamBtn, "Applied! ✨", true);
+              showStatus(steamBtn, successLabel(response.data), true);
+            } else if (response && response.daemonOffline) {
+              showStatus(steamBtn, "App Offline", false);
+              daemonOnline = false;
             } else {
-              showStatus(steamBtn, "Failed", false);
+              showStatus(steamBtn, failureLabel(response), false);
             }
           } catch (_) {
             showStatus(steamBtn, "Offline", false);
@@ -309,6 +360,9 @@
 
           if (response && response.success) {
             showStatus(cardBtn, "✨", true);
+          } else if (response && response.daemonOffline) {
+            showStatus(cardBtn, "Off", false);
+            daemonOnline = false;
           } else {
             showStatus(cardBtn, "Err", false);
           }
@@ -323,6 +377,17 @@
 
   // --- Pinterest Integration ---
   const capturedMediaUrls = new Set();
+
+  async function refreshCapturedMedia() {
+    try {
+      const response = await chrome.runtime.sendMessage({ action: "GET_CAPTURED_MEDIA" });
+      if (response && response.media && Array.isArray(response.media)) {
+        for (const item of response.media) {
+          if (item && item.url) capturedMediaUrls.add(item.url);
+        }
+      }
+    } catch (_) {}
+  }
 
   chrome.runtime.onMessage.addListener((message) => {
     if (message.action === "MEDIA_STREAM_DETECTED" && message.mediaUrl) {
@@ -345,6 +410,19 @@
       ) {
         return src;
       }
+
+      // 1b. Check poster thumbnail and convert to progressive 720p MP4
+      const poster = video.getAttribute("poster") || video.poster;
+      if (poster && (poster.includes("pinimg.com/videos/thumbnails/") || poster.includes("/videos/thumbnails/"))) {
+        const mp4Url = poster
+          .replace("i.pinimg.com", "v1.pinimg.com")
+          .replace("/thumbnails/originals/", "/mc/720p/")
+          .replace("/thumbnails/mc/720p/", "/mc/720p/")
+          .replace("/thumbnails/", "/mc/720p/")
+          .replace(/\.0000000\.(jpg|png)$/i, ".mp4")
+          .replace(/\.(jpg|png)$/i, ".mp4");
+        return mp4Url;
+      }
     }
 
     // 2. Any captured media URLs from background sniffer for this tab
@@ -361,7 +439,21 @@
       }
     }
 
-    // 3. Schema.org JSON-LD
+    // 3. High-resolution / original Pinterest image or animated GIF
+    const img = cardOrContainer.querySelector('img[src*="pinimg.com"]');
+    if (img) {
+      const imgSrc = img.currentSrc || img.src || "";
+      if (imgSrc.includes("pinimg.com")) {
+        const origUrl = imgSrc
+          .replace(/\/(?:236x|474x|564x|736x|1200x)\//, "/originals/")
+          .replace(/\/[0-9]+x[0-9]*(_RS)?\//, "/originals/");
+        if (origUrl.includes("/originals/")) {
+          return origUrl;
+        }
+      }
+    }
+
+    // 4. Schema.org JSON-LD
     try {
       const scripts = document.querySelectorAll('script[type="application/ld+json"]');
       for (const script of scripts) {
@@ -373,7 +465,7 @@
       }
     } catch (_) {}
 
-    // 4. OpenGraph video
+    // 5. OpenGraph video
     const ogVideo = document.querySelector(
       'meta[property="og:video"], meta[property="og:video:secure_url"]'
     );
@@ -381,7 +473,7 @@
       return ogVideo.content;
     }
 
-    // 5. Pin link inside the card
+    // 6. Pin link inside the card
     const link =
       cardOrContainer.querySelector('a[href*="/pin/"]') ||
       cardOrContainer.closest('a[href*="/pin/"]');
@@ -389,12 +481,30 @@
       return link.href;
     }
 
-    // 6. Current page URL if on pin page
+    // 7. Current page URL if on pin page
     if (window.location.pathname.includes("/pin/")) {
       return window.location.href;
     }
 
     return null;
+  }
+
+  function formatAppliedMedia(data) {
+    if (!data) return "resolution unknown";
+    const kind = data.media_type === "image" ? "Image" : "Video";
+    return `${kind} ${data.resolution || "· resolution unknown"}`;
+  }
+
+  function successLabel(data) {
+    const media = formatAppliedMedia(data);
+    return data?.applied === false ? `${media} · Saved` : `${media} ✨`;
+  }
+
+  function failureLabel(response) {
+    if (response?.downloaded) {
+      return `${formatAppliedMedia(response.data)} · Not applied`;
+    }
+    return response?.error || "Failed";
   }
 
   function cleanPinterestTitle(raw) {
@@ -424,7 +534,10 @@
           e.preventDefault();
           e.stopPropagation();
 
-          const mediaUrl = extractPinterestMedia(document.body);
+          await refreshCapturedMedia();
+          // Send the pin page itself so the daemon can choose the highest-quality
+          // original rendition instead of the current feed/preview stream.
+          const mediaUrl = window.location.href;
           const rawTitle = document.querySelector("h1")?.textContent?.trim() || document.title;
           const title = cleanPinterestTitle(rawTitle);
 
@@ -438,9 +551,12 @@
             });
 
             if (response && response.success) {
-              showStatus(pBtn, "Applied! ✨", true);
+              showStatus(pBtn, successLabel(response.data), true);
+            } else if (response && response.daemonOffline) {
+              showStatus(pBtn, "App Offline", false);
+              daemonOnline = false;
             } else {
-              showStatus(pBtn, "Failed", false);
+              showStatus(pBtn, failureLabel(response), false);
             }
           } catch (_) {
             showStatus(pBtn, "Offline", false);
@@ -457,9 +573,8 @@
     );
 
     pinCards.forEach((card) => {
-      const hasVideo =
-        card.querySelector("video") || card.querySelector('[data-test-id="video-player"]');
-      if (!hasVideo) return;
+      const hasMedia = card.querySelector("video, img[src*='pinimg.com']");
+      if (!hasMedia) return;
 
       if (card.dataset.rustWallpaperAttached) return;
       card.dataset.rustWallpaperAttached = "true";
@@ -472,7 +587,7 @@
       const cardBtn = document.createElement("button");
       cardBtn.className = BADGE_CLASS;
       cardBtn.type = "button";
-      cardBtn.title = "Set this Pinterest video as live desktop wallpaper";
+      cardBtn.title = "Set this Pinterest image or video as desktop wallpaper";
       cardBtn.innerHTML = `
         <svg class="rust-wp-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
           <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
@@ -486,10 +601,11 @@
         e.stopPropagation();
         e.preventDefault();
 
+        await refreshCapturedMedia();
         const mediaUrl = extractPinterestMedia(card);
         const link = card.querySelector('a[href*="/pin/"]');
         const rawTitle =
-          card.querySelector("h2, h3, [title]")?.textContent?.trim() || "Pinterest Video Pin";
+          card.querySelector("h2, h3, [title]")?.textContent?.trim() || "Pinterest Wallpaper";
         const title = cleanPinterestTitle(rawTitle);
 
         showStatus(cardBtn, "Sending…", null);
@@ -497,14 +613,19 @@
         try {
           const response = await chrome.runtime.sendMessage({
             action: "SET_WALLPAPER",
-            url: mediaUrl || (link ? link.href : window.location.href),
+            // Prefer resolving the canonical pin URL; direct images/streams discovered
+            // in feed cards are frequently resized previews.
+            url: (link && link.href) || mediaUrl || window.location.href,
             title,
           });
 
           if (response && response.success) {
-            showStatus(cardBtn, "Applied! ✨", true);
+            showStatus(cardBtn, successLabel(response.data), true);
+          } else if (response && response.daemonOffline) {
+            showStatus(cardBtn, "App Offline", false);
+            daemonOnline = false;
           } else {
-            showStatus(cardBtn, "Failed", false);
+            showStatus(cardBtn, failureLabel(response), false);
           }
         } catch (_) {
           showStatus(cardBtn, "Offline", false);
@@ -535,7 +656,7 @@
   function scanTikTok() {
     if (!window.location.hostname.includes("tiktok.com")) return;
     const containers = document.querySelectorAll(
-      'div[data-e2e="feed-video"], div[data-e2e="recommend-list-item-container"], .tiktok-video-container'
+      'div[data-e2e="feed-video"], div[data-e2e="recommend-list-item-container"], .tiktok-video-container, div[data-e2e="item-video"]'
     );
     containers.forEach((box) => {
       const video = box.querySelector("video");
@@ -562,7 +683,7 @@
     });
   }
 
-  // Scan for existing videos, Steam items, Pinterest, TikTok, Instagram, and Reddit
+  // --- Scan All (debounced) ---
   function scanAll() {
     const videos = document.querySelectorAll("video");
     videos.forEach(attachBadgeToVideo);
@@ -573,11 +694,50 @@
     scanReddit();
   }
 
-  // MutationObserver for dynamic websites (YouTube, Reddit, Steam Workshop, etc.)
+  // Debounced MutationObserver to avoid performance hits on heavy SPA sites
+  let scanTimer = null;
+  let lastUrl = window.location.href;
+
+  function debouncedScan() {
+    if (scanTimer) clearTimeout(scanTimer);
+    scanTimer = setTimeout(() => {
+      scanAll();
+    }, 300);
+  }
+
+  // Detect SPA navigation (pushState/replaceState/popstate)
+  function checkUrlChange() {
+    if (window.location.href !== lastUrl) {
+      lastUrl = window.location.href;
+      // URL changed — SPA navigation occurred
+      // Wait a moment for DOM to update, then re-scan
+      setTimeout(scanAll, 500);
+    }
+  }
+
+  // Hook into history API for SPA navigation detection
+  const origPushState = history.pushState;
+  const origReplaceState = history.replaceState;
+  history.pushState = function () {
+    origPushState.apply(history, arguments);
+    setTimeout(checkUrlChange, 100);
+  };
+  history.replaceState = function () {
+    origReplaceState.apply(history, arguments);
+    setTimeout(checkUrlChange, 100);
+  };
+  window.addEventListener("popstate", () => {
+    setTimeout(checkUrlChange, 100);
+  });
+
+  // MutationObserver for dynamic websites (debounced for performance)
   const observer = new MutationObserver(() => {
-    scanAll();
+    debouncedScan();
   });
 
   scanAll();
   observer.observe(document.body, { childList: true, subtree: true });
+
+  // Also poll for URL changes every 2s (catches SPA routes that don't trigger our hooks)
+  setInterval(checkUrlChange, 2000);
 })();

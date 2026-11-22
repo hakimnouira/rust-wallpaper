@@ -8,6 +8,7 @@ pub mod online;
 pub mod registration;
 pub mod runtime;
 pub mod supervisor;
+pub mod widgets;
 pub mod workshop;
 
 pub use filter::{
@@ -17,18 +18,21 @@ pub use filter::{
 pub use library::{LibraryError, WallpaperLibrary};
 pub use online::{
     detect_media_extension_from_magic_bytes, download_online_file,
-    download_online_file_cancellable, fetch_thumbnail_bytes, get_curated_video_wallpapers,
-    resolve_direct_video_url, resolve_web_media_info, search_wallhaven, OnlineError,
-    OnlineWallpaper, ResolvedWebMedia,
+    download_online_file_cancellable, ensure_stream_file, fetch_thumbnail_bytes,
+    get_curated_live_streams, get_curated_video_wallpapers, resolve_direct_video_url,
+    resolve_web_media_info, resolve_web_media_info_with_cancel, resolve_web_media_info_with_policy,
+    search_wallhaven, LiveStream, OnlineError, OnlineWallpaper, ResolvedWebMedia,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 use thiserror::Error;
 use uuid::Uuid;
+pub use widgets::{ensure_widget_file, get_builtin_widgets, InteractiveWidget};
 pub use workshop::{
-    detect_steam_and_wallpaper_engine, find_steam_installations, find_steam_library_folders,
-    parse_workshop_directory, scan_wallpaper_engine_items, SteamEngineStatus, WorkshopItem,
+    detect_steam_and_wallpaper_engine, fetch_steam_workshop_items, find_steam_installations,
+    find_steam_library_folders, get_curated_steam_workshop_items, parse_workshop_directory,
+    scan_wallpaper_engine_items, SteamEngineStatus, SteamWorkshopOnlineItem, WorkshopItem,
     WALLPAPER_ENGINE_APP_ID,
 };
 
@@ -135,6 +139,8 @@ pub struct PlaybackConfig {
     pub ram_budget_mb: Option<u32>,
     #[serde(default)]
     pub quality: VideoQuality,
+    #[serde(default)]
+    pub video_rotation: Option<u32>,
 }
 
 impl Default for PlaybackConfig {
@@ -147,6 +153,29 @@ impl Default for PlaybackConfig {
             target_fps: None,
             ram_budget_mb: None,
             quality: VideoQuality::Fast,
+            video_rotation: None,
+        }
+    }
+}
+
+/// Physical orientation of a wallpaper asset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WallpaperOrientation {
+    #[default]
+    Unknown,
+    Horizontal, // Landscape (width > height)
+    Vertical,   // Portrait (height > width)
+    Square,     // width == height
+}
+
+impl WallpaperOrientation {
+    pub fn display_label(&self) -> &'static str {
+        match self {
+            Self::Horizontal => "Horizontal (Landscape)",
+            Self::Vertical => "Vertical (Portrait)",
+            Self::Square => "Square",
+            Self::Unknown => "Unknown",
         }
     }
 }
@@ -208,6 +237,12 @@ pub struct WallpaperMetadata {
     pub thumbnail_path: Option<String>,
     #[serde(default)]
     pub source_mtime: Option<u64>,
+    #[serde(default)]
+    pub peak_ram_mb: Option<u32>,
+    #[serde(default)]
+    pub peak_cpu_percent: Option<f64>,
+    #[serde(default)]
+    pub is_favorite: bool,
 }
 
 impl WallpaperMetadata {
@@ -224,6 +259,140 @@ impl WallpaperMetadata {
             self.processing_state,
             ProcessingStatus::Pending | ProcessingStatus::Processing
         )
+    }
+
+    pub fn orientation(&self) -> WallpaperOrientation {
+        match (self.width, self.height) {
+            (Some(w), Some(h)) if w > h => WallpaperOrientation::Horizontal,
+            (Some(w), Some(h)) if h > w => WallpaperOrientation::Vertical,
+            (Some(w), Some(h)) if w == h => WallpaperOrientation::Square,
+            _ => WallpaperOrientation::Unknown,
+        }
+    }
+
+    pub fn is_horizontal(&self) -> bool {
+        self.orientation() == WallpaperOrientation::Horizontal
+    }
+
+    pub fn is_vertical(&self) -> bool {
+        self.orientation() == WallpaperOrientation::Vertical
+    }
+}
+
+/// Target time slot for daylight-aware or scheduled day/night playlists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleTimeSlot {
+    #[default]
+    AllDay,
+    Daytime,   // 08:00 - 18:00
+    Sunset,    // 18:00 - 22:00
+    Nighttime, // 22:00 - 08:00
+}
+
+impl ScheduleTimeSlot {
+    pub const ALL: [Self; 4] = [Self::AllDay, Self::Daytime, Self::Sunset, Self::Nighttime];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AllDay => "🔄 All-Day (Continuous)",
+            Self::Daytime => "🌅 Daytime (08:00 - 18:00)",
+            Self::Sunset => "🌇 Sunset / Evening (18:00 - 22:00)",
+            Self::Nighttime => "🌙 Night / OLED Dark (22:00 - 08:00)",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::AllDay => "All-Day",
+            Self::Daytime => "🌅 Daytime",
+            Self::Sunset => "🌇 Sunset",
+            Self::Nighttime => "🌙 Night",
+        }
+    }
+
+    pub fn is_active_now(self) -> bool {
+        let hour = current_local_hour();
+        match self {
+            Self::AllDay => true,
+            Self::Daytime => (8..18).contains(&hour),
+            Self::Sunset => (18..22).contains(&hour),
+            Self::Nighttime => !(8..22).contains(&hour),
+        }
+    }
+}
+
+/// Returns the current local hour of day (0..23).
+pub fn current_local_hour() -> u32 {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct SYSTEMTIME {
+            w_year: u16,
+            w_month: u16,
+            w_day_of_week: u16,
+            w_day: u16,
+            w_hour: u16,
+            w_minute: u16,
+            w_second: u16,
+            w_milliseconds: u16,
+        }
+        extern "system" {
+            fn GetLocalTime(lp_system_time: *mut SYSTEMTIME);
+        }
+        let mut st = SYSTEMTIME {
+            w_year: 0,
+            w_month: 0,
+            w_day_of_week: 0,
+            w_day: 0,
+            w_hour: 0,
+            w_minute: 0,
+            w_second: 0,
+            w_milliseconds: 0,
+        };
+        unsafe { GetLocalTime(&mut st) };
+        st.w_hour as u32
+    }
+    #[cfg(not(windows))]
+    {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        ((secs % 86400) / 3600) as u32
+    }
+}
+
+/// A saved wallpaper playlist for sequential or randomized scheduled rotation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WallpaperPlaylist {
+    pub id: String,
+    pub name: String,
+    pub wallpaper_ids: Vec<WallpaperId>,
+    pub interval_secs: u64,
+    pub shuffle: bool,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub time_slot: ScheduleTimeSlot,
+}
+
+impl WallpaperPlaylist {
+    pub fn new(
+        name: impl Into<String>,
+        wallpaper_ids: Vec<WallpaperId>,
+        interval_secs: u64,
+        shuffle: bool,
+    ) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.into(),
+            wallpaper_ids,
+            interval_secs,
+            shuffle,
+            created_at: String::new(),
+            time_slot: ScheduleTimeSlot::AllDay,
+        }
     }
 }
 
@@ -258,6 +427,9 @@ impl Wallpaper {
                 processing_error: None,
                 thumbnail_path: None,
                 source_mtime: None,
+                peak_ram_mb: None,
+                peak_cpu_percent: None,
+                is_favorite: false,
             },
             config: PlaybackConfig::default(),
         }
@@ -271,6 +443,27 @@ impl Wallpaper {
     #[inline]
     pub fn source(&self) -> &str {
         &self.metadata.source
+    }
+
+    /// Returns the visual orientation of this wallpaper taking user rotation into account.
+    pub fn effective_orientation(&self) -> WallpaperOrientation {
+        let rot = self.config.video_rotation.unwrap_or(0) % 360;
+        let is_transposed = rot == 90 || rot == 270;
+        match self.metadata.orientation() {
+            WallpaperOrientation::Horizontal if is_transposed => WallpaperOrientation::Vertical,
+            WallpaperOrientation::Vertical if is_transposed => WallpaperOrientation::Horizontal,
+            other => other,
+        }
+    }
+
+    #[inline]
+    pub fn is_effective_vertical(&self) -> bool {
+        self.effective_orientation() == WallpaperOrientation::Vertical
+    }
+
+    #[inline]
+    pub fn is_effective_horizontal(&self) -> bool {
+        self.effective_orientation() == WallpaperOrientation::Horizontal
     }
 }
 
@@ -292,17 +485,20 @@ pub enum SuspensionReason {
     SystemSuspended,
     /// Paused due to an active runtime or player failure.
     RuntimeError,
+    /// Paused to conserve laptop battery power.
+    BatterySaver,
 }
 
 impl SuspensionReason {
     /// Every reason, in the fixed order used for deterministic reporting.
-    pub const ALL: [SuspensionReason; 6] = [
+    pub const ALL: [SuspensionReason; 7] = [
         SuspensionReason::UserPaused,
         SuspensionReason::FullscreenApplication,
         SuspensionReason::SessionLocked,
         SuspensionReason::DisplayPoweredOff,
         SuspensionReason::SystemSuspended,
         SuspensionReason::RuntimeError,
+        SuspensionReason::BatterySaver,
     ];
 
     /// Stable snake_case name, identical to the serde representation.
@@ -314,6 +510,7 @@ impl SuspensionReason {
             SuspensionReason::DisplayPoweredOff => "display_powered_off",
             SuspensionReason::SystemSuspended => "system_suspended",
             SuspensionReason::RuntimeError => "runtime_error",
+            SuspensionReason::BatterySaver => "battery_saver",
         }
     }
 }
@@ -450,6 +647,8 @@ pub struct PlaybackPolicy {
     pub pause_on_display_power_off: bool,
     /// Whether to pause while the system is suspended / sleeping.
     pub pause_on_system_suspend: bool,
+    /// Whether to pause playback when running on laptop battery.
+    pub pause_on_battery: bool,
     /// How long a foreground condition must hold before playback is paused.
     pub pause_debounce_millis: u64,
     /// How long the condition must stay cleared before playback resumes.
@@ -478,6 +677,7 @@ impl PlaybackPolicy {
             pause_on_lock: true,
             pause_on_display_power_off: true,
             pause_on_system_suspend: true,
+            pause_on_battery: matches!(profile, PerformanceProfile::Eco),
             pause_debounce_millis: pause_ms,
             resume_debounce_millis: resume_ms,
             poll_interval_millis: poll_ms,
@@ -564,6 +764,8 @@ pub struct PlaybackSettings {
     pub pause_on_lock: bool,
     pub pause_on_display_off: bool,
     pub pause_on_suspend: bool,
+    #[serde(default)]
+    pub pause_on_battery: bool,
 }
 
 impl Default for PlaybackSettings {
@@ -573,6 +775,7 @@ impl Default for PlaybackSettings {
             pause_on_lock: true,
             pause_on_display_off: true,
             pause_on_suspend: true,
+            pause_on_battery: false,
         }
     }
 }
@@ -592,6 +795,7 @@ impl PlaybackSettings {
             pause_on_lock: policy.pause_on_lock,
             pause_on_display_off: policy.pause_on_display_power_off,
             pause_on_suspend: policy.pause_on_system_suspend,
+            pause_on_battery: policy.pause_on_battery,
         }
     }
 
@@ -601,6 +805,7 @@ impl PlaybackSettings {
         policy.pause_on_lock = self.pause_on_lock;
         policy.pause_on_display_power_off = self.pause_on_display_off;
         policy.pause_on_system_suspend = self.pause_on_suspend;
+        policy.pause_on_battery = self.pause_on_battery;
     }
 }
 
@@ -757,6 +962,37 @@ mod tests {
             Some(PerformanceProfile::Balanced)
         );
         assert_eq!(PerformanceProfile::parse("turbo"), Option::None);
+    }
+
+    #[test]
+    fn test_effective_orientation_rotation() {
+        let mut wp = Wallpaper::new("Landscape Test", "video.mp4", WallpaperKind::Video);
+        wp.metadata.width = Some(1920);
+        wp.metadata.height = Some(1080);
+        assert_eq!(wp.metadata.orientation(), WallpaperOrientation::Horizontal);
+        assert!(wp.is_effective_horizontal());
+        assert!(!wp.is_effective_vertical());
+
+        // Rotate 90° -> becomes effective vertical
+        wp.config.video_rotation = Some(90);
+        assert_eq!(wp.effective_orientation(), WallpaperOrientation::Vertical);
+        assert!(wp.is_effective_vertical());
+        assert!(!wp.is_effective_horizontal());
+
+        // Rotate 180° -> remains effective horizontal
+        wp.config.video_rotation = Some(180);
+        assert_eq!(wp.effective_orientation(), WallpaperOrientation::Horizontal);
+        assert!(wp.is_effective_horizontal());
+
+        // Rotate 270° -> becomes effective vertical
+        wp.config.video_rotation = Some(270);
+        assert_eq!(wp.effective_orientation(), WallpaperOrientation::Vertical);
+        assert!(wp.is_effective_vertical());
+
+        // Reset to 0° -> back to horizontal
+        wp.config.video_rotation = Some(0);
+        assert_eq!(wp.effective_orientation(), WallpaperOrientation::Horizontal);
+        assert!(wp.is_effective_horizontal());
     }
 
     #[test]

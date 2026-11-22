@@ -6,7 +6,9 @@ The **RustWallpaper Companion** allows you to send animated live wallpapers, HTM
 
 ## 🚀 Features
 
-- **Floating Hover Button**: Seamlessly hovers over any `<video>` element on supported sites (Reddit, YouTube, Mixkit, Pixabay, Pexels, wallpaper sites, etc.) with a `[ 🖼 Set as Wallpaper ]` badge.
+- **Floating Hover Button**: Offers a `[ 🖼 Set as Wallpaper ]` action for videos and Pinterest image/video pins.
+- **Pinterest best-quality selection**: Resolves pin pages instead of downloading resized feed previews, prefers the highest available progressive video rendition, and upgrades resized pin images to their original URL when available.
+- **Resolution feedback**: Reports the downloaded image/video dimensions after import and shows them in the success notification and popup.
 - **Context Menu Integration**: Right-click any video, image, or link and choose:
   - `RustWallpaper: Set as Live Wallpaper` -> `Apply to Desktop Wallpaper`
   - `RustWallpaper: Set as Live Wallpaper` -> `Apply to Primary Monitor Only`
@@ -51,5 +53,6 @@ The **RustWallpaper Companion** allows you to send animated live wallpapers, HTM
 
 1. Start `RustWallpaper.exe` (or `wallpaper-daemon.exe`).
 2. Open any web video in your browser (e.g. any live wallpaper on Reddit or video sharing site).
-3. Hover over the video and click **"Set as Wallpaper"**, or right-click the video and select **RustWallpaper: Set as Live Wallpaper**.
-4. Check your Windows desktop to see the new live wallpaper running smoothly.
+3. On Pinterest, use the pin action or card button for either an image or video. Other supported sites can use the video hover button or right-click a video, image, or link.
+4. The extension reports the detected resolution (for example, `Image · 2560 × 1440` or `Video · 1920 × 1080`). If the source has no usable dimensions, it reports that resolution is unavailable.
+5. Check your Windows desktop to see the wallpaper. Static images are displayed as desktop wallpapers; videos and GIFs remain animated.

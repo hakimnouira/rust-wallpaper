@@ -156,10 +156,36 @@ impl DesktopApp {
                     };
                     ui.colored_label(dot, "●");
                     ui.label(&player.monitor);
-                    ui.small(format!("{:?}", player.state));
-                    if player.suspended && !player.suspension_reasons.is_empty() {
-                        ui.small(format!("paused: {}", player.suspension_reasons.join(", ")));
-                    }
+                    let (status_text, status_color) = if player.suspended {
+                        let reason = if player
+                            .suspension_reasons
+                            .iter()
+                            .any(|r| r.contains("Fullscreen") || r.contains("Game"))
+                        {
+                            "Paused (Full screen app open)"
+                        } else if player
+                            .suspension_reasons
+                            .iter()
+                            .any(|r| r.contains("Battery"))
+                        {
+                            "Paused (Battery saver)"
+                        } else if player.suspension_reasons.iter().any(|r| r.contains("Lock")) {
+                            "Paused (Windows locked)"
+                        } else {
+                            "Paused"
+                        };
+                        (reason, egui::Color32::from_rgb(230, 175, 90))
+                    } else {
+                        ("Playing", egui::Color32::from_rgb(90, 200, 140))
+                    };
+                    ui.colored_label(status_color, status_text);
+                    let mem_mb = player.memory_bytes / (1024 * 1024);
+                    let decoder = if player.active_decoder.is_empty() {
+                        "auto"
+                    } else {
+                        &player.active_decoder
+                    };
+                    ui.small(format!("· {mem_mb} MB RAM · GPU {decoder}"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("Manage").clicked() {
                             self.selected_monitor = Some(player.monitor.clone());
@@ -168,6 +194,41 @@ impl DesktopApp {
                     });
                 });
             }
+        });
+
+        ui.add_space(4.0);
+        card_frame(&self.theme).show(ui, |ui| {
+            ui.strong("⚡ Engine & Power Diagnostics");
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if let Some((on_battery, percent)) = wallpaper_windows::query_power_status() {
+                    let (badge_color, badge_text) = if on_battery {
+                        (
+                            egui::Color32::from_rgb(251, 191, 36),
+                            format!("🔋 On Battery ({percent}%) · Battery Saver Active"),
+                        )
+                    } else {
+                        (
+                            egui::Color32::from_rgb(52, 211, 153),
+                            format!("⚡ AC Power ({percent}%) · Full GPU Acceleration"),
+                        )
+                    };
+                    ui.colored_label(badge_color, "●");
+                    ui.small(badge_text);
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(52, 211, 153), "●");
+                    ui.small("⚡ Desktop AC Power · Unthrottled");
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let total_mem_mb: u64 = snapshot
+                        .players
+                        .iter()
+                        .map(|p| p.memory_bytes / (1024 * 1024))
+                        .sum();
+                    ui.small(format!("Total Working Set RAM: {total_mem_mb} MB"));
+                });
+            });
         });
     }
 }

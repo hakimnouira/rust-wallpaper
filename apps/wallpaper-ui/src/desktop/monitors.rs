@@ -88,34 +88,59 @@ impl DesktopApp {
             card_frame(&self.theme).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
-                        ui.strong(&monitor.device_name);
-                        ui.label(format!(
-                            "{} × {} · position ({}, {}){}",
-                            monitor.width,
-                            monitor.height,
-                            monitor.x,
-                            monitor.y,
+                        ui.horizontal(|ui| {
+                            ui.strong(&monitor.device_name);
                             if monitor.is_primary {
-                                " · Primary"
-                            } else {
-                                ""
+                                ui.colored_label(egui::Color32::from_rgb(100, 180, 255), "Primary");
                             }
-                        ));
+                        });
+                        ui.label(format!("{} × {}", monitor.width, monitor.height));
+
                         if let Some(player) = status {
-                            ui.label(format!(
-                                "{:?} · {} · {} MB",
-                                player.state,
-                                player.active_decoder,
-                                player.memory_bytes / (1024 * 1024)
-                            ));
-                            if player.suspended && !player.suspension_reasons.is_empty() {
-                                ui.small(format!(
-                                    "Paused: {}",
-                                    player.suspension_reasons.join(", ")
-                                ));
-                            }
+                            ui.horizontal(|ui| {
+                                if player.suspended {
+                                    let reason = if player
+                                        .suspension_reasons
+                                        .iter()
+                                        .any(|r| r.contains("Fullscreen") || r.contains("Game"))
+                                    {
+                                        "Paused (Full screen app open)"
+                                    } else if player
+                                        .suspension_reasons
+                                        .iter()
+                                        .any(|r| r.contains("Battery"))
+                                    {
+                                        "Paused (Battery saver)"
+                                    } else {
+                                        "Paused"
+                                    };
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(255, 190, 80),
+                                        format!("⏸ {reason}"),
+                                    );
+                                } else {
+                                    let hw_text = if player.active_decoder.contains("d3d")
+                                        || player.active_decoder.contains("dxva")
+                                        || player.active_decoder.contains("gpu")
+                                        || player.active_decoder.contains("auto")
+                                        || player.active_decoder.contains("vaapi")
+                                        || player.active_decoder.contains("nvdec")
+                                    {
+                                        "GPU Accelerated"
+                                    } else {
+                                        "Active"
+                                    };
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(80, 210, 120),
+                                        format!("▶ Playing • {hw_text}"),
+                                    );
+                                }
+                            });
                         } else {
-                            ui.label("No active video player");
+                            ui.colored_label(
+                                egui::Color32::from_rgb(160, 160, 160),
+                                "○ Idle (No wallpaper playing)",
+                            );
                         }
                         ui.horizontal(|ui| {
                             let mut volume = self.volumes.get(&device).copied().unwrap_or(100);
@@ -198,17 +223,28 @@ impl DesktopApp {
             ui.add_space(6.0);
         }
         ui.add_space(8.0);
-        if ui
-            .add_enabled(snapshot.connected, egui::Button::new("Pause all"))
-            .clicked()
-        {
-            self.send(Command::Pause { monitor: None }, "Pause all requested…");
-        }
-        if ui
-            .add_enabled(snapshot.connected, egui::Button::new("Resume all"))
-            .clicked()
-        {
-            self.send(Command::Resume { monitor: None }, "Resume all requested…");
-        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(snapshot.connected, egui::Button::new("Pause all"))
+                .clicked()
+            {
+                self.send(Command::Pause { monitor: None }, "Pause all requested…");
+            }
+            if ui
+                .add_enabled(snapshot.connected, egui::Button::new("Resume all"))
+                .clicked()
+            {
+                self.send(Command::Resume { monitor: None }, "Resume all requested…");
+            }
+            if snapshot.monitors.len() > 1 {
+                let is_span = self.selected_monitor.as_deref() == Some(r"\\.\SPAN");
+                if ui
+                    .selectable_label(is_span, "🔲 Target Panoramic Span (All Displays)")
+                    .clicked()
+                {
+                    self.selected_monitor = Some(r"\\.\SPAN".to_string());
+                }
+            }
+        });
     }
 }
