@@ -19,28 +19,137 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install MPV and FFmpeg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          choco install mpv --no-progress -y
+          $ffmpegReal = Get-ChildItem -Path "C:\ProgramData\chocolatey\lib" -Filter "ffmpeg.exe" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 5MB } | Select-Object -First 1
+          if (-not $ffmpegReal) {
+            $cmd = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+            if ($cmd -and (Test-Path $cmd.Source) -and (Get-Item $cmd.Source).Length -gt 5MB) {
+              $ffmpegReal = Get-Item $cmd.Source
+            }
+          }
+          if (-not $ffmpegReal) {
+            choco install ffmpeg --no-progress -y
+          }
+
       - name: Build release binaries
         run: cargo build --release -p wallpaper-ui -p wallpaper-daemon -p wallpaper-installer
 
-      - name: Package binaries & extension
+      - name: Package ZIP, Extension, and standalone Setup.exe
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path release-pkg\assets\wallpapers, release-pkg\extension | Out-Null
-          Copy-Item target\release\RustWallpaper.exe release-pkg\RustWallpaper.exe
-          Copy-Item target\release\wallpaper-daemon.exe release-pkg\wallpaper-daemon.exe
-          Copy-Item target\release\RustWallpaper-Setup.exe release-pkg\RustWallpaper-Setup.exe
-          Copy-Item target\release\uninstall.exe release-pkg\uninstall.exe
-          Copy-Item assets\icon.ico, assets\icon.png, assets\app.manifest release-pkg\assets\
-          Copy-Item assets\wallpapers\* release-pkg\assets\wallpapers\
-          Copy-Item extensions\chrome\* release-pkg\extension\ -Recurse
-          Copy-Item extensions\chrome.crx release-pkg\chrome.crx
-          Compress-Archive -Path release-pkg\* -DestinationPath RustWallpaper-windows-x64-bin.zip -Force
-          Compress-Archive -Path release-pkg\extension\* -DestinationPath RustWallpaper-Extension.zip -Force
+          $ErrorActionPreference = "Stop"
+          $root = "${{ github.workspace }}"
+          $version = (Select-String -Path (Join-Path $root "Cargo.toml") -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if (-not $version) { throw "Could not determine version from Cargo.toml" }
+
+          $pkgDir = Join-Path $root "release-pkg"
+          New-Item -ItemType Directory -Force -Path (Join-Path $pkgDir "assets\wallpapers"), (Join-Path $pkgDir "bin\mpv"), (Join-Path $pkgDir "extension") | Out-Null
+
+          Copy-Item "$root\target\release\RustWallpaper.exe" "$pkgDir\RustWallpaper.exe" -Force
+          Copy-Item "$root\target\release\RustWallpaper.exe" "$pkgDir\wallpaper-ui.exe" -Force
+          Copy-Item "$root\target\release\wallpaper-daemon.exe" "$pkgDir\wallpaper-daemon.exe" -Force
+          Copy-Item "$root\target\release\RustWallpaper-Setup.exe" "$pkgDir\RustWallpaper-Setup.exe" -Force
+          Copy-Item "$root\target\release\uninstall.exe" "$pkgDir\uninstall.exe" -Force
+
+          Copy-Item "$root\assets\icon.ico", "$root\assets\icon.png", "$root\assets\app.manifest" "$pkgDir\assets\" -Force
+          Copy-Item "$root\assets\wallpapers\*" "$pkgDir\assets\wallpapers\" -Force
+          Copy-Item "$root\extensions\chrome\*" "$pkgDir\extension\" -Recurse -Force
+          Copy-Item "$root\extensions\chrome.crx" "$pkgDir\extension\chrome.crx" -Force
+          Copy-Item "$root\extensions\chrome.crx" "$pkgDir\chrome.crx" -Force
+
+          # Resolve real MPV and FFmpeg binaries (> 5 MB, avoiding Chocolatey shims)
+          $mpvExe = Get-ChildItem -Path "C:\ProgramData\chocolatey\lib" -Filter "mpv.exe" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 5MB } | Select-Object -First 1
+          if (-not $mpvExe) {
+            $cmd = Get-Command mpv.exe -ErrorAction SilentlyContinue
+            if ($cmd -and (Test-Path $cmd.Source) -and (Get-Item $cmd.Source).Length -gt 5MB) { $mpvExe = Get-Item $cmd.Source }
+          }
+          if (-not $mpvExe) { throw "Could not locate real mpv.exe (> 5 MB)" }
+          Copy-Item $mpvExe.FullName "$pkgDir\bin\mpv\mpv.exe" -Force
+          $d3d = Join-Path $mpvExe.DirectoryName "d3dcompiler_43.dll"
+          if (Test-Path $d3d) { Copy-Item $d3d "$pkgDir\bin\mpv\d3dcompiler_43.dll" -Force }
+
+          $ffmpegExe = Get-ChildItem -Path "C:\ProgramData\chocolatey\lib" -Filter "ffmpeg.exe" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 5MB } | Select-Object -First 1
+          if (-not $ffmpegExe) {
+            $cmd = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+            if ($cmd -and (Test-Path $cmd.Source) -and (Get-Item $cmd.Source).Length -gt 5MB) { $ffmpegExe = Get-Item $cmd.Source }
+          }
+          if (-not $ffmpegExe) { throw "Could not locate real ffmpeg.exe (> 5 MB)" }
+          Copy-Item $ffmpegExe.FullName "$pkgDir\bin\mpv\ffmpeg.exe" -Force
+
+          $zipName = "RustWallpaper-$version-windows-x64.zip"
+          $zipPath = Join-Path $root $zipName
+          Compress-Archive -Path "$pkgDir\*" -DestinationPath $zipPath -Force
+          $zipHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$zipHash  $zipName" | Set-Content -Path "$zipPath.sha256" -Encoding ascii
+
+          Compress-Archive -Path "$pkgDir\extension\*" -DestinationPath (Join-Path $root "RustWallpaper-Extension.zip") -Force
+
+          # Build standalone self-extracting Setup.exe via Windows iexpress.exe
+          $stage = Join-Path $env:RUNNER_TEMP "rw-iexpress"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item $zipPath (Join-Path $stage "package.zip") -Force
+          $cmdContent = "@echo off`r`nsetlocal`r`nset `"EXTRACT=%TEMP%\RustWallpaper-Setup`"`r`nif exist `"%EXTRACT%`" rmdir /s /q `"%EXTRACT%`"`r`npowershell -NoProfile -ExecutionPolicy Bypass -Command `"Expand-Archive -LiteralPath '%~dp0package.zip' -DestinationPath '%EXTRACT%' -Force`"`r`nif errorlevel 1 exit /b 1`r`n`"%EXTRACT%\RustWallpaper-Setup.exe`"`r`nrmdir /s /q `"%EXTRACT%`" 2>nul`r`n"
+          [System.IO.File]::WriteAllText((Join-Path $stage "run-setup.cmd"), $cmdContent, [System.Text.Encoding]::ASCII)
+
+          $setupName = "RustWallpaper-$version-Setup.exe"
+          $setupPath = Join-Path $root $setupName
+          $sedLines = @(
+            '[Version]'
+            'Class=IEXPRESS'
+            'SEDVersion=3'
+            '[Options]'
+            'PackagePurpose=InstallApp'
+            'ShowInstallProgramWindow=1'
+            'HideExtractAnimation=0'
+            'UseLongFileName=1'
+            'InsideCompressed=0'
+            'CAB_FixedSize=0'
+            'CAB_ResvCodeSigning=0'
+            'RebootMode=N'
+            'InstallPrompt='
+            'DisplayLicense='
+            'FinishMessage='
+            "TargetName=$setupPath"
+            "FriendlyName=RustWallpaper v$version Setup"
+            'AppLaunched=cmd.exe /c run-setup.cmd'
+            'PostInstallCmd=<None>'
+            'AdminQuietInstCmd='
+            'UserQuietInstCmd='
+            'SourceFiles=SourceFiles'
+            '[Strings]'
+            'FILE0="package.zip"'
+            'FILE1="run-setup.cmd"'
+            '[SourceFiles]'
+            "SourceFiles0=$stage\"
+            '[SourceFiles0]'
+            '%FILE0%='
+            '%FILE1%='
+          )
+          $sedPath = Join-Path $stage "installer.sed"
+          [System.IO.File]::WriteAllText($sedPath, ($sedLines -join "`r`n"), [System.Text.Encoding]::ASCII)
+          $proc = Start-Process "C:\Windows\System32\iexpress.exe" -ArgumentList "/N", "/Q", $sedPath -Wait -PassThru
+          if ($proc.ExitCode -ne 0) { throw "iexpress.exe failed with exit code $($proc.ExitCode)" }
+
+          $setupInfo = Get-Item $setupPath
+          if ($setupInfo.Length -lt 20MB) { throw "Generated $setupName is unexpectedly small ($($setupInfo.Length) bytes)" }
+          $setupHash = (Get-FileHash -Path $setupPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$setupHash  $setupName" | Set-Content -Path "$setupPath.sha256" -Encoding ascii
+          Write-Host "Built $setupName ($($setupInfo.Length) bytes)"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.1.0' }}
+          name: RustWallpaper v0.1.0
+          make_latest: true
           files: |
-            RustWallpaper-windows-x64-bin.zip
+            RustWallpaper-*-Setup.exe
+            RustWallpaper-*-Setup.exe.sha256
+            RustWallpaper-*-windows-x64.zip
+            RustWallpaper-*-windows-x64.zip.sha256
             RustWallpaper-Extension.zip
           generate_release_notes: true
