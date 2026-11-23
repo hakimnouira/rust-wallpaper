@@ -23,15 +23,12 @@ mod desktop {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc, Mutex};
     use std::time::{Duration, Instant};
-    use theme::{
-        accent_color, card_frame, monitor_fill, soft_accent, subtle_frame, UiPrefs, UiTheme,
-    };
+    use theme::{accent_color, card_frame, monitor_fill, soft_accent, UiPrefs, UiTheme};
     use tokio::runtime::Builder;
     use tokio::time::timeout;
     use wallpaper_core::{
-        AspectRatioFilter, CodecFilter, FullscreenPauseMode, LibraryQuery, PerformanceProfile,
-        PlaybackSettings, ResolutionFilter, SortDirection, SortKey, StatusFilter, Wallpaper,
-        WallpaperId,
+        FullscreenPauseMode, LibraryQuery, PerformanceProfile, PlaybackSettings, ResolutionFilter,
+        SortDirection, SortKey, Wallpaper, WallpaperId,
     };
     use wallpaper_protocol::client::IpcClient;
     use wallpaper_protocol::{Command, MonitorInfo, PlayerStatusInfo, RequestEnvelope, Response};
@@ -609,7 +606,7 @@ mod desktop {
             Self {
                 snapshot,
                 commands,
-                page: Page::Overview,
+                page: Page::Library,
                 theme,
                 selected_monitor: None,
                 selected_wallpaper: None,
@@ -628,7 +625,7 @@ mod desktop {
                     2 => ThumbnailScale::Large,
                     _ => ThumbnailScale::Medium,
                 },
-                notice: "Connect to the wallpaper daemon to get started.".into(),
+                notice: String::new(),
                 textures: HashMap::new(),
                 current_cache_bytes: 0,
                 visible_thumbnails: HashSet::new(),
@@ -838,25 +835,65 @@ mod desktop {
             );
         }
 
-        fn nav_tab(&self, ui: &mut egui::Ui, page: Page, icon: &str, label: &str) -> bool {
+        fn draw_brand_mark(ui: &mut egui::Ui, accent: egui::Color32) -> egui::Response {
+            let size = egui::vec2(22.0, 22.0);
+            let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+            let p = ui.painter();
+            let c = rect.center();
+            let r = 8.0;
+            let pts = vec![
+                egui::pos2(c.x, c.y - r),
+                egui::pos2(c.x + r, c.y),
+                egui::pos2(c.x, c.y + r),
+                egui::pos2(c.x - r, c.y),
+            ];
+            p.add(egui::Shape::convex_polygon(pts, accent, egui::Stroke::NONE));
+            let inner = 3.5;
+            let inner_pts = vec![
+                egui::pos2(c.x, c.y - inner),
+                egui::pos2(c.x + inner, c.y),
+                egui::pos2(c.x, c.y + inner),
+                egui::pos2(c.x - inner, c.y),
+            ];
+            p.add(egui::Shape::convex_polygon(
+                inner_pts,
+                egui::Color32::from_rgb(10, 11, 14),
+                egui::Stroke::NONE,
+            ));
+            resp
+        }
+
+        fn nav_tab(&self, ui: &mut egui::Ui, page: Page, label: &str) -> bool {
             let active = self.page == page;
-            let text = egui::RichText::new(format!("{icon} {label}"))
-                .strong()
-                .size(12.5)
-                .color(if active {
-                    egui::Color32::WHITE
+            let text_color = if active {
+                if self.theme.dark_mode {
+                    egui::Color32::from_rgb(244, 245, 248)
                 } else {
-                    egui::Color32::from_gray(185)
-                });
-            let btn = egui::Button::new(text)
-                .fill(if active {
-                    accent_color(&self.theme)
-                } else {
-                    egui::Color32::TRANSPARENT
-                })
-                .min_size(egui::vec2(0.0, 28.0))
+                    egui::Color32::from_rgb(15, 23, 42)
+                }
+            } else if self.theme.dark_mode {
+                egui::Color32::from_rgb(138, 147, 166)
+            } else {
+                egui::Color32::from_rgb(100, 116, 139)
+            };
+            let text = egui::RichText::new(label).size(13.0).color(text_color);
+            let btn = egui::Button::new(if active { text.strong() } else { text })
+                .fill(egui::Color32::TRANSPARENT)
+                .stroke(egui::Stroke::NONE)
+                .min_size(egui::vec2(0.0, 30.0))
                 .rounding(egui::Rounding::same(6.0));
-            ui.add(btn).clicked()
+            let resp = ui.add(btn);
+            if active {
+                let y = resp.rect.bottom() - 1.0;
+                ui.painter().line_segment(
+                    [
+                        egui::pos2(resp.rect.left() + 6.0, y),
+                        egui::pos2(resp.rect.right() - 6.0, y),
+                    ],
+                    egui::Stroke::new(2.0_f32, accent_color(&self.theme)),
+                );
+            }
+            resp.clicked()
         }
 
         fn send(&mut self, command: Command, message: &str) {
@@ -1228,39 +1265,45 @@ mod desktop {
                     self.pending_apply_download_id = None;
                 }
             }
-            // Top Navigation Bar (Wallpaper Engine Style)
+            // Top Navigation & Command Bar (Option 3: Minimalist Command)
+            let search_id = egui::Id::new("global_command_search");
+            if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::K)) {
+                ctx.memory_mut(|m| m.request_focus(search_id));
+            }
+
+            let dark = self.theme.dark_mode;
+            let accent = accent_color(&self.theme);
+            let playing_count = snapshot
+                .players
+                .iter()
+                .filter(|p| {
+                    matches!(p.state, wallpaper_core::PlaybackState::Playing) && !p.suspended
+                })
+                .count();
+
             egui::TopBottomPanel::top("topbar")
                 .frame(
                     egui::Frame::none()
-                        .fill(if self.theme.dark_mode {
-                            egui::Color32::from_rgb(18, 19, 25)
+                        .fill(if dark {
+                            egui::Color32::from_rgb(10, 11, 14)
                         } else {
-                            egui::Color32::from_rgb(240, 243, 248)
+                            egui::Color32::from_rgb(246, 248, 252)
                         })
                         .stroke(egui::Stroke::new(
                             1.0_f32,
-                            if self.theme.dark_mode {
-                                egui::Color32::from_rgb(34, 36, 46)
+                            if dark {
+                                egui::Color32::from_rgb(29, 33, 45)
                             } else {
                                 egui::Color32::from_rgb(220, 224, 235)
                             },
                         ))
-                        .inner_margin(egui::Margin::symmetric(14.0, 8.0)),
+                        .inner_margin(egui::Margin::symmetric(18.0, 10.0)),
                 )
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        // Brand Icon & Title (clickable home button -> Overview)
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("❖ Rust Wallpaper")
-                                        .strong()
-                                        .size(15.5)
-                                        .color(accent_color(&self.theme)),
-                                )
-                                .frame(false),
-                            )
-                            .on_hover_text("Go to Overview home")
+                        // Brand Mark (clickable -> Overview)
+                        if Self::draw_brand_mark(ui, accent)
+                            .on_hover_text("Go to Overview")
                             .clicked()
                         {
                             self.page = Page::Overview;
@@ -1268,63 +1311,52 @@ mod desktop {
 
                         ui.add_space(6.0);
 
-                        // Live Engine Status Pill
-                        let (dot_color, status_text) = if snapshot.connected {
-                            let any_playing = snapshot.players.iter().any(|p| !p.suspended);
-                            if any_playing {
-                                (egui::Color32::from_rgb(16, 185, 129), "Engine Active")
-                            } else {
-                                (egui::Color32::from_rgb(245, 158, 11), "Engine Paused")
-                            }
-                        } else {
-                            (egui::Color32::from_rgb(239, 68, 68), "Daemon Offline")
-                        };
-                        egui::Frame::none()
-                            .fill(if self.theme.dark_mode {
-                                egui::Color32::from_rgb(26, 28, 36)
-                            } else {
-                                egui::Color32::from_rgb(230, 234, 242)
-                            })
-                            .rounding(egui::Rounding::same(12.0))
-                            .inner_margin(egui::Margin::symmetric(8.0, 3.0))
-                            .show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.colored_label(dot_color, "●");
-                                    ui.small(status_text);
-                                });
-                            });
-
-                        ui.add_space(8.0);
-
-                        // Top Navigation Tabs
-                        if self.nav_tab(ui, Page::Overview, "🏠", "Home") {
+                        // Horizontal Navigation Tabs
+                        if self.nav_tab(ui, Page::Overview, "Overview") {
                             self.page = Page::Overview;
                         }
-                        if self.nav_tab(ui, Page::Library, "▦", "Library") {
+                        if self.nav_tab(ui, Page::Library, "Library") {
                             self.page = Page::Library;
                         }
-                        if self.nav_tab(ui, Page::Browse, "🌐", "Discover") {
+                        if self.nav_tab(ui, Page::Browse, "Browse") {
                             self.page = Page::Browse;
                         }
-                        if self.nav_tab(ui, Page::Monitors, "🖥", "Displays") {
+                        if self.nav_tab(ui, Page::Monitors, "Monitors") {
                             self.page = Page::Monitors;
                         }
-                        if self.nav_tab(ui, Page::Extension, "🧩", "Extension") {
+                        if self.nav_tab(ui, Page::Extension, "Extension") {
                             self.page = Page::Extension;
                         }
-                        if self.nav_tab(ui, Page::Appearance, "🎨", "Theme") {
+                        if self.nav_tab(ui, Page::Appearance, "Appearance") {
                             self.page = Page::Appearance;
                         }
-                        if self.nav_tab(ui, Page::Settings, "⚙", "Settings") {
+                        if self.nav_tab(ui, Page::Settings, "Settings") {
                             self.page = Page::Settings;
                         }
 
-                        // Right-aligned controls
+                        // Right-aligned Command Search, + Import, Status Pill & Tray
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             // Minimize to Tray
                             if ui
-                                .button("⏷ Tray")
-                                .on_hover_text("Minimize to Windows system notification area")
+                                .add(
+                                    egui::Button::new(
+                                        egui::RichText::new("Tray")
+                                            .size(12.0)
+                                            .color(egui::Color32::from_rgb(148, 163, 184)),
+                                    )
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::new(
+                                        1.0_f32,
+                                        if dark {
+                                            egui::Color32::from_rgb(29, 33, 45)
+                                        } else {
+                                            egui::Color32::from_rgb(210, 215, 228)
+                                        },
+                                    ))
+                                    .rounding(egui::Rounding::same(7.0))
+                                    .min_size(egui::vec2(0.0, 28.0)),
+                                )
+                                .on_hover_text("Minimize to Windows system tray")
                                 .clicked()
                             {
                                 self.window_visible = false;
@@ -1332,61 +1364,166 @@ mod desktop {
                                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                             }
 
-                            ui.separator();
+                            // Live Status Pill
+                            let (pill_bg, dot_color, status_text) = if snapshot.connected {
+                                if playing_count > 0 {
+                                    (
+                                        egui::Color32::from_rgb(16, 36, 26),
+                                        egui::Color32::from_rgb(34, 197, 94),
+                                        format!("{playing_count} Active"),
+                                    )
+                                } else {
+                                    (
+                                        egui::Color32::from_rgb(30, 27, 16),
+                                        egui::Color32::from_rgb(245, 158, 11),
+                                        "Paused".to_string(),
+                                    )
+                                }
+                            } else {
+                                (
+                                    egui::Color32::from_rgb(38, 18, 22),
+                                    egui::Color32::from_rgb(239, 68, 68),
+                                    "Offline".to_string(),
+                                )
+                            };
+                            egui::Frame::none()
+                                .fill(pill_bg)
+                                .stroke(egui::Stroke::new(
+                                    1.0_f32,
+                                    egui::Color32::from_rgba_unmultiplied(
+                                        dot_color.r(),
+                                        dot_color.g(),
+                                        dot_color.b(),
+                                        60,
+                                    ),
+                                ))
+                                .rounding(egui::Rounding::same(14.0))
+                                .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        let (dot_rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(7.0, 7.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().circle_filled(
+                                            dot_rect.center(),
+                                            3.5,
+                                            dot_color,
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(status_text)
+                                                .size(11.5)
+                                                .strong()
+                                                .color(dot_color),
+                                        );
+                                    });
+                                });
 
-                            // Master Mute
-                            let mute_icon = if self.master_muted { "🔇" } else { "🔊" };
+                            // + Import button
                             if ui
-                                .button(mute_icon)
-                                .on_hover_text("Toggle master audio (Alt+M)")
+                                .add_enabled(
+                                    snapshot.connected,
+                                    egui::Button::new(
+                                        egui::RichText::new("+ Import")
+                                            .size(12.5)
+                                            .strong()
+                                            .color(accent),
+                                    )
+                                    .fill(egui::Color32::from_rgba_unmultiplied(
+                                        accent.r(),
+                                        accent.g(),
+                                        accent.b(),
+                                        28,
+                                    ))
+                                    .stroke(egui::Stroke::new(1.0_f32, accent))
+                                    .rounding(egui::Rounding::same(7.0))
+                                    .min_size(egui::vec2(0.0, 28.0)),
+                                )
+                                .on_hover_text("Import local video, image, or HTML5 wallpapers")
                                 .clicked()
                             {
-                                self.master_muted = !self.master_muted;
-                                let muted = self.master_muted;
-                                self.send(
-                                    Command::SetMute {
-                                        monitor: None,
-                                        muted,
-                                    },
-                                    if muted {
-                                        "Muted all audio…"
-                                    } else {
-                                        "Unmuted all audio…"
-                                    },
-                                );
+                                if let Some(paths) = rfd::FileDialog::new()
+                                    .add_filter(
+                                        "Media & Web Wallpapers",
+                                        &[
+                                            "mp4", "webm", "mkv", "mov", "gif", "jpg", "jpeg",
+                                            "png", "webp", "bmp", "html", "htm",
+                                        ],
+                                    )
+                                    .pick_files()
+                                {
+                                    let count = paths.len();
+                                    for p in paths {
+                                        let _ = self.commands.send(Command::ImportWallpaper {
+                                            path: p.display().to_string(),
+                                            title: None,
+                                        });
+                                    }
+                                    if count > 0 {
+                                        self.notice = format!(
+                                            "Queued {count} wallpaper{} for import…",
+                                            if count == 1 { "" } else { "s" }
+                                        );
+                                        self.page = Page::Library;
+                                    }
+                                }
                             }
 
-                            // Quick Monitor Selector
-                            egui::ComboBox::from_id_salt("quick_target_monitor")
-                                .selected_text(
-                                    self.selected_monitor.as_deref().unwrap_or("All Displays"),
-                                )
-                                .show_ui(ui, |ui| {
-                                    if ui
-                                        .selectable_label(
-                                            self.selected_monitor.is_none(),
-                                            "All Displays",
-                                        )
-                                        .clicked()
-                                    {
-                                        self.selected_monitor = None;
-                                    }
-                                    for m in &snapshot.monitors {
-                                        ui.selectable_value(
-                                            &mut self.selected_monitor,
-                                            Some(m.device_name.clone()),
-                                            format!("{}: {}x{}", m.device_name, m.width, m.height),
+                            // Command Search / URL Bar (Ctrl+K)
+                            egui::Frame::none()
+                                .fill(if dark {
+                                    egui::Color32::from_rgb(18, 20, 28)
+                                } else {
+                                    egui::Color32::from_rgb(236, 240, 247)
+                                })
+                                .stroke(egui::Stroke::new(
+                                    1.0_f32,
+                                    if dark {
+                                        egui::Color32::from_rgb(29, 33, 45)
+                                    } else {
+                                        egui::Color32::from_rgb(210, 215, 228)
+                                    },
+                                ))
+                                .rounding(egui::Rounding::same(8.0))
+                                .inner_margin(egui::Margin::symmetric(10.0, 4.0))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("Ctrl+K")
+                                                .size(10.5)
+                                                .color(egui::Color32::from_rgb(120, 128, 145)),
                                         );
-                                    }
-                                    if snapshot.monitors.len() > 1 {
-                                        ui.selectable_value(
-                                            &mut self.selected_monitor,
-                                            Some(wallpaper_windows::SPAN_DEVICE_NAME.to_string()),
-                                            "🔲 Span All Displays (Panoramic)".to_string(),
+                                        let resp = ui.add(
+                                            egui::TextEdit::singleline(&mut self.query.search)
+                                                .id(search_id)
+                                                .frame(false)
+                                                .desired_width(210.0)
+                                                .hint_text("Search library or paste URL…"),
                                         );
-                                    }
+                                        if resp.changed()
+                                            && !self.query.search.trim().is_empty()
+                                            && !self.query.search.trim().starts_with("http://")
+                                            && !self.query.search.trim().starts_with("https://")
+                                        {
+                                            self.page = Page::Library;
+                                        }
+                                        if resp.lost_focus()
+                                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                                        {
+                                            let trimmed = self.query.search.trim().to_string();
+                                            if trimmed.starts_with("http://")
+                                                || trimmed.starts_with("https://")
+                                            {
+                                                self.direct_url_input = trimmed;
+                                                self.query.search.clear();
+                                                self.page = Page::Browse;
+                                                self.start_direct_url_download(true);
+                                            } else if !trimmed.is_empty() {
+                                                self.page = Page::Library;
+                                            }
+                                        }
+                                    });
                                 });
-                            ui.small("Target Display:");
                         });
                     });
                 });
@@ -1404,34 +1541,37 @@ mod desktop {
             egui::TopBottomPanel::bottom("statusbar")
                 .frame(
                     egui::Frame::none()
-                        .fill(if self.theme.dark_mode {
-                            egui::Color32::from_rgb(14, 15, 20)
+                        .fill(if dark {
+                            egui::Color32::from_rgb(10, 11, 14)
                         } else {
                             egui::Color32::from_rgb(238, 241, 246)
                         })
                         .stroke(egui::Stroke::new(
                             1.0_f32,
-                            if self.theme.dark_mode {
-                                egui::Color32::from_rgb(28, 30, 40)
+                            if dark {
+                                egui::Color32::from_rgb(29, 33, 45)
                             } else {
                                 egui::Color32::from_rgb(220, 224, 235)
                             },
                         ))
-                        .inner_margin(egui::Margin::symmetric(14.0, 4.0)),
+                        .inner_margin(egui::Margin::symmetric(18.0, 5.0)),
                 )
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        if !self.notice.is_empty() {
-                            ui.small(&self.notice);
-                        } else {
-                            ui.small("Ready");
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.small(format!(
-                                "{} Displays  ·  {} Wallpapers in Library",
+                        let left_msg = if !self.notice.is_empty() {
+                            self.notice.clone()
+                        } else if snapshot.connected {
+                            format!(
+                                "{playing_count} active · {} displays · {} wallpapers",
                                 snapshot.monitors.len(),
                                 snapshot.wallpapers.len()
-                            ));
+                            )
+                        } else {
+                            "Waiting for wallpaper daemon…".to_string()
+                        };
+                        ui.small(left_msg);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.small("Alt+W Next  ·  Alt+M Mute  ·  Ctrl+K Search");
                         });
                     });
                 });

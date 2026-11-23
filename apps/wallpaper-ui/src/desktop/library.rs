@@ -15,17 +15,221 @@ fn wallpaper_playing_monitors<'a>(snapshot: &'a Snapshot, source: &str) -> Vec<&
 }
 
 impl DesktopApp {
-    pub(super) fn render_library(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
-        ui.heading("Wallpaper library");
-        ui.label("Import local videos, filter, and assign them to your displays.");
-        ui.add_space(8.0);
+    fn render_active_displays_strip(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        if snapshot.monitors.is_empty() {
+            return;
+        }
+        let dark = self.theme.dark_mode;
+        let accent = accent_color(&self.theme);
 
-        // Subtabs: Wallpapers vs Playlists
-        ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("Active Displays")
+                .size(13.0)
+                .strong()
+                .color(if dark {
+                    egui::Color32::from_rgb(209, 213, 219)
+                } else {
+                    egui::Color32::from_rgb(51, 65, 85)
+                }),
+        );
+        ui.add_space(4.0);
+
+        let cols = snapshot.monitors.len().clamp(1, 3);
+        let monitors = snapshot.monitors.clone();
+        let players = snapshot.players.clone();
+        let wallpapers = snapshot.wallpapers.clone();
+
+        ui.columns(cols, |columns| {
+            for (idx, mon) in monitors.iter().take(cols).enumerate() {
+                let col_ui = &mut columns[idx];
+                let is_targeted = self.selected_monitor.as_deref() == Some(&mon.device_name);
+                let player = players.iter().find(|p| p.monitor == mon.device_name);
+                let playing_wp = player.and_then(|p| {
+                    p.source.as_deref().and_then(|src| {
+                        let target_path = std::path::Path::new(src);
+                        wallpapers.iter().find(|w| {
+                            w.source().eq_ignore_ascii_case(src)
+                                || std::path::Path::new(w.source()) == target_path
+                        })
+                    })
+                });
+                let tex_id = playing_wp
+                    .and_then(|w| w.metadata.thumbnail_path.as_ref())
+                    .map(std::path::PathBuf::from)
+                    .and_then(|p| self.get_or_load_texture(&p));
+
+                let mut pause_req: Option<(String, bool)> = None;
+                let mut mute_req: Option<(String, bool)> = None;
+                let mut select_mon_req: Option<String> = None;
+
+                let frame_resp = egui::Frame::none()
+                    .fill(if dark {
+                        egui::Color32::from_rgb(18, 20, 28)
+                    } else {
+                        egui::Color32::from_rgb(246, 248, 252)
+                    })
+                    .stroke(egui::Stroke::new(
+                        if is_targeted { 1.5_f32 } else { 1.0_f32 },
+                        if is_targeted {
+                            accent
+                        } else if dark {
+                            egui::Color32::from_rgb(29, 33, 45)
+                        } else {
+                            egui::Color32::from_rgb(220, 224, 235)
+                        },
+                    ))
+                    .rounding(egui::Rounding::same(10.0))
+                    .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                    .show(col_ui, |ui| {
+                        ui.horizontal(|ui| {
+                            // Mini 16:9 thumbnail
+                            let thumb_size = egui::vec2(76.0, 44.0);
+                            let (thumb_rect, _) =
+                                ui.allocate_exact_size(thumb_size, egui::Sense::hover());
+                            if let Some(id) = tex_id {
+                                ui.painter().image(
+                                    id,
+                                    thumb_rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            } else {
+                                ui.painter().rect_filled(
+                                    thumb_rect,
+                                    egui::Rounding::same(6.0),
+                                    egui::Color32::from_rgb(12, 14, 20),
+                                );
+                            }
+                            ui.painter().rect_stroke(
+                                thumb_rect,
+                                egui::Rounding::same(6.0),
+                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(35, 40, 56)),
+                            );
+
+                            ui.add_space(6.0);
+
+                            // Display info + playing title
+                            ui.vertical(|ui| {
+                                let clean_name = mon.device_name.trim_start_matches(r"\\.\");
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "{clean_name} · {}x{}",
+                                        mon.width, mon.height
+                                    ))
+                                    .size(11.0)
+                                    .color(egui::Color32::from_rgb(138, 147, 166)),
+                                );
+
+                                let title = playing_wp
+                                    .map(|w| w.title().to_string())
+                                    .unwrap_or_else(|| "No wallpaper assigned".to_string());
+                                let (dot_col, state_label) = match player {
+                                    Some(p) if !p.suspended => {
+                                        (egui::Color32::from_rgb(34, 197, 94), "Playing")
+                                    }
+                                    Some(_) => (egui::Color32::from_rgb(245, 158, 11), "Paused"),
+                                    None => (egui::Color32::from_rgb(120, 128, 145), "Idle"),
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(title).size(13.0).strong(),
+                                        )
+                                        .truncate(),
+                                    );
+                                    ui.colored_label(
+                                        dot_col,
+                                        egui::RichText::new(format!("• {state_label}")).size(11.5),
+                                    );
+                                });
+                            });
+
+                            // Inline Pause/Resume & Mute controls on the right
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if let Some(p) = player {
+                                        let mute_lbl =
+                                            if self.master_muted { "Unmute" } else { "Mute" };
+                                        if ui
+                                            .small_button(mute_lbl)
+                                            .on_hover_text("Toggle audio for this display")
+                                            .clicked()
+                                        {
+                                            mute_req =
+                                                Some((mon.device_name.clone(), !self.master_muted));
+                                        }
+                                        let pause_lbl = if p.suspended { "Play" } else { "Pause" };
+                                        if ui
+                                            .small_button(pause_lbl)
+                                            .on_hover_text("Pause or resume playback")
+                                            .clicked()
+                                        {
+                                            pause_req =
+                                                Some((mon.device_name.clone(), !p.suspended));
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                    });
+
+                let body_resp = col_ui.interact(
+                    frame_resp.response.rect,
+                    col_ui.id().with(("active_disp_card", &mon.device_name)),
+                    egui::Sense::click(),
+                );
+                if body_resp.clicked() && pause_req.is_none() && mute_req.is_none() {
+                    select_mon_req = Some(mon.device_name.clone());
+                }
+
+                if let Some((m, should_pause)) = pause_req {
+                    if should_pause {
+                        self.send(Command::Pause { monitor: Some(m) }, "Paused display…");
+                    } else {
+                        self.send(Command::Resume { monitor: Some(m) }, "Resumed display…");
+                    }
+                }
+                if let Some((m, muted)) = mute_req {
+                    self.master_muted = muted;
+                    self.send(
+                        Command::SetMute {
+                            monitor: Some(m),
+                            muted,
+                        },
+                        if muted {
+                            "Muted display audio…"
+                        } else {
+                            "Unmuted display audio…"
+                        },
+                    );
+                }
+                if let Some(m) = select_mon_req {
+                    if self.selected_monitor.as_deref() == Some(m.as_str()) {
+                        self.selected_monitor = None;
+                    } else {
+                        self.selected_monitor = Some(m);
+                    }
+                }
+            }
+        });
+        ui.add_space(10.0);
+    }
+
+    pub(super) fn render_library(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+        if self.library_subtab == LibrarySubtab::Wallpapers {
+            self.render_active_displays_strip(ui, snapshot);
+        }
+
+        // Sleek Subtab & Filter Strip
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .selectable_label(
                     self.library_subtab == LibrarySubtab::Wallpapers,
-                    format!("🖼 All Wallpapers ({})", snapshot.wallpapers.len()),
+                    format!("Wallpapers ({})", snapshot.wallpapers.len()),
                 )
                 .clicked()
             {
@@ -34,11 +238,95 @@ impl DesktopApp {
             if ui
                 .selectable_label(
                     self.library_subtab == LibrarySubtab::Playlists,
-                    format!("📋 Playlists ({})", snapshot.playlists.len()),
+                    format!("Playlists ({})", snapshot.playlists.len()),
                 )
                 .clicked()
             {
                 self.library_subtab = LibrarySubtab::Playlists;
+            }
+
+            if self.library_subtab == LibrarySubtab::Wallpapers {
+                ui.separator();
+
+                // Quick filter chips
+                if ui
+                    .selectable_label(!self.query.is_filtered(), "All")
+                    .clicked()
+                {
+                    self.query.reset_filters();
+                    self.filter_orientation = FilterOrientation::All;
+                }
+                if ui
+                    .selectable_label(self.query.resolution == ResolutionFilter::Uhd4k, "4K UHD")
+                    .clicked()
+                {
+                    self.query.resolution = if self.query.resolution == ResolutionFilter::Uhd4k {
+                        ResolutionFilter::All
+                    } else {
+                        ResolutionFilter::Uhd4k
+                    };
+                }
+                if ui
+                    .selectable_label(self.query.resolution == ResolutionFilter::Fhd1080p, "1080p")
+                    .clicked()
+                {
+                    self.query.resolution = if self.query.resolution == ResolutionFilter::Fhd1080p {
+                        ResolutionFilter::All
+                    } else {
+                        ResolutionFilter::Fhd1080p
+                    };
+                }
+                if ui
+                    .selectable_label(self.query.favorites_only, "Favorites")
+                    .clicked()
+                {
+                    self.query.favorites_only = !self.query.favorites_only;
+                }
+
+                ui.separator();
+
+                egui::ComboBox::from_id_salt("sort_key_combo")
+                    .selected_text(format!("Sort: {}", self.query.sort_key.label()))
+                    .show_ui(ui, |ui| {
+                        for key in SortKey::ALL {
+                            ui.selectable_value(&mut self.query.sort_key, key, key.label());
+                        }
+                    });
+
+                let dir_text = match self.query.sort_direction {
+                    SortDirection::Ascending => "Asc",
+                    SortDirection::Descending => "Desc",
+                };
+                if ui.button(dir_text).clicked() {
+                    self.query.sort_direction = match self.query.sort_direction {
+                        SortDirection::Ascending => SortDirection::Descending,
+                        SortDirection::Descending => SortDirection::Ascending,
+                    };
+                }
+
+                if ui
+                    .selectable_label(self.view_mode == ViewMode::Grid, "Grid")
+                    .clicked()
+                    && self.view_mode != ViewMode::Grid
+                {
+                    self.view_mode = ViewMode::Grid;
+                    self.save_prefs();
+                }
+                if ui
+                    .selectable_label(self.view_mode == ViewMode::List, "List")
+                    .clicked()
+                    && self.view_mode != ViewMode::List
+                {
+                    self.view_mode = ViewMode::List;
+                    self.save_prefs();
+                }
+
+                if (self.query.is_filtered() || self.filter_orientation != FilterOrientation::All)
+                    && ui.button("Reset").clicked()
+                {
+                    self.query.reset_filters();
+                    self.filter_orientation = FilterOrientation::All;
+                }
             }
         });
 
@@ -51,24 +339,24 @@ impl DesktopApp {
         if let Some(ref pl_id) = self.active_playlist_id {
             if let Some(pl) = snapshot.playlists.iter().find(|p| &p.id == pl_id) {
                 egui::Frame::group(ui.style())
-                    .fill(egui::Color32::from_rgb(30, 45, 60))
+                    .fill(egui::Color32::from_rgb(20, 32, 46))
                     .inner_margin(8.0)
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.colored_label(
-                                egui::Color32::from_rgb(100, 220, 150),
-                                "▶ Active Playlist Playing:",
+                                egui::Color32::from_rgb(34, 197, 94),
+                                "Active Playlist:",
                             );
                             ui.strong(&pl.name);
                             ui.small(format!(
-                                "({} wallpapers • rotates every {}m)",
+                                "({} wallpapers · every {}m)",
                                 pl.wallpaper_ids.len(),
                                 pl.interval_secs / 60
                             ));
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    if ui.button("⏹ Stop Playlist").clicked() {
+                                    if ui.button("Stop").clicked() {
                                         self.active_playlist_id = None;
                                         self.rotation_dirty_until =
                                             Some(Instant::now() + Duration::from_secs(2));
@@ -77,7 +365,7 @@ impl DesktopApp {
                                             "Playlist stopped.",
                                         );
                                     }
-                                    if ui.button("⏭ Next Wallpaper").clicked() {
+                                    if ui.button("Next").clicked() {
                                         self.cycle_playlist_wallpaper(snapshot);
                                     }
                                 },
@@ -87,252 +375,6 @@ impl DesktopApp {
                 ui.add_space(4.0);
             }
         }
-
-        // Import Box
-        card_frame(&self.theme).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.strong("Import:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.import_path)
-                        .hint_text(r"Full path, or drop/select multiple files…"),
-                );
-                if ui.button("Browse…").clicked() {
-                    if let Some(paths) = rfd::FileDialog::new()
-                        .add_filter(
-                            "Media & Web Wallpapers",
-                            &[
-                                "mp4", "webm", "mkv", "mov", "gif", "jpg", "jpeg", "png", "webp",
-                                "bmp", "html", "htm",
-                            ],
-                        )
-                        .pick_files()
-                    {
-                        if paths.len() == 1 {
-                            self.import_path = paths[0].display().to_string();
-                        } else if !paths.is_empty() && snapshot.connected {
-                            let count = paths.len();
-                            for p in paths {
-                                let _ = self.commands.send(Command::ImportWallpaper {
-                                    path: p.display().to_string(),
-                                    title: None,
-                                });
-                            }
-                            self.notice = format!("Queued {count} wallpapers for batch import…");
-                        }
-                    }
-                }
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.import_title)
-                        .hint_text("Display name (optional)"),
-                );
-                if ui
-                    .add_enabled(
-                        snapshot.connected && !self.import_path.trim().is_empty(),
-                        egui::Button::new("Import video"),
-                    )
-                    .clicked()
-                {
-                    let path = self.import_path.trim().to_string();
-                    let title = if self.import_title.trim().is_empty() {
-                        None
-                    } else {
-                        Some(self.import_title.trim().to_string())
-                    };
-                    self.send(
-                        Command::ImportWallpaper { path, title },
-                        "Import requested…",
-                    );
-                }
-            });
-        });
-
-        ui.add_space(6.0);
-
-        // Row 1: Search bar + View Mode + Thumb Scale
-        subtle_frame(&self.theme).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("🔍");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.query.search)
-                        .hint_text("Search title, file, codec, resolution…")
-                        .desired_width(260.0),
-                );
-                if !self.query.search.is_empty() && ui.small_button("✖").clicked() {
-                    self.query.search.clear();
-                }
-
-                ui.separator();
-
-                // View Mode
-                if ui
-                    .selectable_label(self.view_mode == ViewMode::Grid, "⊞ Grid")
-                    .clicked()
-                    && self.view_mode != ViewMode::Grid
-                {
-                    self.view_mode = ViewMode::Grid;
-                    self.save_prefs();
-                }
-                if ui
-                    .selectable_label(self.view_mode == ViewMode::List, "☰ List")
-                    .clicked()
-                    && self.view_mode != ViewMode::List
-                {
-                    self.view_mode = ViewMode::List;
-                    self.save_prefs();
-                }
-
-                ui.separator();
-
-                // Thumbnail scale
-                if self.view_mode == ViewMode::Grid {
-                    let prev_scale = self.thumb_scale;
-                    egui::ComboBox::from_id_salt("thumb_scale_combo")
-                        .selected_text(match self.thumb_scale {
-                            ThumbnailScale::Small => "Thumb: Small",
-                            ThumbnailScale::Medium => "Thumb: Medium",
-                            ThumbnailScale::Large => "Thumb: Large",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(
-                                &mut self.thumb_scale,
-                                ThumbnailScale::Small,
-                                "Small (140px)",
-                            );
-                            ui.selectable_value(
-                                &mut self.thumb_scale,
-                                ThumbnailScale::Medium,
-                                "Medium (200px)",
-                            );
-                            ui.selectable_value(
-                                &mut self.thumb_scale,
-                                ThumbnailScale::Large,
-                                "Large (280px)",
-                            );
-                        });
-                    if self.thumb_scale != prev_scale {
-                        self.save_prefs();
-                    }
-                }
-            });
-        });
-
-        ui.add_space(4.0);
-
-        // Row 2: Sort and Filters
-        subtle_frame(&self.theme).show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                // Sort Key
-                egui::ComboBox::from_id_salt("sort_key_combo")
-                    .selected_text(format!("Sort: {}", self.query.sort_key.label()))
-                    .show_ui(ui, |ui| {
-                        for key in SortKey::ALL {
-                            ui.selectable_value(&mut self.query.sort_key, key, key.label());
-                        }
-                    });
-
-                let dir_text = match self.query.sort_direction {
-                    SortDirection::Ascending => "▲ Asc",
-                    SortDirection::Descending => "▼ Desc",
-                };
-                if ui.button(dir_text).clicked() {
-                    self.query.sort_direction = match self.query.sort_direction {
-                        SortDirection::Ascending => SortDirection::Descending,
-                        SortDirection::Descending => SortDirection::Ascending,
-                    };
-                }
-
-                ui.separator();
-
-                // Resolution
-                egui::ComboBox::from_id_salt("res_filter_combo")
-                    .selected_text(self.query.resolution.label())
-                    .show_ui(ui, |ui| {
-                        for item in ResolutionFilter::ALL {
-                            ui.selectable_value(&mut self.query.resolution, item, item.label());
-                        }
-                    });
-
-                // Aspect ratio
-                egui::ComboBox::from_id_salt("aspect_filter_combo")
-                    .selected_text(self.query.aspect_ratio.label())
-                    .show_ui(ui, |ui| {
-                        for item in AspectRatioFilter::ALL {
-                            ui.selectable_value(&mut self.query.aspect_ratio, item, item.label());
-                        }
-                    });
-
-                // Orientation filter
-                let orient_text = match self.filter_orientation {
-                    FilterOrientation::All => "All Orientations",
-                    FilterOrientation::Horizontal => "🖥 Horizontal (Landscape)",
-                    FilterOrientation::Vertical => "📱 Vertical (Portrait)",
-                };
-                egui::ComboBox::from_id_salt("orient_filter_combo")
-                    .selected_text(orient_text)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.filter_orientation,
-                            FilterOrientation::All,
-                            "All Orientations",
-                        );
-                        ui.selectable_value(
-                            &mut self.filter_orientation,
-                            FilterOrientation::Horizontal,
-                            "🖥 Horizontal (Landscape)",
-                        );
-                        ui.selectable_value(
-                            &mut self.filter_orientation,
-                            FilterOrientation::Vertical,
-                            "📱 Vertical (Portrait)",
-                        );
-                    });
-
-                if ui
-                    .button("🔄 Turn Horizontal to Vertical")
-                    .on_hover_text(
-                        "Rotate horizontal wallpapers in your library into vertical (90° portrait)",
-                    )
-                    .clicked()
-                {
-                    for wp in &snapshot.wallpapers {
-                        if wp.is_effective_horizontal() {
-                            self.send(
-                                Command::SetWallpaperRotation {
-                                    wallpaper_id: wp.id,
-                                    rotation: 90,
-                                },
-                                "Converted to vertical",
-                            );
-                        }
-                    }
-                }
-
-                // Codec
-                egui::ComboBox::from_id_salt("codec_filter_combo")
-                    .selected_text(self.query.codec.label())
-                    .show_ui(ui, |ui| {
-                        for item in CodecFilter::ALL {
-                            ui.selectable_value(&mut self.query.codec, item, item.label());
-                        }
-                    });
-
-                // Status
-                egui::ComboBox::from_id_salt("status_filter_combo")
-                    .selected_text(self.query.status.label())
-                    .show_ui(ui, |ui| {
-                        for item in StatusFilter::ALL {
-                            ui.selectable_value(&mut self.query.status, item, item.label());
-                        }
-                    });
-
-                ui.toggle_value(&mut self.query.favorites_only, "⭐ Favorites")
-                    .on_hover_text("Show only favorited wallpapers");
-
-                if self.query.is_filtered() && ui.button("✖ Reset Filters").clicked() {
-                    self.query.reset_filters();
-                }
-            });
-        });
 
         ui.add_space(6.0);
 
@@ -506,13 +548,7 @@ impl DesktopApp {
         let mut rotate_req = None;
         let mut benchmark_req: Option<WallpaperId> = None;
 
-        // Side Inspector Panel (Wallpaper Engine style)
-        if self.selected_wallpaper.is_none() {
-            if let Some(first) = snapshot.wallpapers.first() {
-                self.selected_wallpaper = Some(first.id);
-            }
-        }
-
+        // Side Inspector Panel (opened on card click, collapsed by default for full-width 4-col gallery)
         if let Some(selected_id) = self.selected_wallpaper {
             if let Some(wp) = snapshot.wallpapers.iter().find(|w| w.id == selected_id) {
                 let wp = wp.clone();
@@ -984,14 +1020,22 @@ impl DesktopApp {
                 );
             }
             ViewMode::Grid => {
-                let thumb_dim = self.thumb_scale.dimensions();
-                let card_width = thumb_dim.x;
-                let card_height = thumb_dim.y + 48.0;
-                let avail_w = ui.available_width().max(card_width);
-                let spacing = 10.0;
-                let cols = ((avail_w + spacing) / (card_width + spacing))
+                let avail_w = ui.available_width().max(260.0);
+                let spacing = 16.0;
+                let cols = if avail_w >= 920.0 {
+                    4
+                } else if avail_w >= 660.0 {
+                    3
+                } else if avail_w >= 420.0 {
+                    2
+                } else {
+                    1
+                };
+                let card_width = ((avail_w - spacing * (cols as f32 - 1.0)) / cols as f32)
                     .floor()
-                    .max(1.0) as usize;
+                    .max(160.0);
+                let thumb_h = (card_width * 9.0 / 16.0).round();
+                let card_height = thumb_h + 44.0;
                 let total_rows = filtered.len().div_ceil(cols);
 
                 egui::ScrollArea::vertical().show_rows(
@@ -1001,6 +1045,7 @@ impl DesktopApp {
                     |ui, row_range| {
                         for row_idx in row_range {
                             ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = spacing;
                                 for col_idx in 0..cols {
                                     let item_idx = row_idx * cols + col_idx;
                                     if item_idx >= filtered.len() {
@@ -1016,7 +1061,7 @@ impl DesktopApp {
                                         egui::Sense::click(),
                                     );
 
-                                    // Double-click: Instant Apply!
+                                    // Double-click: Instant Apply! Single-click: Open Inspector
                                     if response.double_clicked() {
                                         assign_req = Some(wallpaper.id);
                                     } else if response.clicked() {
@@ -1025,52 +1070,47 @@ impl DesktopApp {
 
                                     // Context menu (Right-click)
                                     response.context_menu(|ui| {
-                                        if ui.button("▶ Set as Wallpaper").clicked() {
+                                        if ui.button("Set as Wallpaper").clicked() {
                                             assign_req = Some(wallpaper.id);
                                             ui.close_menu();
                                         }
                                         if snapshot.monitors.len() > 1 {
-                                            ui.menu_button(
-                                                "🖥 Set on Specific Monitor…",
-                                                |ui| {
-                                                    for mon in &snapshot.monitors {
-                                                        let label = if mon.is_primary {
-                                                            format!("{} (Primary)", mon.device_name)
-                                                        } else {
-                                                            mon.device_name.clone()
-                                                        };
-                                                        if ui.button(label).clicked() {
-                                                            self.selected_monitor =
-                                                                Some(mon.device_name.clone());
-                                                            assign_req = Some(wallpaper.id);
-                                                            ui.close_menu();
-                                                        }
+                                            ui.menu_button("Set on Specific Monitor…", |ui| {
+                                                for mon in &snapshot.monitors {
+                                                    let label = if mon.is_primary {
+                                                        format!("{} (Primary)", mon.device_name)
+                                                    } else {
+                                                        mon.device_name.clone()
+                                                    };
+                                                    if ui.button(label).clicked() {
+                                                        self.selected_monitor =
+                                                            Some(mon.device_name.clone());
+                                                        assign_req = Some(wallpaper.id);
+                                                        ui.close_menu();
                                                     }
-                                                },
-                                            );
+                                                }
+                                            });
                                         }
                                         ui.separator();
                                         if wallpaper.is_effective_vertical() {
-                                            if ui.button("↔ Turn Horizontal (0°)").clicked() {
+                                            if ui.button("Turn Horizontal (0°)").clicked() {
                                                 rotate_req = Some((wallpaper.id, 0));
                                                 ui.close_menu();
                                             }
-                                        } else {
-                                            if ui.button("↕ Turn Vertical (90°)").clicked() {
-                                                rotate_req = Some((wallpaper.id, 90));
-                                                ui.close_menu();
-                                            }
+                                        } else if ui.button("Turn Vertical (90°)").clicked() {
+                                            rotate_req = Some((wallpaper.id, 90));
+                                            ui.close_menu();
                                         }
-                                        if ui.button("🔄 Rotate 90° Clockwise").clicked() {
+                                        if ui.button("Rotate 90° Clockwise").clicked() {
                                             let cur = wallpaper.config.video_rotation.unwrap_or(0);
                                             rotate_req = Some((wallpaper.id, (cur + 90) % 360));
                                             ui.close_menu();
                                         }
                                         ui.separator();
                                         let fav_ctx_label = if wallpaper.metadata.is_favorite {
-                                            "☆ Remove from Favorites"
+                                            "Remove from Favorites"
                                         } else {
-                                            "⭐ Add to Favorites"
+                                            "Add to Favorites"
                                         };
                                         if ui.button(fav_ctx_label).clicked() {
                                             fav_req = Some((
@@ -1079,11 +1119,11 @@ impl DesktopApp {
                                             ));
                                             ui.close_menu();
                                         }
-                                        if ui.button("⚡ Run 10s Benchmark").clicked() {
+                                        if ui.button("Run 10s Benchmark").clicked() {
                                             benchmark_req = Some(wallpaper.id);
                                             ui.close_menu();
                                         }
-                                        if ui.button("📂 Open File Location").clicked() {
+                                        if ui.button("Open File Location").clicked() {
                                             let p = std::path::PathBuf::from(wallpaper.source());
                                             if let Some(f) = p.parent() {
                                                 let _ = std::process::Command::new("explorer.exe")
@@ -1095,7 +1135,7 @@ impl DesktopApp {
                                         ui.separator();
                                         if ui
                                             .button(
-                                                egui::RichText::new("🗑 Remove Wallpaper")
+                                                egui::RichText::new("Remove Wallpaper")
                                                     .color(egui::Color32::from_rgb(239, 68, 68)),
                                             )
                                             .clicked()
@@ -1110,43 +1150,10 @@ impl DesktopApp {
                                         wallpaper_playing_monitors(snapshot, wallpaper.source());
                                     let is_playing = !card_playing.is_empty();
 
-                                    // Draw card background
-                                    let bg_color = if is_current {
-                                        egui::Color32::from_rgb(32, 35, 48)
-                                    } else if response.hovered() {
-                                        egui::Color32::from_rgb(28, 30, 42)
-                                    } else {
-                                        egui::Color32::from_rgb(22, 23, 30)
-                                    };
-
-                                    let border_color = if is_current {
-                                        accent_color(&self.theme)
-                                    } else if is_playing {
-                                        egui::Color32::from_rgb(16, 185, 129)
-                                    } else if response.hovered() {
-                                        egui::Color32::from_rgb(75, 80, 105)
-                                    } else {
-                                        egui::Color32::from_rgb(38, 40, 52)
-                                    };
-
-                                    ui.painter().rect(
-                                        rect,
-                                        egui::Rounding::same(8.0),
-                                        bg_color,
-                                        egui::Stroke::new(
-                                            if is_current || is_playing {
-                                                1.5_f32
-                                            } else {
-                                                1.0_f32
-                                            },
-                                            border_color,
-                                        ),
-                                    );
-
-                                    // Thumbnail rect
+                                    // Borderless 16:9 thumbnail
                                     let thumb_rect = egui::Rect::from_min_size(
-                                        rect.min + egui::vec2(2.0, 2.0),
-                                        egui::vec2(card_width - 4.0, thumb_dim.y),
+                                        rect.min,
+                                        egui::vec2(card_width, thumb_h),
                                     );
 
                                     let thumb_path = wallpaper
@@ -1154,7 +1161,6 @@ impl DesktopApp {
                                         .thumbnail_path
                                         .as_ref()
                                         .map(std::path::PathBuf::from);
-
                                     let tex_id = thumb_path
                                         .as_deref()
                                         .and_then(|p| self.get_or_load_texture(p));
@@ -1172,231 +1178,40 @@ impl DesktopApp {
                                     } else {
                                         ui.painter().rect_filled(
                                             thumb_rect,
-                                            egui::Rounding::same(6.0),
-                                            egui::Color32::from_rgb(16, 17, 22),
+                                            egui::Rounding::same(8.0),
+                                            egui::Color32::from_rgb(18, 20, 28),
                                         );
                                     }
 
-                                    // Bottom-Right duration/res pill
-                                    let duration_str =
-                                        wallpaper.metadata.duration_secs.map(format_duration);
-                                    let res_str = wallpaper.metadata.resolution_category.clone();
-                                    let pill_str = match (res_str, duration_str) {
-                                        (Some(r), Some(d)) => format!("{r} • {d}"),
-                                        (Some(r), None) => r,
-                                        (None, Some(d)) => d,
-                                        (None, None) => "Video".into(),
-                                    };
-                                    let pill_galley = ui.painter().layout_no_wrap(
-                                        pill_str,
-                                        egui::FontId::new(9.5, egui::FontFamily::Proportional),
-                                        egui::Color32::from_gray(230),
-                                    );
-                                    let pill_rect = egui::Rect::from_min_size(
-                                        thumb_rect.max
-                                            - egui::vec2(
-                                                pill_galley.size().x + 8.0,
-                                                pill_galley.size().y + 4.0,
-                                            ),
-                                        pill_galley.size() + egui::vec2(8.0, 4.0),
-                                    );
-                                    ui.painter().rect_filled(
-                                        pill_rect,
-                                        egui::Rounding::same(4.0),
-                                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190),
-                                    );
-                                    ui.painter().galley(
-                                        pill_rect.min + egui::vec2(4.0, 2.0),
-                                        pill_galley,
-                                        egui::Color32::from_gray(230),
-                                    );
-
-                                    // Top-Right orientation badge
-                                    let rot = wallpaper.config.video_rotation.unwrap_or(0);
-                                    let is_vert = wallpaper.is_effective_vertical();
-                                    let (orient_tag, tag_bg, tag_fg) = if rot == 90 {
-                                        (
-                                            Some("↕ Vertical (90°)"),
-                                            egui::Color32::from_rgb(99, 102, 241),
-                                            egui::Color32::WHITE,
-                                        )
-                                    } else if rot == 180 {
-                                        (
-                                            Some("🔄 180°"),
-                                            egui::Color32::from_rgb(139, 92, 246),
-                                            egui::Color32::WHITE,
-                                        )
-                                    } else if rot == 270 {
-                                        (
-                                            Some("↕ Vertical (270°)"),
-                                            egui::Color32::from_rgb(99, 102, 241),
-                                            egui::Color32::WHITE,
-                                        )
-                                    } else if is_vert {
-                                        (
-                                            Some("📱 Portrait"),
-                                            egui::Color32::from_rgba_unmultiplied(30, 41, 59, 220),
-                                            egui::Color32::from_rgb(203, 213, 225),
-                                        )
-                                    } else {
-                                        (
-                                            None,
-                                            egui::Color32::TRANSPARENT,
-                                            egui::Color32::TRANSPARENT,
-                                        )
-                                    };
-
-                                    if let Some(tag) = orient_tag {
-                                        let tag_galley = ui.painter().layout_no_wrap(
-                                            tag.into(),
-                                            egui::FontId::new(9.5, egui::FontFamily::Proportional),
-                                            tag_fg,
-                                        );
-                                        let tag_rect = egui::Rect::from_min_size(
-                                            egui::pos2(
-                                                thumb_rect.max.x - tag_galley.size().x - 8.0,
-                                                thumb_rect.min.y + 4.0,
-                                            ),
-                                            tag_galley.size() + egui::vec2(8.0, 4.0),
-                                        );
-                                        ui.painter().rect_filled(
-                                            tag_rect,
-                                            egui::Rounding::same(4.0),
-                                            tag_bg,
-                                        );
-                                        ui.painter().galley(
-                                            tag_rect.min + egui::vec2(4.0, 2.0),
-                                            tag_galley,
-                                            tag_fg,
-                                        );
-                                    }
-
-                                    // Quick one-click Orientation Switcher (always visible on thumbnail)
-                                    let toggle_rect = egui::Rect::from_min_size(
-                                        thumb_rect.min + egui::vec2(6.0, 6.0),
-                                        egui::vec2(if is_vert { 88.0 } else { 82.0 }, 22.0),
-                                    );
-                                    let toggle_resp = ui.interact(
-                                        toggle_rect,
-                                        ui.id().with(("rot_toggle", wallpaper.id)),
-                                        egui::Sense::click(),
-                                    );
-                                    if toggle_resp.clicked() {
-                                        rotate_req =
-                                            Some((wallpaper.id, if is_vert { 0 } else { 90 }));
-                                    }
-                                    let btn_bg = if toggle_resp.hovered() {
+                                    let border_color = if is_current || response.hovered() {
                                         accent_color(&self.theme)
+                                    } else if is_playing {
+                                        egui::Color32::from_rgb(34, 197, 94)
                                     } else {
-                                        egui::Color32::from_rgba_unmultiplied(22, 26, 38, 220)
+                                        egui::Color32::from_rgb(29, 33, 45)
                                     };
-                                    ui.painter().rect_filled(
-                                        toggle_rect,
-                                        egui::Rounding::same(4.0),
-                                        btn_bg,
-                                    );
                                     ui.painter().rect_stroke(
-                                        toggle_rect,
-                                        egui::Rounding::same(4.0),
+                                        thumb_rect,
+                                        egui::Rounding::same(8.0),
                                         egui::Stroke::new(
-                                            1.0_f32,
-                                            if toggle_resp.hovered() {
-                                                accent_color(&self.theme)
+                                            if is_current || is_playing || response.hovered() {
+                                                1.5_f32
                                             } else {
-                                                egui::Color32::from_rgb(70, 75, 95)
+                                                1.0_f32
                                             },
+                                            border_color,
                                         ),
                                     );
-                                    let btn_text = if is_vert {
-                                        "↔ Make Horiz"
-                                    } else {
-                                        "↕ Make Vert"
-                                    };
-                                    ui.painter().text(
-                                        toggle_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        btn_text,
-                                        egui::FontId::new(10.0, egui::FontFamily::Proportional),
-                                        egui::Color32::WHITE,
-                                    );
 
-                                    // Clickable favorite star button below orientation switcher
-                                    let fav_rect = egui::Rect::from_min_size(
-                                        thumb_rect.min + egui::vec2(6.0, 32.0),
-                                        egui::vec2(22.0, 22.0),
-                                    );
-                                    let fav_resp = ui.interact(
-                                        fav_rect,
-                                        ui.id().with(("fav_toggle", wallpaper.id)),
-                                        egui::Sense::click(),
-                                    );
-                                    if fav_resp.clicked() {
-                                        fav_req =
-                                            Some((wallpaper.id, !wallpaper.metadata.is_favorite));
-                                    }
-                                    let fav_bg = if fav_resp.hovered() {
-                                        egui::Color32::from_rgba_unmultiplied(45, 52, 72, 235)
-                                    } else {
-                                        egui::Color32::from_rgba_unmultiplied(18, 22, 32, 200)
-                                    };
-                                    ui.painter().rect_filled(
-                                        fav_rect,
-                                        egui::Rounding::same(11.0),
-                                        fav_bg,
-                                    );
-                                    ui.painter().text(
-                                        fav_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        if wallpaper.metadata.is_favorite {
-                                            "★"
-                                        } else {
-                                            "☆"
-                                        },
-                                        egui::FontId::new(12.0, egui::FontFamily::Proportional),
-                                        if wallpaper.metadata.is_favorite {
-                                            egui::Color32::from_rgb(250, 204, 21)
-                                        } else {
-                                            egui::Color32::from_gray(200)
-                                        },
-                                    );
-
-                                    // Bottom-Left active playing badge
-                                    if is_playing {
-                                        let playing_galley = ui.painter().layout_no_wrap(
-                                            "▶ Playing".into(),
-                                            egui::FontId::new(9.5, egui::FontFamily::Proportional),
-                                            egui::Color32::WHITE,
-                                        );
-                                        let playing_rect = egui::Rect::from_min_size(
-                                            egui::pos2(
-                                                thumb_rect.min.x + 6.0,
-                                                thumb_rect.max.y - playing_galley.size().y - 8.0,
-                                            ),
-                                            playing_galley.size() + egui::vec2(8.0, 4.0),
-                                        );
-                                        ui.painter().rect_filled(
-                                            playing_rect,
-                                            egui::Rounding::same(4.0),
-                                            egui::Color32::from_rgba_unmultiplied(
-                                                16, 185, 129, 230,
-                                            ),
-                                        );
-                                        ui.painter().galley(
-                                            playing_rect.min + egui::vec2(4.0, 2.0),
-                                            playing_galley,
-                                            egui::Color32::WHITE,
-                                        );
-                                    }
-
-                                    // Multi-selection checkbox
+                                    // Multi-selection check indicator only when selected
                                     if is_selected {
                                         let check_rect = egui::Rect::from_min_size(
-                                            thumb_rect.min + egui::vec2(4.0, 4.0),
+                                            thumb_rect.min + egui::vec2(6.0, 6.0),
                                             egui::vec2(16.0, 16.0),
                                         );
                                         ui.painter().rect_filled(
                                             check_rect,
-                                            egui::Rounding::same(3.0),
+                                            egui::Rounding::same(4.0),
                                             accent_color(&self.theme),
                                         );
                                         ui.painter().text(
@@ -1408,80 +1223,51 @@ impl DesktopApp {
                                         );
                                     }
 
-                                    // Floating Quick-Apply Overlay Button on Hover
-                                    if response.hovered() {
-                                        let play_size = egui::vec2(72.0, 26.0);
-                                        let play_rect = egui::Rect::from_center_size(
-                                            thumb_rect.center(),
-                                            play_size,
-                                        );
-                                        let play_resp = ui.interact(
-                                            play_rect,
-                                            ui.id().with(("hover_apply", wallpaper.id)),
-                                            egui::Sense::click(),
-                                        );
-                                        if play_resp.clicked() {
-                                            assign_req = Some(wallpaper.id);
-                                        }
-                                        let play_bg = if play_resp.hovered() {
-                                            egui::Color32::from_rgb(16, 185, 129)
-                                        } else {
-                                            egui::Color32::from_rgba_unmultiplied(16, 185, 129, 230)
-                                        };
-                                        ui.painter().rect_filled(
-                                            play_rect,
-                                            egui::Rounding::same(13.0),
-                                            play_bg,
-                                        );
-                                        ui.painter().text(
-                                            play_rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            "▶ Apply",
-                                            egui::FontId::new(11.5, egui::FontFamily::Proportional),
-                                            egui::Color32::WHITE,
-                                        );
-                                    }
-
-                                    // Card Footer (Fixed 44px)
-                                    let footer_min = rect.min + egui::vec2(6.0, thumb_dim.y + 6.0);
-                                    let title_galley = ui.painter().layout(
-                                        wallpaper.title().to_string(),
-                                        egui::FontId::new(12.5, egui::FontFamily::Proportional),
-                                        egui::Color32::WHITE,
-                                        card_width - 12.0,
-                                    );
-                                    ui.painter().galley(
-                                        footer_min,
-                                        title_galley,
-                                        egui::Color32::WHITE,
-                                    );
-
-                                    let sub_str = if let (Some(ram), Some(cpu)) = (
-                                        wallpaper.metadata.peak_ram_mb,
-                                        wallpaper.metadata.peak_cpu_percent,
-                                    ) {
-                                        format!("⚡ {ram}MB • {cpu:.1}% CPU")
-                                    } else if wallpaper.is_effective_vertical() {
-                                        if rot > 0 {
-                                            "Vertical (Rotated 90°) • Fluid Playback".into()
-                                        } else {
-                                            "Portrait • Fluid Playback".into()
-                                        }
+                                    // Clean single-line Title + Metadata below thumbnail
+                                    let title_pos = rect.min + egui::vec2(2.0, thumb_h + 7.0);
+                                    let title_col = if self.theme.dark_mode {
+                                        egui::Color32::from_rgb(243, 244, 246)
                                     } else {
-                                        "Landscape (Horizontal) • Fluid Playback".into()
+                                        egui::Color32::from_rgb(15, 23, 42)
                                     };
-                                    let sub_galley = ui.painter().layout_no_wrap(
-                                        sub_str,
-                                        egui::FontId::new(10.5, egui::FontFamily::Proportional),
-                                        egui::Color32::from_rgb(148, 163, 184),
+                                    let title_galley = ui.painter().layout_no_wrap(
+                                        wallpaper.title().to_string(),
+                                        egui::FontId::new(13.5, egui::FontFamily::Proportional),
+                                        title_col,
+                                    );
+                                    ui.painter().galley(title_pos, title_galley, title_col);
+
+                                    let res_part = wallpaper
+                                        .metadata
+                                        .resolution_category
+                                        .as_deref()
+                                        .unwrap_or("HD");
+                                    let right_part = wallpaper
+                                        .metadata
+                                        .duration_secs
+                                        .map(format_duration)
+                                        .or_else(|| wallpaper.metadata.codec.clone())
+                                        .unwrap_or_else(|| "Video".to_string());
+                                    let meta_str = if is_playing {
+                                        format!("{res_part} · {right_part} · Playing")
+                                    } else {
+                                        format!("{res_part} · {right_part}")
+                                    };
+                                    let meta_col = if is_playing {
+                                        egui::Color32::from_rgb(34, 197, 94)
+                                    } else {
+                                        egui::Color32::from_rgb(138, 147, 166)
+                                    };
+                                    let meta_galley = ui.painter().layout_no_wrap(
+                                        meta_str,
+                                        egui::FontId::new(11.5, egui::FontFamily::Proportional),
+                                        meta_col,
                                     );
                                     ui.painter().galley(
-                                        footer_min + egui::vec2(0.0, 16.0),
-                                        sub_galley,
-                                        egui::Color32::from_rgb(148, 163, 184),
+                                        title_pos + egui::vec2(0.0, 18.0),
+                                        meta_galley,
+                                        meta_col,
                                     );
-
-                                    ui.add_space(spacing);
                                 }
                             });
                             ui.add_space(spacing);

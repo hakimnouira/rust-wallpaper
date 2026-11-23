@@ -25,20 +25,20 @@
 
 <div align="center">
 
-### Modern Desktop Control Panel & Library
-![RustWallpaper Overview](docs/screenshots/01_overview.png)
+### Minimalist Command Library & Active Displays
+![RustWallpaper Library](docs/screenshots/02_library.png)
 
 </div>
 
 <br/>
 
-| ◈ Browse & Curated Catalog | ▣ Display Topology & Assignment |
+| ◈ Engine Overview & Diagnostics | 🌐 Discover & Curated Catalog |
 |:---:|:---:|
-| ![Browse](docs/screenshots/03_browse.png) | ![Monitors](docs/screenshots/04_monitors.png) |
+| ![Overview](docs/screenshots/01_overview.png) | ![Browse](docs/screenshots/03_browse.png) |
 
-| ⚙️ Performance & Engine Tuning | ▦ Grid Library View |
+| ▣ Display Topology & Assignment | ⚙️ Performance & Engine Tuning |
 |:---:|:---:|
-| ![Settings](docs/screenshots/06_settings.png) | ![Library](docs/screenshots/02_library.png) |
+| ![Monitors](docs/screenshots/04_monitors.png) | ![Settings](docs/screenshots/06_settings.png) |
 
 ---
 
@@ -120,16 +120,15 @@ graph TD
 
 ## 🚀 Quick Start
 
-### Option 1: Pre-Built Release (Recommended)
+### Option 1: One-Click Windows Installer (Recommended)
 
-1. Download the latest release package (`RustWallpaper-0.1.0-windows-x64.zip`) from [GitHub Releases](https://github.com/hakimnouira/rust-wallpaper/releases/latest).
-2. Extract the archive and run **`RustWallpaper-Setup.exe`**.
-3. Choose your installation directory (defaults to `%LOCALAPPDATA%\RustWallpaper`) and finish installation.
-4. Launch **Rust Wallpaper** from your Start Menu or Desktop!
+1. Download [**`RustWallpaper-0.1.0-Setup.exe`**](https://github.com/hakimnouira/rust-wallpaper/releases/download/v0.1.0/RustWallpaper-0.1.0-Setup.exe) from [GitHub Releases](https://github.com/hakimnouira/rust-wallpaper/releases/tag/v0.1.0).
+2. Double-click `RustWallpaper-0.1.0-Setup.exe`, choose your installation directory (defaults to `%LOCALAPPDATA%\Programs\RustWallpaper`), and finish the setup wizard.
+3. Launch **Rust Wallpaper** from your Start Menu or Desktop shortcut!
 
 ### Option 2: Portable Mode
 
-Extract the archive and run `RustWallpaper.exe` directly. It runs self-contained without requiring system-wide registry modifications.
+Download and extract [**`RustWallpaper-0.1.0-windows-x64.zip`**](https://github.com/hakimnouira/rust-wallpaper/releases/download/v0.1.0/RustWallpaper-0.1.0-windows-x64.zip) anywhere and run `RustWallpaper.exe` directly without modifying Start Menu shortcuts.
 
 ---
 
@@ -187,6 +186,7 @@ All distribution artifacts are written to `dist/`.
 
 | Shortcut | Action | Scope |
 |:---:|:---|:---:|
+| <kbd>Ctrl</kbd> + <kbd>K</kbd> | Focus **Command Search / Paste Video URL** bar | Active UI Window |
 | <kbd>Alt</kbd> + <kbd>W</kbd> | Skip to **Next Wallpaper** in rotation | Global (System-wide) |
 | <kbd>Alt</kbd> + <kbd>M</kbd> | Toggle **Master Audio Mute** | Global (System-wide) |
 | <kbd>Esc</kbd> | Close control panel to System Tray | Active UI Window |

@@ -1,5 +1,6 @@
 param(
     [string]$OutputDir = "docs\screenshots",
+    [string]$UiExe = "",
     [switch]$Restart
 )
 
@@ -7,6 +8,15 @@ $ErrorActionPreference = "Stop"
 
 $rootDir = Split-Path -Parent $PSScriptRoot
 $distDir = Join-Path $rootDir "dist"
+if (-not $UiExe) {
+    $debugExe = Join-Path $rootDir "target\debug\RustWallpaper.exe"
+    $distExe = Join-Path $distDir "RustWallpaper.exe"
+    if ((Test-Path $debugExe) -and ((-not (Test-Path $distExe)) -or ((Get-Item $debugExe).LastWriteTime -gt (Get-Item $distExe).LastWriteTime))) {
+        $UiExe = $debugExe
+    } else {
+        $UiExe = $distExe
+    }
+}
 $shotsDir = Join-Path $rootDir $OutputDir
 Remove-Item -Recurse -Force $shotsDir -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $shotsDir | Out-Null
@@ -174,8 +184,8 @@ if ($Restart -or (-not $existingDaemon)) {
     $startedOwnDaemon = $true
     Start-Sleep -Seconds 2
 
-    Write-Host "Starting wallpaper UI..." -ForegroundColor Cyan
-    $ui = Start-Process (Join-Path $distDir "wallpaper-ui.exe") -PassThru
+    Write-Host "Starting wallpaper UI ($UiExe)..." -ForegroundColor Cyan
+    $ui = Start-Process $UiExe -PassThru
     $startedOwnUi = $true
     Start-Sleep -Seconds 4
 } else {
@@ -229,36 +239,35 @@ if ($hwnd -ne [IntPtr]::Zero) {
         Write-Host "Saved: $outPath ($w x $h)" -ForegroundColor Green
     }
 
-    $clickX = $rect.Left + [int]($w * 0.08)
+    $tabY = $rect.Top + [int]($h * 0.064)
 
-    # 1. Overview
-    Write-Host "Capturing Overview..." -ForegroundColor Yellow
-    [ScreenCap]::ClickAt($hwnd, $clickX, $rect.Top + [int]($h * 0.146))
-    SaveScreenshot "01_overview.png" 1500
-
-    # 2. Library
-    Write-Host "Navigating to Library..." -ForegroundColor Yellow
-    [ScreenCap]::ClickAt($hwnd, $clickX, $rect.Top + [int]($h * 0.190))
+    # 2. Library (initial landing tab in Option 3)
+    Write-Host "Capturing Library..." -ForegroundColor Yellow
     SaveScreenshot "02_library.png" 1800
 
+    # 1. Overview
+    Write-Host "Navigating to Overview..." -ForegroundColor Yellow
+    [ScreenCap]::ClickAt($hwnd, $rect.Left + [int]($w * 0.062), $tabY)
+    SaveScreenshot "01_overview.png" 1500
+
     # 3. Browse & Workshop
-    Write-Host "Navigating to Browse & Workshop..." -ForegroundColor Yellow
-    [ScreenCap]::ClickAt($hwnd, $clickX, $rect.Top + [int]($h * 0.233))
+    Write-Host "Navigating to Browse..." -ForegroundColor Yellow
+    [ScreenCap]::ClickAt($hwnd, $rect.Left + [int]($w * 0.204), $tabY)
     SaveScreenshot "03_browse.png" 1800
 
     # 4. Monitors
     Write-Host "Navigating to Monitors..." -ForegroundColor Yellow
-    [ScreenCap]::ClickAt($hwnd, $clickX, $rect.Top + [int]($h * 0.276))
+    [ScreenCap]::ClickAt($hwnd, $rect.Left + [int]($w * 0.275), $tabY)
     SaveScreenshot "04_monitors.png" 1500
 
     # 5. Appearance
     Write-Host "Navigating to Appearance..." -ForegroundColor Yellow
-    [ScreenCap]::ClickAt($hwnd, $clickX, $rect.Top + [int]($h * 0.368))
+    [ScreenCap]::ClickAt($hwnd, $rect.Left + [int]($w * 0.432), $tabY)
     SaveScreenshot "05_appearance.png" 1500
 
     # 6. Settings
     Write-Host "Navigating to Settings..." -ForegroundColor Yellow
-    [ScreenCap]::ClickAt($hwnd, $clickX, $rect.Top + [int]($h * 0.411))
+    [ScreenCap]::ClickAt($hwnd, $rect.Left + [int]($w * 0.502), $tabY)
     SaveScreenshot "06_settings.png" 1500
 } else {
     Write-Error "Could not find main window for PID $($ui.Id)"

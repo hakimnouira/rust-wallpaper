@@ -39,7 +39,7 @@ impl ThemePreset {
 
     fn palette(self) -> Option<(&'static str, &'static str, bool)> {
         match self {
-            Self::Midnight => Some(("#6366F1", "#111216", true)),
+            Self::Midnight => Some(("#7C7CFF", "#0A0B0E", true)),
             Self::Graphite => Some(("#38BDF8", "#121214", true)),
             Self::Aurora => Some(("#10B981", "#0D1514", true)),
             Self::Ember => Some(("#F59E0B", "#171412", true)),
@@ -62,8 +62,8 @@ impl Default for UiTheme {
     fn default() -> Self {
         Self {
             preset: ThemePreset::Midnight,
-            accent: "#6366F1".into(),
-            background: "#111216".into(),
+            accent: "#7C7CFF".into(),
+            background: "#0A0B0E".into(),
             dark_mode: true,
             scale: 1.0,
         }
@@ -166,9 +166,9 @@ impl UiTheme {
         ctx.set_visuals(visuals);
         ctx.set_zoom_factor(self.scale.clamp(0.8, 1.3));
         ctx.style_mut(|s| {
-            s.spacing.item_spacing = egui::vec2(8.0, 8.0);
-            s.spacing.button_padding = egui::vec2(10.0, 6.0);
-            s.spacing.window_margin = egui::Margin::same(10.0);
+            s.spacing.item_spacing = egui::vec2(10.0, 8.0);
+            s.spacing.button_padding = egui::vec2(12.0, 6.0);
+            s.spacing.window_margin = egui::Margin::same(16.0);
         });
     }
 }
@@ -178,21 +178,21 @@ pub fn card_frame(theme: &UiTheme) -> egui::Frame {
     let (_, _background, dark) = theme.colors();
     egui::Frame::none()
         .fill(if dark {
-            egui::Color32::from_rgb(26, 27, 35)
+            egui::Color32::from_rgb(18, 20, 28)
         } else {
             egui::Color32::from_rgb(246, 248, 252)
         })
         .stroke(egui::Stroke::new(
             1.0_f32,
             if dark {
-                egui::Color32::from_rgb(40, 42, 54)
+                egui::Color32::from_rgb(29, 33, 45)
             } else {
                 egui::Color32::from_rgb(220, 224, 235)
             },
         ))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::same(8.0))
-        .outer_margin(egui::Margin::same(3.0))
+        .rounding(egui::Rounding::same(10.0))
+        .inner_margin(egui::Margin::same(12.0))
+        .outer_margin(egui::Margin::same(2.0))
 }
 
 /// Quieter surface for secondary content such as filters or helper text.
@@ -200,20 +200,20 @@ pub fn subtle_frame(theme: &UiTheme) -> egui::Frame {
     let (_, _background, dark) = theme.colors();
     egui::Frame::none()
         .fill(if dark {
-            egui::Color32::from_rgb(19, 20, 26)
+            egui::Color32::from_rgb(14, 16, 22)
         } else {
             egui::Color32::from_rgb(240, 243, 248)
         })
         .stroke(egui::Stroke::new(
             1.0_f32,
             if dark {
-                egui::Color32::from_rgb(33, 34, 44)
+                egui::Color32::from_rgb(29, 33, 45)
             } else {
                 egui::Color32::from_rgb(222, 226, 236)
             },
         ))
-        .rounding(egui::Rounding::same(8.0))
-        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+        .rounding(egui::Rounding::same(10.0))
+        .inner_margin(egui::Margin::symmetric(12.0, 8.0))
         .outer_margin(egui::Margin::symmetric(0.0, 3.0))
 }
 
