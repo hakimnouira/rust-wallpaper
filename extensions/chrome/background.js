@@ -179,26 +179,13 @@ setInterval(checkDaemonHealth, HEALTH_CHECK_INTERVAL_MS);
 
 // Handle context menu clicks
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  let mediaUrl = info.srcUrl || info.linkUrl;
+  let mediaUrl =
+    (info.linkUrl && /\/pin\//i.test(info.linkUrl) ? info.linkUrl : null) ||
+    info.srcUrl ||
+    info.linkUrl;
   if (!mediaUrl && info.pageUrl) {
     mediaUrl = info.pageUrl;
   }
-
-  // On a Pinterest pin detail page, clicked media is usually a resized preview.
-  // Resolve the canonical pin URL to choose the best available original rendition.
-  try {
-    const tabUrl = new URL(tab?.url || "");
-    if (
-      /(^|\.)pinterest\./i.test(tabUrl.hostname) &&
-      /\/pin\//i.test(tabUrl.pathname) &&
-      mediaUrl && /pinimg\.com/i.test(mediaUrl)
-    ) {
-      mediaUrl = tabUrl.href;
-    }
-  } catch (_) {}
-
-  // Keep Pinterest pin URLs intact so the daemon can select the best available rendition.
-  // A captured stream is often only the low-resolution feed preview.
 
   if (!mediaUrl) {
     notifyUser("No Media Detected", "Could not determine a direct media URL from this page element.");

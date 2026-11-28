@@ -514,10 +514,24 @@ impl DesktopApp {
                 ui.add_space(8.0);
                 if ui.button("Browse files…").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("Video files", &["mp4", "webm", "mkv", "mov"])
+                        .add_filter(
+                            "Media & Web Wallpapers",
+                            &[
+                                "mp4", "webm", "mkv", "mov", "gif", "jpg", "jpeg", "png", "webp",
+                                "bmp", "html", "htm",
+                            ],
+                        )
                         .pick_file()
                     {
-                        self.import_path = path.display().to_string();
+                        let path_str = path.display().to_string();
+                        self.pending_apply_source = Some(path_str.clone());
+                        self.send(
+                            Command::ImportWallpaper {
+                                path: path_str,
+                                title: None,
+                            },
+                            "Importing and applying wallpaper…",
+                        );
                     }
                 }
             });
@@ -538,7 +552,6 @@ impl DesktopApp {
         }
 
         // Virtualized Viewport Rendering
-        let selected_monitor = self.selected_monitor.clone();
         let mut assign_req = None;
         let mut select_req: Option<Option<WallpaperId>> = None;
         let mut retry_req = None;
@@ -1060,13 +1073,11 @@ impl DesktopApp {
                                         egui::vec2(card_width, card_height),
                                         egui::Sense::click(),
                                     );
-
-                                    // Double-click: Instant Apply! Single-click: Open Inspector
-                                    if response.double_clicked() {
-                                        assign_req = Some(wallpaper.id);
-                                    } else if response.clicked() {
-                                        select_req = Some(Some(wallpaper.id));
-                                    }
+                                    let card_hovered = ui.rect_contains_pointer(rect);
+                                    let thumb_rect = egui::Rect::from_min_size(
+                                        rect.min,
+                                        egui::vec2(card_width, thumb_h),
+                                    );
 
                                     // Context menu (Right-click)
                                     response.context_menu(|ui| {
@@ -1151,11 +1162,6 @@ impl DesktopApp {
                                     let is_playing = !card_playing.is_empty();
 
                                     // Borderless 16:9 thumbnail
-                                    let thumb_rect = egui::Rect::from_min_size(
-                                        rect.min,
-                                        egui::vec2(card_width, thumb_h),
-                                    );
-
                                     let thumb_path = wallpaper
                                         .metadata
                                         .thumbnail_path
@@ -1183,7 +1189,7 @@ impl DesktopApp {
                                         );
                                     }
 
-                                    let border_color = if is_current || response.hovered() {
+                                    let border_color = if is_current || card_hovered {
                                         accent_color(&self.theme)
                                     } else if is_playing {
                                         egui::Color32::from_rgb(34, 197, 94)
@@ -1194,7 +1200,7 @@ impl DesktopApp {
                                         thumb_rect,
                                         egui::Rounding::same(8.0),
                                         egui::Stroke::new(
-                                            if is_current || is_playing || response.hovered() {
+                                            if is_current || is_playing || card_hovered {
                                                 1.5_f32
                                             } else {
                                                 1.0_f32
@@ -1202,6 +1208,54 @@ impl DesktopApp {
                                             border_color,
                                         ),
                                     );
+
+                                    // Flicker-free hover Apply pill button in bottom-right of thumbnail
+                                    let mut apply_btn_clicked = false;
+                                    if card_hovered {
+                                        let btn_size = egui::vec2(64.0, 26.0);
+                                        let btn_rect = egui::Rect::from_min_size(
+                                            thumb_rect.max - btn_size - egui::vec2(8.0, 8.0),
+                                            btn_size,
+                                        );
+                                        let apply_btn_resp = ui.interact(
+                                            btn_rect,
+                                            ui.id().with(("card_apply_btn", wallpaper.id)),
+                                            egui::Sense::click(),
+                                        );
+                                        if apply_btn_resp.clicked() {
+                                            assign_req = Some(wallpaper.id);
+                                            apply_btn_clicked = true;
+                                        }
+                                        let btn_fill = if apply_btn_resp.hovered() {
+                                            accent_color(&self.theme)
+                                        } else {
+                                            egui::Color32::from_rgba_unmultiplied(15, 18, 28, 230)
+                                        };
+                                        ui.painter().rect_filled(
+                                            btn_rect,
+                                            egui::Rounding::same(13.0),
+                                            btn_fill,
+                                        );
+                                        ui.painter().rect_stroke(
+                                            btn_rect,
+                                            egui::Rounding::same(13.0),
+                                            egui::Stroke::new(1.0_f32, accent_color(&self.theme)),
+                                        );
+                                        ui.painter().text(
+                                            btn_rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "Apply",
+                                            egui::FontId::new(11.5, egui::FontFamily::Proportional),
+                                            egui::Color32::WHITE,
+                                        );
+                                    }
+
+                                    // Double-click: Instant Apply! Single-click: Open Inspector
+                                    if response.double_clicked() {
+                                        assign_req = Some(wallpaper.id);
+                                    } else if response.clicked() && !apply_btn_clicked {
+                                        select_req = Some(Some(wallpaper.id));
+                                    }
 
                                     // Multi-selection check indicator only when selected
                                     if is_selected {
@@ -1290,7 +1344,7 @@ impl DesktopApp {
             self.send(
                 Command::ApplyWallpaper {
                     wallpaper_id: id,
-                    monitor: selected_monitor.clone(),
+                    monitor: self.selected_monitor.clone(),
                 },
                 "Wallpaper assignment requested…",
             );
@@ -1314,7 +1368,7 @@ impl DesktopApp {
             self.send(
                 Command::BenchmarkWallpaper {
                     wallpaper_id: id,
-                    monitor: selected_monitor.clone(),
+                    monitor: self.selected_monitor.clone(),
                 },
                 "10-second resource benchmark started…",
             );

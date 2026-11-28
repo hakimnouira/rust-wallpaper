@@ -1056,8 +1056,74 @@ fn extract_pinterest_media_url(html: &str) -> String {
     let unescaped = html.replace(r"\/", "/");
     let html = unescaped.as_str();
 
-    // 1. Collect progressive MP4 renditions and choose the highest explicit quality,
-    // rather than whichever low-resolution preview happens to occur first in page JSON.
+    // 1. Main-pin-scoped Schema.org contentUrl (used for videos)
+    if let Some(pos) = html.find("\"contentUrl\"") {
+        let slice = &html[pos..];
+        if let Some(q_start) = slice.find("http") {
+            let after_http = &slice[q_start..];
+            if let Some(q_end) = after_http.find('"') {
+                let candidate = &after_http[..q_end];
+                if candidate.contains(".mp4") || candidate.contains("pinimg.com/videos") {
+                    return candidate.to_string();
+                }
+            }
+        }
+    }
+
+    // 2. Main-pin-scoped OpenGraph video: og:video or og:video:secure_url
+    for marker in ["property=\"og:video\"", "property=\"og:video:secure_url\""] {
+        if let Some(pos) = html.find(marker) {
+            let start = pos.saturating_sub(50);
+            let end = (pos + 350).min(html.len());
+            let slice = &html[start..end];
+            if let Some(c_pos) = slice.find("content=\"http") {
+                let after = &slice[c_pos + 9..];
+                if let Some(end_q) = after.find('"') {
+                    let candidate = &after[..end_q];
+                    if candidate.contains(".mp4") || candidate.contains("pinimg.com/videos") {
+                        return candidate.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Main-pin-scoped OpenGraph og:image (must run BEFORE scanning arbitrary page JSON
+    //    so an image pin is never hijacked by a related video pin further down in the HTML).
+    if let Some(pos) = html.find("property=\"og:image\"") {
+        let start = pos.saturating_sub(50);
+        let end = (pos + 350).min(html.len());
+        let slice = &html[start..end];
+        if let Some(c_pos) = slice.find("content=\"http") {
+            let after = &slice[c_pos + 9..];
+            if let Some(end_q) = after.find('"') {
+                let candidate = &after[..end_q];
+                if (candidate.contains("pinimg.com/videos/thumbnails/")
+                    || candidate.contains("pinimg.com/videos/mc/thumbnails/"))
+                    && (candidate.contains(".jpg") || candidate.contains(".png"))
+                {
+                    let mp4_url = candidate
+                        .replace("/thumbnails/originals/", "/mc/720p/")
+                        .replace("/thumbnails/mc/720p/", "/mc/720p/")
+                        .replace("/thumbnails/", "/mc/720p/")
+                        .replace(".0000000.jpg", ".mp4")
+                        .replace(".0000000.png", ".mp4")
+                        .replace(".jpg", ".mp4");
+                    return mp4_url.replace("i.pinimg.com", "v1.pinimg.com");
+                }
+                if candidate.contains("pinimg.com") {
+                    let orig = candidate
+                        .replace("/736x/", "/originals/")
+                        .replace("/564x/", "/originals/")
+                        .replace("/474x/", "/originals/")
+                        .replace("/236x/", "/originals/");
+                    return orig;
+                }
+            }
+        }
+    }
+
+    // 4. Fallback: collect progressive MP4 renditions and choose the highest explicit quality
     let mut video_candidates: Vec<(u16, String)> = Vec::new();
     for prefix in [
         "https://v1.pinimg.com/videos/",
@@ -1094,7 +1160,7 @@ fn extract_pinterest_media_url(html: &str) -> String {
         return url;
     }
 
-    // If page HTML only contains HLS, request the highest common progressive variant.
+    // 5. Fallback: HLS playlist -> progressive 720p MP4
     for marker in [
         "https://v1.pinimg.com/videos/hls/",
         "https://v.pinimg.com/videos/hls/",
@@ -1112,8 +1178,7 @@ fn extract_pinterest_media_url(html: &str) -> String {
         }
     }
 
-    // 1b. Look for video thumbnail / poster URLs:
-    // e.g. https://v1.pinimg.com/videos/thumbnails/originals/12/83/f0/1283f06c1c8fa040011cd7231f33f069.0000000.jpg
+    // 6. Fallback: video thumbnail / poster URLs
     for marker in [
         "pinimg.com/videos/thumbnails/",
         "pinimg.com/videos/mc/thumbnails/",
@@ -1143,40 +1208,7 @@ fn extract_pinterest_media_url(html: &str) -> String {
         }
     }
 
-    // 2. Look for schema.org contentUrl (used for videos)
-    if let Some(pos) = html.find("\"contentUrl\"") {
-        let slice = &html[pos..];
-        if let Some(q_start) = slice.find("http") {
-            let after_http = &slice[q_start..];
-            if let Some(q_end) = after_http.find('"') {
-                let candidate = &after_http[..q_end];
-                if candidate.contains(".mp4") || candidate.contains("pinimg.com/videos") {
-                    return candidate.to_string();
-                }
-            }
-        }
-    }
-
-    // 3. Look for OpenGraph video: og:video or og:video:secure_url
-    for marker in ["property=\"og:video\"", "property=\"og:video:secure_url\""] {
-        if let Some(pos) = html.find(marker) {
-            let start = pos.saturating_sub(50);
-            let end = (pos + 350).min(html.len());
-            let slice = &html[start..end];
-            if let Some(c_pos) = slice.find("content=\"http") {
-                let after = &slice[c_pos + 9..];
-                if let Some(end_q) = after.find('"') {
-                    let candidate = &after[..end_q];
-                    if candidate.contains(".mp4") || candidate.contains("pinimg.com/videos") {
-                        return candidate.to_string();
-                    }
-                }
-            }
-        }
-    }
-
-    // 4. Look for original uncompressed image / animated GIF:
-    // e.g. "images_orig":{"url":"https://i.pinimg.com/originals/..."}
+    // 7. Fallback: original uncompressed image / animated GIF
     if let Some(pos) = html.find("https://i.pinimg.com/originals/") {
         let slice = &html[pos..];
         let end = slice
@@ -1186,28 +1218,7 @@ fn extract_pinterest_media_url(html: &str) -> String {
         return candidate.to_string();
     }
 
-    // 5. Look for standard og:image fallback
-    if let Some(pos) = html.find("property=\"og:image\"") {
-        let start = pos.saturating_sub(50);
-        let end = (pos + 350).min(html.len());
-        let slice = &html[start..end];
-        if let Some(c_pos) = slice.find("content=\"http") {
-            let after = &slice[c_pos + 9..];
-            if let Some(end_q) = after.find('"') {
-                let candidate = &after[..end_q];
-                if candidate.contains("pinimg.com") {
-                    let orig = candidate
-                        .replace("/736x/", "/originals/")
-                        .replace("/564x/", "/originals/")
-                        .replace("/474x/", "/originals/")
-                        .replace("/236x/", "/originals/");
-                    return orig;
-                }
-            }
-        }
-    }
-
-    // 6. Look for any /736x/ or /564x/ pinimg image and upgrade to /originals/
+    // 8. Fallback: /736x/ or /564x/ pinimg image upgraded to /originals/
     for marker in ["https://i.pinimg.com/736x/", "https://i.pinimg.com/564x/"] {
         if let Some(pos) = html.find(marker) {
             let slice = &html[pos..];
@@ -2144,6 +2155,22 @@ mod tests {
         assert_eq!(
             extract_video_from_video_list(&data),
             Some("https://cdn.example/mc/1080p/1080/index.mp4".to_string())
+        );
+    }
+
+    #[test]
+    fn pinterest_html_prefers_main_pin_og_image_over_related_pin_video() {
+        let html = r#"
+            <head>
+                <meta property="og:image" content="https://i.pinimg.com/736x/aa/bb/cc/main_pin.jpg">
+            </head>
+            <body>
+                <script>{"related":[{"url":"https://v1.pinimg.com/videos/mc/1080p/99/88/77/related_pin.mp4"}]}</script>
+            </body>
+        "#;
+        assert_eq!(
+            extract_pinterest_media_url(html),
+            "https://i.pinimg.com/originals/aa/bb/cc/main_pin.jpg"
         );
     }
 

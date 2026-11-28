@@ -18,7 +18,7 @@ use windows::Win32::System::Registry::{
 };
 
 pub const EXTENSION_ID: &str = "gemjknbkapmdcopknokbikcneknbpoij";
-pub const EXTENSION_VERSION: &str = "1.0.1";
+pub const EXTENSION_VERSION: &str = "1.0.2";
 /// The update URL used in HKCU/HKLM External Extensions keys.
 /// NOTE: for the policy ExtensionInstallForcelist we use a file:// URL that points
 /// directly to the CRX so Chrome/Brave accept it without a live HTTP server.

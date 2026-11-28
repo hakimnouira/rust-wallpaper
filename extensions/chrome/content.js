@@ -32,12 +32,22 @@
 
   function extractBestVideoUrl(video) {
     let direct = video.currentSrc || video.src || (video.querySelector("source")?.src);
-    // On Pinterest, use the canonical pin page so the daemon can resolve the
-    // original image or best available video rendition rather than a feed preview.
+    // On Pinterest, scope to the enclosing pin card link first; only fall back to
+    // window.location.href when the video is in the main closeup container.
     if (window.location.hostname.includes("pinterest.")) {
-      const pinLink = video.closest('a[href*="/pin/"]');
-      if (pinLink && pinLink.href) return pinLink.href;
-      if (window.location.pathname.includes("/pin/")) return window.location.href;
+      const directLink = video.closest('a[href*="/pin/"]');
+      if (directLink && directLink.href) return directLink.href;
+      const pinCard = video.closest(
+        '[data-test-id="pin"], [data-test-id="pinWrapper"], [data-grid-item="true"], div[role="listitem"]'
+      );
+      const cardLink = pinCard?.querySelector('a[href*="/pin/"]');
+      if (cardLink && cardLink.href) return cardLink.href;
+      if (
+        window.location.pathname.includes("/pin/") &&
+        video.closest('[data-test-id="pin-closeup"], [data-test-id="closeup-body"], [data-test-id="story-pin-closeup"]')
+      ) {
+        return window.location.href;
+      }
     }
 
     if (direct && !direct.startsWith("blob:") && (direct.includes(".mp4") || direct.includes(".webm") || direct.includes("cdn.pixabay.com"))) {
@@ -77,6 +87,12 @@
   }
 
   function attachBadgeToVideo(video) {
+    if (
+      window.location.hostname.includes("pinterest.") &&
+      video.closest('[data-test-id="pin"], [data-test-id="pinWrapper"], [data-grid-item="true"], div[role="listitem"]')
+    ) {
+      return;
+    }
     if (video.dataset.rustWallpaperAttached) return;
     video.dataset.rustWallpaperAttached = "true";
 
@@ -397,7 +413,10 @@
   });
 
   function extractPinterestMedia(cardOrContainer) {
-    // 1. Direct <video> element
+    // Strictly scope extraction to this specific card so we never grab media
+    // from another pin or related-pin stream on the same page.
+
+    // 1. Direct <video> element inside this card
     const video =
       cardOrContainer.querySelector("video") ||
       (cardOrContainer.tagName === "VIDEO" ? cardOrContainer : null);
@@ -425,21 +444,15 @@
       }
     }
 
-    // 2. Any captured media URLs from background sniffer for this tab
-    if (capturedMediaUrls.size > 0) {
-      for (const url of Array.from(capturedMediaUrls).reverse()) {
-        if (url.includes("pinimg.com/videos/")) {
-          return url;
-        }
-      }
-      for (const url of Array.from(capturedMediaUrls).reverse()) {
-        if (url.includes(".mp4")) {
-          return url;
-        }
-      }
+    // 2. Pin link inside this card
+    const link =
+      cardOrContainer.querySelector('a[href*="/pin/"]') ||
+      cardOrContainer.closest('a[href*="/pin/"]');
+    if (link && link.href) {
+      return link.href;
     }
 
-    // 3. High-resolution / original Pinterest image or animated GIF
+    // 3. High-resolution / original Pinterest image or animated GIF inside this card
     const img = cardOrContainer.querySelector('img[src*="pinimg.com"]');
     if (img) {
       const imgSrc = img.currentSrc || img.src || "";
@@ -450,40 +463,8 @@
         if (origUrl.includes("/originals/")) {
           return origUrl;
         }
+        return imgSrc;
       }
-    }
-
-    // 4. Schema.org JSON-LD
-    try {
-      const scripts = document.querySelectorAll('script[type="application/ld+json"]');
-      for (const script of scripts) {
-        const text = script.textContent || "";
-        if (text.includes("contentUrl")) {
-          const data = JSON.parse(text);
-          if (data.contentUrl) return data.contentUrl;
-        }
-      }
-    } catch (_) {}
-
-    // 5. OpenGraph video
-    const ogVideo = document.querySelector(
-      'meta[property="og:video"], meta[property="og:video:secure_url"]'
-    );
-    if (ogVideo && ogVideo.content) {
-      return ogVideo.content;
-    }
-
-    // 6. Pin link inside the card
-    const link =
-      cardOrContainer.querySelector('a[href*="/pin/"]') ||
-      cardOrContainer.closest('a[href*="/pin/"]');
-    if (link && link.href) {
-      return link.href;
-    }
-
-    // 7. Current page URL if on pin page
-    if (window.location.pathname.includes("/pin/")) {
-      return window.location.href;
     }
 
     return null;
@@ -573,6 +554,9 @@
     );
 
     pinCards.forEach((card) => {
+      if (!card.matches('[data-test-id="pin"]') && card.querySelector('[data-test-id="pin"]')) {
+        return;
+      }
       const hasMedia = card.querySelector("video, img[src*='pinimg.com']");
       if (!hasMedia) return;
 
@@ -601,11 +585,24 @@
         e.stopPropagation();
         e.preventDefault();
 
-        await refreshCapturedMedia();
+        const pinLink =
+          card.querySelector('a[href*="/pin/"]') ||
+          card.closest('a[href*="/pin/"]');
         const mediaUrl = extractPinterestMedia(card);
-        const link = card.querySelector('a[href*="/pin/"]');
+        const targetUrl = (pinLink && pinLink.href) || mediaUrl;
+        if (!targetUrl) {
+          showStatus(cardBtn, "No Pin URL", false);
+          return;
+        }
+
+        const candidateTitle =
+          card.querySelector('img[alt]')?.getAttribute("alt")?.trim() ||
+          card.querySelector("h1, h2, h3")?.textContent?.trim() ||
+          "";
         const rawTitle =
-          card.querySelector("h2, h3, [title]")?.textContent?.trim() || "Pinterest Wallpaper";
+          candidateTitle && !/^set as wallpaper$/i.test(candidateTitle)
+            ? candidateTitle
+            : "Pinterest Wallpaper";
         const title = cleanPinterestTitle(rawTitle);
 
         showStatus(cardBtn, "Sending…", null);
@@ -613,9 +610,7 @@
         try {
           const response = await chrome.runtime.sendMessage({
             action: "SET_WALLPAPER",
-            // Prefer resolving the canonical pin URL; direct images/streams discovered
-            // in feed cards are frequently resized previews.
-            url: (link && link.href) || mediaUrl || window.location.href,
+            url: targetUrl,
             title,
           });
 
@@ -683,10 +678,162 @@
     });
   }
 
+  // --- Generic Image Integration (PNG, JPG, WebP, BMP, GIF) ---
+  function extractBestImageUrl(img) {
+    const link = img.closest("a[href]");
+    if (link && link.href && /\.(png|jpe?g|webp|bmp|gif)(\?.*)?$/i.test(link.href)) {
+      return link.href;
+    }
+    return img.currentSrc || img.src || "";
+  }
+
+  function cleanImageTitle(img, mediaUrl) {
+    const alt = img.getAttribute("alt")?.trim() || "";
+    if (alt && !/^set as wallpaper$/i.test(alt)) {
+      return alt;
+    }
+    try {
+      const pathname = new URL(mediaUrl).pathname;
+      const file = pathname.split("/").pop() || "";
+      const stem = file.replace(/\.[^.]+$/, "").replace(/[_-]+/g, " ").trim();
+      if (stem) return stem;
+    } catch (_) {}
+    const docTitle = document.title?.trim() || "";
+    if (docTitle && !/^set as wallpaper$/i.test(docTitle)) {
+      return docTitle;
+    }
+    return "Web Image Wallpaper";
+  }
+
+  function attachBadgeToImage(img) {
+    if (img.dataset.rustWallpaperAttached) return;
+    if (img.closest(`.${BADGE_CLASS}`)) return;
+
+    // Pinterest pin cards and Steam Workshop previews already have dedicated handlers
+    if (
+      window.location.hostname.includes("pinterest.") &&
+      img.closest('[data-test-id="pin"], [data-test-id="pinWrapper"], [data-grid-item="true"], div[role="listitem"]')
+    ) {
+      return;
+    }
+    if (
+      window.location.hostname.includes("steamcommunity.com") &&
+      img.closest("#highlight_player_area, .workshopItemPreviewImageEnlargeableContainer, .workshopItem, .workshop_showcase, .ugc")
+    ) {
+      return;
+    }
+
+    const rawSrc = extractBestImageUrl(img);
+    if (!/^https?:\/\//i.test(rawSrc)) return;
+    const pathPart = rawSrc.split("?")[0].toLowerCase();
+    if (pathPart.endsWith(".svg")) return;
+
+    const isStandaloneImageTab =
+      typeof document.contentType === "string" && document.contentType.startsWith("image/");
+
+    if (!img.complete) {
+      if (!img.dataset.rustWallpaperLoadHooked) {
+        img.dataset.rustWallpaperLoadHooked = "true";
+        img.addEventListener("load", () => attachBadgeToImage(img), { once: true });
+      }
+      return;
+    }
+
+    const rect = img.getBoundingClientRect();
+    if (!isStandaloneImageTab && (rect.width < 320 || rect.height < 200)) {
+      return;
+    }
+
+    const parent = img.parentElement;
+    if (!parent) return;
+
+    img.dataset.rustWallpaperAttached = "true";
+
+    const parentPos = window.getComputedStyle(parent).position;
+    if (parentPos === "static") {
+      parent.classList.add(CONTAINER_CLASS);
+    }
+
+    const btn = document.createElement("button");
+    btn.className = isStandaloneImageTab ? `${BADGE_CLASS} visible` : BADGE_CLASS;
+    btn.type = "button";
+    btn.title = "Download and apply this image as your desktop wallpaper";
+    btn.innerHTML = `
+      <svg class="rust-wp-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+        <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+        <line x1="8" y1="21" x2="16" y2="21"></line>
+        <line x1="12" y1="17" x2="12" y2="21"></line>
+      </svg>
+      <span class="rust-wp-label">Set as Wallpaper</span>
+    `;
+
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+
+      const mediaUrl = extractBestImageUrl(img);
+      if (!mediaUrl || !/^https?:\/\//i.test(mediaUrl)) {
+        showStatus(btn, "No URL", false);
+        return;
+      }
+
+      const title = cleanImageTitle(img, mediaUrl);
+      showStatus(btn, "Sending...", null);
+
+      try {
+        const response = await chrome.runtime.sendMessage({
+          action: "SET_WALLPAPER",
+          url: mediaUrl,
+          title
+        });
+
+        if (response && response.success) {
+          showStatus(btn, successLabel(response.data), true);
+        } else if (response && response.daemonOffline) {
+          showStatus(btn, "App Offline", false);
+          daemonOnline = false;
+        } else {
+          showStatus(btn, failureLabel(response), false);
+        }
+      } catch (err) {
+        if (err && err.message && err.message.includes("Could not establish connection")) {
+          showStatus(btn, "Extension reloading...", false);
+        } else {
+          showStatus(btn, "Offline", false);
+        }
+      }
+    });
+
+    parent.appendChild(btn);
+
+    let hideTimer = null;
+    const show = () => {
+      if (hideTimer) clearTimeout(hideTimer);
+      btn.classList.add("visible");
+    };
+    const hide = () => {
+      if (isStandaloneImageTab) return;
+      hideTimer = setTimeout(() => {
+        btn.classList.remove("visible");
+      }, 800);
+    };
+
+    img.addEventListener("mouseenter", show);
+    img.addEventListener("mouseleave", hide);
+    btn.addEventListener("mouseenter", show);
+    btn.addEventListener("mouseleave", hide);
+  }
+
+  function scanImages() {
+    const images = document.querySelectorAll("img");
+    images.forEach(attachBadgeToImage);
+  }
+
   // --- Scan All (debounced) ---
   function scanAll() {
     const videos = document.querySelectorAll("video");
     videos.forEach(attachBadgeToVideo);
+    scanImages();
     scanSteamWorkshop();
     scanPinterest();
     scanTikTok();

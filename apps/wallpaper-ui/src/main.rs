@@ -1204,6 +1204,7 @@ mod desktop {
                 ctx.input(|i| (!i.raw.hovered_files.is_empty(), i.raw.dropped_files.clone()));
             if !dropped_files.is_empty() && snapshot.connected {
                 let mut imported = 0usize;
+                let mut last_imported_path: Option<String> = None;
                 for file in dropped_files {
                     if let Some(path) = file.path {
                         let ext = path
@@ -1226,10 +1227,12 @@ mod desktop {
                                 | "html"
                                 | "htm"
                         ) {
+                            let path_str = path.to_string_lossy().to_string();
                             let _ = self.commands.send(Command::ImportWallpaper {
-                                path: path.to_string_lossy().to_string(),
+                                path: path_str.clone(),
                                 title: None,
                             });
+                            last_imported_path = Some(path_str);
                             imported += 1;
                         }
                     }
@@ -1237,10 +1240,13 @@ mod desktop {
                 if imported > 0 {
                     self.page = Page::Library;
                     self.library_subtab = LibrarySubtab::Wallpapers;
-                    self.notice = format!(
-                        "Importing {imported} dropped wallpaper{} into library…",
-                        if imported == 1 { "" } else { "s" }
-                    );
+                    if imported == 1 {
+                        self.pending_apply_source = last_imported_path;
+                        self.notice = "Importing and applying dropped wallpaper…".into();
+                    } else {
+                        self.notice =
+                            format!("Importing {imported} dropped wallpapers into library…");
+                    }
                 } else {
                     self.notice =
                         "Dropped files did not match supported video, image, or HTML formats."
@@ -1251,7 +1257,7 @@ mod desktop {
             // Auto-apply newly imported wallpaper if requested
             if let Some(src) = self.pending_apply_source.clone() {
                 if let Some(wp) = snapshot.wallpapers.iter().find(|w| {
-                    w.source() == src
+                    w.source().eq_ignore_ascii_case(&src)
                         || std::path::Path::new(w.source()) == std::path::Path::new(&src)
                 }) {
                     self.send(
@@ -1453,17 +1459,27 @@ mod desktop {
                                     .pick_files()
                                 {
                                     let count = paths.len();
+                                    let mut single_path: Option<String> = None;
                                     for p in paths {
+                                        let path_str = p.display().to_string();
                                         let _ = self.commands.send(Command::ImportWallpaper {
-                                            path: p.display().to_string(),
+                                            path: path_str.clone(),
                                             title: None,
                                         });
+                                        if count == 1 {
+                                            single_path = Some(path_str);
+                                        }
                                     }
                                     if count > 0 {
-                                        self.notice = format!(
-                                            "Queued {count} wallpaper{} for import…",
-                                            if count == 1 { "" } else { "s" }
-                                        );
+                                        if count == 1 {
+                                            self.pending_apply_source = single_path;
+                                            self.notice =
+                                                "Importing and applying wallpaper…".into();
+                                        } else {
+                                            self.notice = format!(
+                                                "Queued {count} wallpapers for import…"
+                                            );
+                                        }
                                         self.page = Page::Library;
                                     }
                                 }
